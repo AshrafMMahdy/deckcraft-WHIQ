@@ -11,9 +11,9 @@ Run everything: `cargo test` (workspace default members) — the contract suite 
 `cargo test -p deckcraft-cli --test mcp_contract --test mcp_deck`. End-to-end smoke of the release
 binary: `cargo build --release -p deckcraft-cli && python3 tests/mcp-contract/smoke.py`.
 
-Build note: the binary embeds the Arabic fallback font (Noto Sans Arabic) from a
-[craft-fonts](https://github.com/storytold/craft-fonts) checkout next to this repository
-(`../craft-fonts`, see `.cargo/config.toml`); release builds should set `CRAFT_FONTS_REQUIRED=1`.
+Build note: the binary embeds its fonts (Latin presentation faces with real italics, the Arabic
+fallback, Japanese) from a [craft-fonts](https://github.com/storytold/craft-fonts) checkout; release
+builds set `CRAFT_FONTS_DIR` and `CRAFT_FONTS_REQUIRED=1` — recipe in §9.
 
 ## 1. The shared "no dead stops" contract (MCP server)
 
@@ -187,6 +187,40 @@ PDF, PNG and GIF exports write nothing; a cancelled read adds no document; PDF p
   test), `editing_in_place_keeps_media_animations_fonts_and_unknown_parts` (an add-in part on `rId1`
   — an id the writer would give the layout — named by a slide extension, and a part shared by the
   deck and a slide).
+
+## 9. Fonts: the craft-fonts build input (round 2)
+
+Same mechanism as wordcraft: `crates/fonts/build.rs` embeds the faces listed in a craft-fonts
+checkout's `fonts/latin-manifest.txt` (presentation fonts) and `fonts/manifest.txt` (scripts) into
+the binary, read from `CRAFT_FONTS_DIR` (local builds default to `../craft-fonts` through
+`.cargo/config.toml`). With `CRAFT_FONTS_REQUIRED` set the build **fails** (native targets) when:
+
+- `CRAFT_FONTS_DIR` is unset, or the checkout or a listed font file cannot be read;
+- no embedded face covers Arabic (`Arab` — Noto Sans Arabic, the fallback every Arabic run without
+  a font of its own is drawn with, so every machine draws it the same), Japanese (`Jpan`) or Latin;
+- any of Inter (the default face), Carlito, Caladea, Liberation Sans/Serif/Mono (the
+  metric-compatible stand-ins for Calibri, Cambria, Arial, Times New Roman, Courier New) has no
+  real italic face — italics are then drawn with the font's own italic, not a slanted Regular.
+
+`Hans` is not required (unlike wordcraft): craft-fonts' only Simplified Chinese face is Noto Sans
+CJK SC, which DeckCraft's asset policy excludes (AGENTS.md §1, with Source Sans/Serif/Han); Chinese
+text uses the Japanese faces' Han glyphs or an installed face.
+
+Release recipe:
+
+```sh
+git clone https://github.com/storytold/craft-fonts ../craft-fonts
+git -C ../craft-fonts checkout 43913056ce82a3fdad0ef69f6b88d1dc922a8104   # the pin in .github/workflows/release.yml
+CRAFT_FONTS_DIR="$PWD/../craft-fonts" CRAFT_FONTS_REQUIRED=1 cargo build --release -p deckcraft-cli
+```
+
+(Windows PowerShell: `$env:CRAFT_FONTS_DIR="..\craft-fonts"; $env:CRAFT_FONTS_REQUIRED="1"` before
+the same `cargo build`.) At that pin the manifests hold Inter Italic, Carlito/Caladea/Liberation
+Italic and Bold Italic, Lato/Merriweather/Poppins Italic, the Montserrat/Open Sans/Roboto/Playfair
+Display/Nunito Sans italic variable fonts, and Noto Sans Arabic (variable weight).
+Test: `craft_fonts_ship_real_italics_and_the_arabic_fallback` (`crates/fonts`): with no installed
+fonts, every required family resolves Italic and Bold Italic to a real italic face, Calibri/Arial
+italics reach theirs, and an Arabic cluster in an Inter run falls back to the bundled Arabic face.
 
 ## Not done / known limits
 

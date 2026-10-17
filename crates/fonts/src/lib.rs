@@ -424,6 +424,35 @@ mod tests {
         }
     }
 
+    /// WHIQ: a build with craft-fonts draws italics with real italic faces (not a slanted
+    /// Regular) and Arabic with the bundled Arabic face, on every machine.
+    #[test]
+    fn craft_fonts_ship_real_italics_and_the_arabic_fallback() {
+        if !CRAFT_FONTS.iter().any(|f| f.family == "Inter") {
+            eprintln!("skipped: built without craft-fonts' Latin manifest (set CRAFT_FONTS_DIR)");
+            return;
+        }
+        let db = FontDb::with_font_dirs(Vec::new());
+        db.set_system_fallback(false);
+        for family in ["Inter", "Carlito", "Caladea", "Liberation Sans", "Liberation Serif", "Liberation Mono"] {
+            for style in ["Italic", "Bold Italic"] {
+                let f = db.face(family, style);
+                assert_eq!(f.family, family, "{family} {style}");
+                assert!(f.italic, "{family} {style}: a real italic face, got {}", f.style);
+            }
+        }
+        // Office names reach the metric-compatible italics.
+        assert!(db.face("Calibri", "Italic").italic);
+        assert!(db.face("Arial", "Bold Italic").italic);
+        let arabic = fallback::bundled_families(*b"Arab");
+        assert!(!arabic.is_empty(), "an Arabic face is embedded");
+        let inter = db.face("Inter", "Regular");
+        let cluster = ['\u{0628}', '\u{064E}'];
+        let f = db.cascade(&cluster, std::slice::from_ref(&inter), "Regular");
+        assert!(arabic.contains(&f.family.as_str()), "Arabic falls back to the bundled face, got {}", f.family);
+        assert!(fallback::covers_cluster(&f, &cluster));
+    }
+
     /// An Embedded OpenType header of `version` around `font`, with the font at the end.
     fn wrap_eot(font: &[u8], version: u32) -> Vec<u8> {
         let mut h = vec![0u8; 82];
