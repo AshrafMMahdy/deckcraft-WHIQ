@@ -49,10 +49,53 @@ fn cancelled_exports_write_nothing_past_their_safe_point() {
     let before = s.documents().len();
     assert!(scope(cancelled_task(), || s.execute("file.open", &json!({"path": pptx.to_str().unwrap()}))).is_err());
     assert_eq!(s.documents().len(), before);
-    // A PDF export reports its pages.
+    // A cancelled save writes nothing and leaves the document unsaved.
+    let saved = dir.join("cancelled.pptx");
+    assert!(scope(cancelled_task(), || s.execute("file.save", &json!({"path": saved.to_str().unwrap()}))).is_err());
+    assert!(!saved.exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Run `cmd` under a fresh task; its stages and final overall progress.
+fn staged(s: &mut Session, cmd: &str, p: serde_json::Value) -> (Vec<String>, f64) {
     let t = Task::new();
-    scope(t.clone(), || s.execute("file.export", &json!({"path": pdf.to_str().unwrap(), "dpi": 36}))).unwrap();
-    let (done, total) = t.progress();
-    assert!(total >= 8 && done + 1 == total, "{done}/{total}");
+    scope(t.clone(), || s.execute(cmd, &p)).unwrap();
+    (t.stages(), t.overall())
+}
+
+#[test]
+fn every_job_reports_its_stages_and_progress() {
+    let mut s = Session::new();
+    crate::sample::open_sample(&mut s).unwrap();
+    let dir = std::env::temp_dir().join(format!("deckcraft-progress-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = |n: &str| dir.join(n).to_str().unwrap().to_string();
+    let done = |(stages, overall): (Vec<String>, f64), want: &[&str]| {
+        for w in want {
+            assert!(stages.iter().any(|s| s == w), "stage {w} missing from {stages:?}");
+        }
+        assert!((overall - 1.0).abs() < 1e-9, "{stages:?} ended at {overall}");
+    };
+    done(staged(&mut s, "file.export", json!({"path": path("p.pdf"), "dpi": 36})), &["writing PDF pages", "writing the file"]);
+    done(staged(&mut s, "file.export", json!({"path": path("p.png"), "all": true, "scale": 0.1})), &["rendering slides"]);
+    done(staged(&mut s, "file.export", json!({"path": path("p.gif"), "width": 64})), &["rendering GIF frames", "writing the file"]);
+    done(staged(&mut s, "file.export", json!({"path": path("p.pptx")})), &["writing slides", "compressing the package", "writing the file"]);
+    done(staged(&mut s, "file.export", json!({"path": path("p.deckcraft")})), &["writing the presentation", "writing the file"]);
+    done(staged(&mut s, "file.export", json!({"path": path("p.txt")})), &["writing the file"]);
+    done(staged(&mut s, "file.save", json!({"path": path("saved.pptx")})), &["writing slides", "compressing the package", "writing the file"]);
+    // Opening: the file by bytes, then its slides; the host adds it to the session last.
+    for f in ["p.pptx", "p.deckcraft"] {
+        let t = Task::new();
+        let loaded = scope(t.clone(), || crate::cmd::file::read_presentation_file(&path(f))).unwrap();
+        assert!(!loaded.doc.slides.is_empty());
+        let stages = t.stages();
+        assert_eq!(stages.first().map(String::as_str), Some("reading the file"), "{stages:?}");
+        assert!(stages.iter().any(|s| s == "reading the presentation"), "{stages:?}");
+        assert_eq!(stages.last().map(String::as_str), Some("adding it to the session"), "{stages:?}");
+        assert!((t.overall() - 0.9).abs() < 1e-9);
+        if f == "p.pptx" {
+            assert!(stages.iter().any(|s| s == "reading slides"), "{stages:?}");
+        }
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }

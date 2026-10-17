@@ -40,9 +40,8 @@ pub fn spawn_open(shared: &Arc<Shared>, roots: Option<Arc<AutomationRoots>>, pat
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             deckcraft_engine::task::scope(t, || {
                 file_access::confine(roots.as_ref(), || {
-                    deckcraft_engine::task::stage("reading the file");
+                    deckcraft_engine::task::phase("reading the file", 0.0, 0.15);
                     test_delay(&sh, &args);
-                    sh.job_progress(&jid, 0.05);
                     deckcraft_engine::cmd::file::read_presentation_file(&path).map_err(|e| e.to_string())
                 })
             })
@@ -53,7 +52,7 @@ pub fn spawn_open(shared: &Arc<Shared>, roots: Option<Arc<AutomationRoots>>, pat
         }
         match r {
             Ok(Ok(loaded)) => {
-                task.set_stage("adding it to the session");
+                task.set_phase("adding it to the session", 0.9, 1.0);
                 sh.set_pending_open(&jid, loaded)
             }
             Ok(Err(e)) => sh.job_failed(&jid, error_value(&sh, "open_presentation", &e)),
@@ -86,7 +85,7 @@ pub fn spawn_export(
             deckcraft_engine::task::scope(t, || {
                 file_access::confine(roots.as_ref(), || {
                     test_delay(&sh, &args);
-                    let run = || export(&sh, &jid, &doc, current, &args);
+                    let run = || export(&doc, current, &args);
                     if overwrite { (run(), vec![]) } else { deckcraft_engine::io::keep_previous(run) }
                 })
             })
@@ -119,13 +118,18 @@ pub fn spawn_export(
 }
 
 /// What `file.export` does, on a snapshot, reporting progress slide by slide for images.
-fn export(sh: &Shared, jid: &str, doc: &Presentation, current: usize, p: &Value) -> Result<Value, String> {
+fn export(doc: &Presentation, current: usize, p: &Value) -> Result<Value, String> {
     use deckcraft_engine::cmd::file as f;
     let path = p.get("path").and_then(Value::as_str).ok_or("export: missing `path`")?.to_string();
     let format = p.get("format").and_then(Value::as_str).unwrap_or_else(|| f::format_for_path(&path)).to_string();
     let scale = p.get("scale").and_then(Value::as_f64).filter(|s| s.is_finite()).unwrap_or(2.0).clamp(0.01, 16.0);
     let n = doc.slides.len();
     let write = |out: &str, bytes: &[u8]| deckcraft_engine::io::write_file(out, bytes);
+    // The last stage of every format but images: the file, with progress by bytes.
+    let write_whole = |out: &str, bytes: &[u8]| {
+        deckcraft_engine::task::phase("writing the file", 0.9, 1.0);
+        deckcraft_engine::io::write_file_reporting(out, bytes)
+    };
     match format.as_str() {
         "png" | "jpeg" | "jpg" => {
             let slides: Vec<usize> = match p.get("slide").and_then(Value::as_u64) {
@@ -138,7 +142,7 @@ fn export(sh: &Shared, jid: &str, doc: &Presentation, current: usize, p: &Value)
             }
             let scale = f::image_scale(doc, scale);
             let mut written: Vec<String> = vec![];
-            deckcraft_engine::task::stage("rendering slides");
+            deckcraft_engine::task::phase("rendering slides", 0.0, 1.0);
             for (k, i) in slides.iter().enumerate() {
                 // A safe point between slides: the files written so far are whole.
                 deckcraft_engine::task::step(k, slides.len()).map_err(|e| format!("{e}; written so far: {}", written.join(", ")))?;
@@ -155,31 +159,27 @@ fn export(sh: &Shared, jid: &str, doc: &Presentation, current: usize, p: &Value)
                 };
                 write(&out, &bytes).map_err(|e| if written.is_empty() { e } else { format!("{e} (slides 1–{k} were written)") })?;
                 written.push(out);
-                sh.job_progress(jid, (k + 1) as f64 / slides.len().max(1) as f64 * 0.95);
+                deckcraft_engine::task::step(k + 1, slides.len()).map_err(|e| e.to_string())?;
             }
             Ok(json!({"files": written, "slides": slides.len()}))
         }
         "pdf" => {
-            sh.job_progress(jid, 0.02);
             let bytes = f::pdf_bytes(doc, p).map_err(|e| e.to_string())?;
-            write(&path, &bytes)?;
+            write_whole(&path, &bytes)?;
             Ok(json!({"path": path, "bytes": bytes.len()}))
         }
         "gif" => {
-            sh.job_progress(jid, 0.02);
             let mut gp = p.clone();
             if let Some(text) = p.get("slides").and_then(Value::as_str) {
                 gp["slides"] = json!(f::parse_slide_range(text, n).map_err(|e| e.to_string())?);
             }
             let bytes = f::gif_bytes(doc, &gp).map_err(|e| e.to_string())?;
-            write(&path, &bytes)?;
+            write_whole(&path, &bytes)?;
             Ok(json!({"path": path, "bytes": bytes.len()}))
         }
         "pptx" | "potx" | "ppsx" | "deckcraft" | "outline" | "txt" => {
-            deckcraft_engine::task::stage("writing the file");
-            sh.job_progress(jid, 0.3);
             let bytes = f::save_bytes(doc, &format).map_err(|e| e.to_string())?;
-            write(&path, &bytes)?;
+            write_whole(&path, &bytes)?;
             Ok(json!({"path": path, "bytes": bytes.len()}))
         }
         other => Err(format!("file.export: unknown format `{other}`")),

@@ -454,10 +454,13 @@ pub fn call_tool(b: &mut dyn Backend, name: &str, a: &Value) -> ToolResult {
         "batch" => {
             let keep = a.get("keepGoing").and_then(Value::as_bool).unwrap_or(false);
             let mut out = vec![];
-            for c in a.get("commands").and_then(Value::as_array).cloned().unwrap_or_default() {
+            let commands = a.get("commands").and_then(Value::as_array).cloned().unwrap_or_default();
+            let n = commands.len();
+            deckcraft_engine::task::phase("running commands", 0.0, 1.0);
+            for (k, c) in commands.into_iter().enumerate() {
                 let id = c.get("command").and_then(Value::as_str).unwrap_or("");
-                // WHIQ: a safe point between commands.
-                if let Err(e) = deckcraft_engine::task::check() {
+                // WHIQ: a safe point between commands, with the progress of the batch.
+                if let Err(e) = deckcraft_engine::task::step(k, n) {
                     out.push(json!({"command": id, "ok": false, "error": e.to_string()}));
                     return ToolResult { content: vec![json!({"type": "text", "text": Value::Array(out).to_string()})], is_error: true };
                 }

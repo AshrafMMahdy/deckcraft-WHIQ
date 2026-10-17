@@ -11,9 +11,39 @@ pub fn read_file(path: &str) -> Result<Vec<u8>, String> {
     std::fs::read(path).map_err(|e| format!("{path}: {e}"))
 }
 
+/// WHIQ: [`read_file`] in chunks under the current task: progress by bytes (the task's current
+/// stage) and a safe point per chunk.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn read_file_reporting(path: &str) -> Result<Vec<u8>, String> {
+    crate::file_access::check_read(path)?;
+    if crate::task::current().is_some() {
+        use std::io::Read;
+        let err = |e: std::io::Error| format!("{path}: {e}");
+        let mut f = std::fs::File::open(path).map_err(err)?;
+        let total = f.metadata().map(|m| m.len() as usize).unwrap_or(0);
+        let mut out = Vec::with_capacity(total);
+        let mut buf = vec![0u8; 4 << 20];
+        loop {
+            crate::task::step(out.len(), total.max(out.len())).map_err(|e| e.to_string())?;
+            let n = f.read(&mut buf).map_err(err)?;
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n]);
+        }
+        return Ok(out);
+    }
+    std::fs::read(path).map_err(|e| format!("{path}: {e}"))
+}
+
 #[cfg(target_arch = "wasm32")]
 pub fn read_file(path: &str) -> Result<Vec<u8>, String> {
     Err(format!("{path}: files are opened through the browser on the web"))
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn read_file_reporting(path: &str) -> Result<Vec<u8>, String> {
+    read_file(path)
 }
 
 /// Write `bytes` to the file at `path`, inside the automation write root when there is one.
@@ -23,6 +53,17 @@ pub fn read_file(path: &str) -> Result<Vec<u8>, String> {
 /// `path` is.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn write_file(path: &str, bytes: &[u8]) -> Result<(), String> {
+    write_file_with(path, bytes, false)
+}
+
+/// WHIQ: [`write_file`] reporting progress by bytes to the current task's stage.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn write_file_reporting(path: &str, bytes: &[u8]) -> Result<(), String> {
+    write_file_with(path, bytes, true)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn write_file_with(path: &str, bytes: &[u8], report: bool) -> Result<(), String> {
     use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -40,7 +81,22 @@ pub fn write_file(path: &str, bytes: &[u8]) -> Result<(), String> {
             Err(e) => return Err(err(e)),
         }
     };
-    let written = file.write_all(bytes).and_then(|()| file.sync_all());
+    // WHIQ: reporting under a task (a job), write in chunks with progress by bytes.
+    let written = match crate::task::current().filter(|_| report) {
+        Some(t) => {
+            let mut r = Ok(());
+            for (k, chunk) in bytes.chunks(4 << 20).enumerate() {
+                t.set((k * (4 << 20)) as u64, bytes.len() as u64);
+                r = file.write_all(chunk);
+                if r.is_err() {
+                    break;
+                }
+            }
+            t.set(bytes.len() as u64, bytes.len() as u64);
+            r.and_then(|()| file.sync_all())
+        }
+        None => file.write_all(bytes).and_then(|()| file.sync_all()),
+    };
     drop(file);
     // WHIQ: under `keep_previous`, an existing file is renamed `OLD_<name>` first, never replaced.
     let kept = match written.as_ref() {
@@ -151,6 +207,11 @@ fn sync_parent(path: &str) {
 #[cfg(target_arch = "wasm32")]
 pub fn write_file(path: &str, _bytes: &[u8]) -> Result<(), String> {
     Err(format!("{path}: saving to a path is not available in the browser"))
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn write_file_reporting(path: &str, bytes: &[u8]) -> Result<(), String> {
+    write_file(path, bytes)
 }
 
 /// The size in bytes of the file at `path`; `None` when it can't be read (or is outside the

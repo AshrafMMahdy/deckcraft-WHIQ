@@ -13,12 +13,35 @@ use std::sync::{Arc, Mutex};
 use crate::EngineError;
 
 /// Progress and a cancel flag shared between the thread doing the work and its host.
-#[derive(Debug, Default)]
+///
+/// Work in several stages names each one with [`phase`] and the share of the whole it covers
+/// (`lo..hi`); [`Task::overall`] maps the stage's own steps into that span, so the progress of the
+/// whole never goes back when a new stage starts counting from 0.
+#[derive(Debug)]
 pub struct Task {
     cancelled: AtomicBool,
     done: AtomicU64,
     total: AtomicU64,
     stage: Mutex<String>,
+    /// Every stage named so far, in order.
+    stages: Mutex<Vec<String>>,
+    span: Mutex<(f64, f64)>,
+    /// The highest overall progress reported, as `f64` bits (non-negative floats order as their bits).
+    peak: AtomicU64,
+}
+
+impl Default for Task {
+    fn default() -> Self {
+        Task {
+            cancelled: AtomicBool::new(false),
+            done: AtomicU64::new(0),
+            total: AtomicU64::new(0),
+            stage: Mutex::new(String::new()),
+            stages: Mutex::new(Vec::new()),
+            span: Mutex::new((0.0, 1.0)),
+            peak: AtomicU64::new(0),
+        }
+    }
 }
 
 impl Task {
@@ -49,9 +72,40 @@ impl Task {
         if let Ok(mut s) = self.stage.lock() {
             *s = stage.to_string();
         }
+        if let Ok(mut v) = self.stages.lock()
+            && v.last().is_none_or(|l| l != stage)
+        {
+            v.push(stage.to_string());
+        }
+    }
+    /// The stages named so far, in order (a stage entered twice in a row counts once).
+    pub fn stages(&self) -> Vec<String> {
+        self.stages.lock().map(|v| v.clone()).unwrap_or_default()
     }
     pub fn stage(&self) -> String {
         self.stage.lock().map(|s| s.clone()).unwrap_or_default()
+    }
+    /// Start stage `name`, covering `lo..hi` of the whole (0..1); its steps count from 0.
+    pub fn set_phase(&self, name: &str, lo: f64, hi: f64) {
+        let lo = lo.clamp(0.0, 1.0);
+        let hi = hi.clamp(lo, 1.0);
+        self.record(lo);
+        if let Ok(mut s) = self.span.lock() {
+            *s = (lo, hi);
+        }
+        self.total.store(0, Ordering::Relaxed);
+        self.done.store(0, Ordering::Relaxed);
+        self.set_stage(name);
+    }
+    fn record(&self, v: f64) -> f64 {
+        let bits = v.clamp(0.0, 1.0).to_bits();
+        f64::from_bits(self.peak.fetch_max(bits, Ordering::Relaxed).max(bits))
+    }
+    /// Share of the whole work done, 0..1: the current stage's steps within its span. Never
+    /// decreases.
+    pub fn overall(&self) -> f64 {
+        let (lo, hi) = self.span.lock().map(|s| *s).unwrap_or((0.0, 1.0));
+        self.record(lo + (hi - lo) * self.fraction().unwrap_or(0.0))
     }
 }
 
@@ -105,6 +159,13 @@ pub fn stage(name: &str) {
     }
 }
 
+/// Start stage `name` of the current task, covering `lo..hi` of the whole (see [`Task::set_phase`]).
+pub fn phase(name: &str, lo: f64, hi: f64) {
+    if let Some(t) = current() {
+        t.set_phase(name, lo, hi);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -125,5 +186,23 @@ mod tests {
         assert!(r.is_err());
         assert_eq!(t.progress(), (4, 10));
         assert!(step(1, 2).is_ok(), "outside the scope nothing is cancelled");
+    }
+
+    #[test]
+    fn phases_map_their_steps_into_the_whole_and_never_go_back() {
+        let t = Task::new();
+        scope(t.clone(), || {
+            phase("reading", 0.0, 0.2);
+            step(5, 10).unwrap();
+            assert!((t.overall() - 0.1).abs() < 1e-9);
+            phase("parsing", 0.2, 0.9);
+            assert!((t.overall() - 0.2).abs() < 1e-9, "a new stage starts where the last one ended");
+            step(1, 2).unwrap();
+            assert!((t.overall() - 0.55).abs() < 1e-9);
+            assert_eq!(t.stage(), "parsing");
+            // A stage that restarts its count does not move the whole back.
+            step(0, 2).unwrap();
+            assert!((t.overall() - 0.55).abs() < 1e-9);
+        });
     }
 }

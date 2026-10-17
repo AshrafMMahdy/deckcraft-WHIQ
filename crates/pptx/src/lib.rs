@@ -78,6 +78,17 @@ pub fn export(p: &Presentation) -> Result<Vec<u8>, PptxError> {
     write::export(p, write::CT_PRES)
 }
 
+/// WHIQ: [`export_as`] reporting progress (`on(stage, done, total)`, see `write::export_with`);
+/// returning `false` stops it.
+pub fn export_as_with(p: &Presentation, ext: &str, on: &mut dyn FnMut(&'static str, usize, usize) -> bool) -> Result<Vec<u8>, PptxError> {
+    let ct = match ext {
+        "potx" => write::CT_TEMPLATE,
+        "ppsx" => write::CT_SHOW,
+        _ => write::CT_PRES,
+    };
+    write::export_with(p, ct, on)
+}
+
 /// Write a package for `ext`: `potx` (template) and `ppsx` (slide show) differ from `pptx` only in
 /// the main part's content type.
 pub fn export_as(p: &Presentation, ext: &str) -> Result<Vec<u8>, PptxError> {

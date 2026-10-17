@@ -251,10 +251,40 @@ italics reach theirs, and an Arabic cluster in an Inter run falls back to the bu
   `checkpoints_follow_time_and_go_once_the_work_is_saved` (the time trigger; a save removes the
   checkpoint; closing writes the recovered copy and removes the new one).
 
+## 11. Progress on every job (round 2)
+
+Every job — and every running call, in `server_status.current_call` — reports `progress` (0..1,
+never going back, 1 only once done), the `stage` it is in, that stage's `steps` (`done`/`total`)
+and the `stages` passed so far. Work in several stages names each with the share of the whole it
+covers (`deckcraft_engine::task::phase`), so progress runs evenly across them:
+
+| job | stages (share of the whole) and what is counted |
+|-----|------------------------------------------------|
+| open `.pptx`/`.potx` | reading the file (0–15 %, bytes, 4 MB chunks with a safe point each) → reading the presentation / reading slides (15–90 %, slides) → adding it to the session (90–100 %, when the worker takes it in) |
+| open `.deckcraft`, outline | reading the file (bytes) → reading the presentation → adding it to the session |
+| export PDF | writing PDF pages (0–90 %, pages, vector or raster) → writing the file (90–100 %, bytes) |
+| export PNG/JPEG (all slides) | rendering slides (0–100 %, slides; each file written as its slide is done) |
+| export GIF | rendering GIF frames (0–90 %, frames) → writing the file |
+| export / save `.pptx`/`.potx`/`.ppsx` | writing slides (0–50 %, slides) → compressing the package (50–90 %, bytes of parts) → writing the file |
+| export / save `.deckcraft`, outline | writing the presentation → writing the file |
+| `batch` (a call) | running commands (commands) |
+| `build_deck` (a call) | slides built |
+
+Every count is also a safe point for `cancel` (§7), except the final file write (the file is
+written whole or not at all). Code: `crates/engine/src/task.rs` (`phase`, `Task::overall`,
+`Task::stages`), `crates/engine/src/cmd/file.rs`, `crates/engine/src/io.rs`
+(`read_file_reporting`, `write_file_reporting`), `crates/pptx/src/write/mod.rs` (`export_with`),
+`crates/pptx/src/opc.rs` (`finish_with`), `crates/mcp/src/jobs.rs`. Tests:
+`tests_task::every_job_reports_its_stages_and_progress` (engine: every export format, save, and
+opening `.pptx` and `.deckcraft`), `task::tests::phases_map_their_steps_into_the_whole_and_never_go_back`,
+and `long_work_runs_as_a_job` (contract: PDF, PNG, `.pptx` export jobs and an open job report
+their stages; the open job is seen in "reading the file" while it runs).
+
 ## Not done / known limits
 
-- Busy is per process: one worker serves calls in order (one process per caller and document is
-  the platform's model); a call cannot be preempted once it runs — jobs cover the long ones.
+- By design, not a gap: busy is per process — one worker serves calls in order (one process per
+  caller and document is the platform's model); a running call stops at its next safe point on
+  `cancel` (§7), and long work runs as jobs alongside it.
 
 ## Test status (Linux x86_64 container, 2026-10-17)
 

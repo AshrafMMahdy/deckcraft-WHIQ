@@ -133,10 +133,20 @@ fn long_work_runs_as_a_job() {
     let j = wait_job(&mut m, &id);
     assert_eq!(j["state"], "done", "{j}");
     assert!(std::fs::read(dir.join("big.pdf")).unwrap().starts_with(b"%PDF"));
+    // Every job reports its stages and progress (WHIQ round 2).
+    assert_eq!(j["progress"], 1.0, "{j}");
+    assert_eq!(j["stages"], json!(["writing PDF pages", "writing the file"]), "{j}");
     // Every slide as PNG, with progress per slide.
     let r = m.ok("export", json!({"path": "slide.png", "all": true, "scale": 0.25}));
     let j = wait_job(&mut m, r["job_id"].as_str().unwrap());
     assert_eq!(j["result"]["files"].as_array().unwrap().len(), 13, "{j}");
+    assert_eq!(j["stages"], json!(["rendering slides"]), "{j}");
+    assert_eq!(j["steps"], json!({"done": 13, "total": 13}), "{j}");
+    // Any export can be asked to run as a job; a .pptx one reports slides, compression, the file.
+    let r = m.ok("export", json!({"path": "copy.pptx", "async": true}));
+    let j = wait_job(&mut m, r["job_id"].as_str().unwrap());
+    assert_eq!(j["stages"], json!(["writing slides", "compressing the package", "writing the file"]), "{j}");
+    assert_eq!(j["progress"], 1.0, "{j}");
     // The result survives: asking again later still gives it.
     std::thread::sleep(Duration::from_millis(200));
     assert_eq!(m.ok("job_status", json!({"job_id": id}))["state"], "done");
@@ -150,8 +160,14 @@ fn long_work_runs_as_a_job() {
     let e = m.err("inspect_document", json!({}));
     assert_eq!(e["code"], "busy", "{e}");
     assert_eq!(e["job_id"], json!(id));
+    let running = m.ok("job_status", json!({"job_id": id}));
+    assert_eq!(running["stage"], "reading the file", "{running}");
     let j = wait_job(&mut m, &id);
     assert_eq!(j["state"], "done", "{j}");
+    assert_eq!(j["progress"], 1.0, "{j}");
+    let stages: Vec<&str> = j["stages"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+    assert_eq!(stages.first(), Some(&"reading the file"), "{j}");
+    assert!(stages.contains(&"reading slides") && stages.last() == Some(&"adding it to the session"), "{j}");
     assert_eq!(m.ok("inspect_document", json!({}))["slides"].as_array().unwrap().len(), 13);
     let e = m.err("job_status", json!({"job_id": "job-99"}));
     assert_eq!(e["code"], "not_found");

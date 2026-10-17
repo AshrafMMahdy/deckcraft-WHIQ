@@ -152,7 +152,9 @@ impl Job {
     pub fn effective_progress(&self) -> f64 {
         match self.state {
             JobState::Done => 1.0,
-            _ => self.progress.max(self.task.fraction().unwrap_or(0.0) * 0.95),
+            // Running: the task's stages and steps (never past 0.99 until it is done).
+            JobState::Running => self.progress.max(self.task.overall()).min(0.99),
+            _ => self.progress.max(self.task.overall()),
         }
     }
 
@@ -168,6 +170,7 @@ impl Job {
             "progress": (progress * 1000.0).round() / 1000.0,
             "stage": self.task.stage(),
             "steps": {"done": done, "total": total},
+            "stages": self.task.stages(),
             "elapsed_ms": elapsed,
         });
         match self.state {
@@ -276,9 +279,6 @@ impl Shared {
     }
     pub fn with_job<T>(&self, id: &str, f: impl FnOnce(&mut Job) -> T) -> Option<T> {
         lock(&self.jobs).get_mut(id).map(f)
-    }
-    pub fn job_progress(&self, id: &str, p: f64) {
-        self.with_job(id, |j| j.progress = p.clamp(0.0, 1.0));
     }
     pub fn job_done(&self, id: &str, result: Value) {
         self.with_job(id, |j| {
@@ -422,7 +422,7 @@ impl Shared {
     pub fn current_progress(&self) -> Option<Value> {
         lock(&self.current_task).as_ref().map(|t| {
             let (d, n) = t.progress();
-            json!({"done": d, "total": n, "stage": t.stage(), "cancelling": t.is_cancelled()})
+            json!({"progress": (t.overall() * 1000.0).round() / 1000.0, "done": d, "total": n, "stage": t.stage(), "cancelling": t.is_cancelled()})
         })
     }
     pub fn current(&self) -> Option<(String, u64)> {

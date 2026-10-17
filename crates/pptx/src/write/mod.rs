@@ -528,6 +528,13 @@ fn sanitized(p: &Presentation) -> std::borrow::Cow<'_, Presentation> {
 }
 
 pub fn export(p: &Presentation, main_ct: &str) -> Result<Vec<u8>, PptxError> {
+    export_with(p, main_ct, &mut |_, _, _| true)
+}
+
+/// WHIQ: [`export`] reporting progress: `on(stage, done, total)` per slide written ("writing
+/// slides") and per byte of parts compressed ("compressing the package"); returning `false`
+/// stops the export (`PptxError::Write("cancelled")`).
+pub fn export_with(p: &Presentation, main_ct: &str, on: &mut dyn FnMut(&'static str, usize, usize) -> bool) -> Result<Vec<u8>, PptxError> {
     let p = sanitized(p);
     let p: &Presentation = &p;
     let mut x = Exp {
@@ -657,6 +664,9 @@ pub fn export(p: &Presentation, main_ct: &str) -> Result<Vec<u8>, PptxError> {
     // Slides.
     let mut slide_rids = vec![];
     for (i, s) in p.slides.iter().enumerate() {
+        if !on("writing slides", i, p.slides.len()) {
+            return Err(PptxError::Write("cancelled".into()));
+        }
         let sname = format!("ppt/slides/slide{}.xml", i + 1);
         let mut so = Out::new(&sname);
         // WHIQ: parts the slide linked that DeckCraft doesn't model are linked first, under their own
@@ -773,7 +783,7 @@ pub fn export(p: &Presentation, main_ct: &str) -> Result<Vec<u8>, PptxError> {
         root.add_new(&k.rel_type, &k.name, false);
     }
     x.pkg.rels("", &root);
-    x.pkg.finish()
+    x.pkg.finish_with(on)
 }
 
 /// A kept part may be written at this name: inside the package, not one the writer always makes.

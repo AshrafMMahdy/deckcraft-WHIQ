@@ -219,7 +219,7 @@ pub fn encode(doc: &Presentation, opts: &GifOptions) -> Result<GifOutput> {
         if opts.loop_forever {
             enc.set_repeat(Repeat::Infinite).map_err(enc_err)?;
         }
-        crate::task::stage("rendering GIF frames");
+        crate::task::phase("rendering GIF frames", 0.0, 0.9);
         for (k, i) in frames.iter().enumerate() {
             crate::task::step(k, frames.len())?;
             let img = deckcraft_render::render_slide(doc, *i, &deckcraft_render::RenderOpts { scale, size: Some((w, h)), ..Default::default() });

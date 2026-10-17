@@ -424,7 +424,11 @@ impl PackageOut {
         }
         self.files.push((name.to_string(), data, false));
     }
-    pub fn finish(self) -> Result<Vec<u8>, PptxError> {
+    /// The package's bytes. WHIQ: `on(stage, done, total)` is told the bytes compressed so far;
+    /// `false` stops it.
+    pub fn finish_with(self, on: &mut dyn FnMut(&'static str, usize, usize) -> bool) -> Result<Vec<u8>, PptxError> {
+        let total: usize = self.files.iter().map(|f| f.1.len()).sum();
+        let mut done = 0usize;
         let mut ct = W::new();
         ct.open("Types", A::new().a("xmlns", "http://schemas.openxmlformats.org/package/2006/content-types"));
         for (e, c) in &self.defaults {
@@ -448,6 +452,10 @@ impl PackageOut {
                 log::warn!("pptx: part {name} written twice; keeping the first");
                 continue;
             }
+            if !on("compressing the package", done, total) {
+                return Err(PptxError::Write("cancelled".into()));
+            }
+            done += data.len();
             let large = data.len() as u64 >= u32::MAX as u64 / 2;
             let opts = if *compress { deflate } else { stored }.large_file(large);
             zw.start_file(name.as_str(), opts).map_err(|e| err(&e))?;

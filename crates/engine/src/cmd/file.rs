@@ -189,8 +189,11 @@ pub struct LoadedFile {
 /// Read and parse the presentation at `path`.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn read_presentation_file(path: &str) -> Result<LoadedFile> {
-    let bytes = crate::io::read_file(path).map_err(EngineError::Other)?;
+    crate::task::phase("reading the file", 0.0, 0.15);
+    let bytes = crate::io::read_file_reporting(path).map_err(EngineError::Other)?;
+    crate::task::phase("reading the presentation", 0.15, 0.9);
     let (doc, damaged) = open_checked(path, &bytes)?;
+    crate::task::phase("adding it to the session", 0.9, 1.0);
     let native = deckcraft_format::sniff(&bytes) || deckcraft_pptx::sniff(&bytes);
     Ok(LoadedFile { path: path.to_string(), doc, native, damaged })
 }
@@ -262,11 +265,27 @@ fn report_damage(s: &mut Session, damaged: &[String]) -> Result<()> {
 /// Encode the presentation in `format` (`deckcraft`, `pptx`, `potx`, `ppsx`, `outline`, `pdf`, `gif`).
 pub fn save_bytes(doc: &Presentation, format: &str) -> Result<Vec<u8>> {
     match format {
-        f @ ("pptx" | "potx" | "ppsx") => deckcraft_pptx::export_as(doc, f).map_err(|e| EngineError::Other(e.to_string())),
+        // WHIQ: progress per slide written and per byte compressed, with a safe point at each.
+        f @ ("pptx" | "potx" | "ppsx") => {
+            let mut last = "";
+            let mut on = |stage: &'static str, done: usize, total: usize| {
+                if stage != last {
+                    last = stage;
+                    let (lo, hi) = if stage == "writing slides" { (0.0, 0.5) } else { (0.5, 0.9) };
+                    crate::task::phase(stage, lo, hi);
+                }
+                crate::task::step(done, total).is_ok()
+            };
+            deckcraft_pptx::export_as_with(doc, f, &mut on)
+                .map_err(|e| if crate::task::check().is_err() { crate::task::cancelled() } else { EngineError::Other(e.to_string()) })
+        }
         "outline" | "txt" => Ok(deckcraft_format::slides_to_outline(doc).into_bytes()),
         "pdf" => deckcraft_pdf::export(doc, &Default::default()).map_err(|e| EngineError::Other(e.to_string())),
         "gif" => gif_bytes(doc, &Value::Null),
-        _ => deckcraft_format::save(doc).map_err(|e| EngineError::Other(e.to_string())),
+        _ => {
+            crate::task::phase("writing the presentation", 0.0, 0.9);
+            deckcraft_format::save(doc).map_err(|e| EngineError::Other(e.to_string()))
+        }
     }
 }
 
@@ -340,7 +359,7 @@ pub fn pdf_bytes(doc: &Presentation, p: &Value) -> Result<Vec<u8>> {
     let mut o = pdf_options(p, doc.slides.len())?;
     // WHIQ: progress per page, and a safe point between pages.
     if let Some(task) = crate::task::current() {
-        crate::task::stage("writing PDF pages");
+        crate::task::phase("writing PDF pages", 0.0, 0.9);
         o.on_page = Some(deckcraft_pdf::PageHook::new(move |done, total| {
             task.set(done as u64, total as u64);
             !task.is_cancelled()
@@ -409,6 +428,12 @@ fn write_file(path: &str, bytes: &[u8]) -> Result<()> {
     crate::io::write_file(path, bytes).map_err(EngineError::Other)
 }
 
+/// WHIQ: the last stage of a save or an export: the file, with progress by bytes.
+fn write_whole(path: &str, bytes: &[u8]) -> Result<()> {
+    crate::task::phase("writing the file", 0.9, 1.0);
+    crate::io::write_file_reporting(path, bytes).map_err(EngineError::Other)
+}
+
 fn save(s: &mut Session, p: &Value) -> Result<Value> {
     let path = str_param(p, "path").map(String::from).or_else(|| s.active().and_then(|d| d.path.clone()));
     let Some(path) = path else {
@@ -417,7 +442,7 @@ fn save(s: &mut Session, p: &Value) -> Result<Value> {
     };
     let format = str_param(p, "format").unwrap_or(format_for_path(&path));
     let bytes = save_bytes(&s.doc()?.doc, format)?;
-    write_file(&path, &bytes)?;
+    write_whole(&path, &bytes)?;
     mark_saved(s, Some(path.clone()))?;
     Ok(json!({"path": path, "bytes": bytes.len()}))
 }
@@ -512,7 +537,7 @@ fn export(s: &mut Session, p: &Value) -> Result<Value> {
             }
             let scale = image_scale(&st.doc, scale);
             let mut written = vec![];
-            crate::task::stage("rendering slides");
+            crate::task::phase("rendering slides", 0.0, 1.0);
             for (k, i) in slides.iter().enumerate() {
                 // A safe point: the files written so far are whole; say which.
                 crate::task::step(k, slides.len())
@@ -531,12 +556,15 @@ fn export(s: &mut Session, p: &Value) -> Result<Value> {
                 write_file(&out, &bytes)
                     .map_err(|e| if written.is_empty() { e } else { EngineError::Other(format!("{e} (slides 1–{k} were written)")) })?;
                 written.push(out);
+                if let Some(t) = crate::task::current() {
+                    t.set(written.len() as u64, slides.len() as u64);
+                }
             }
             Ok(json!({"files": written}))
         }
         "pdf" => {
             let bytes = pdf_bytes(&st.doc, p)?;
-            write_file(&path, &bytes)?;
+            write_whole(&path, &bytes)?;
             Ok(json!({"path": path, "bytes": bytes.len()}))
         }
         "gif" => {
@@ -546,7 +574,7 @@ fn export(s: &mut Session, p: &Value) -> Result<Value> {
                 gp["slides"] = json!(parse_slide_range(text, st.doc.slides.len())?);
             }
             let out = crate::gif_export::encode(&st.doc, &crate::gif_export::GifOptions::from_params(&gp)?)?;
-            write_file(&path, &out.bytes)?;
+            write_whole(&path, &out.bytes)?;
             Ok(json!({
                 "path": path,
                 "bytes": out.bytes.len(),
@@ -558,7 +586,7 @@ fn export(s: &mut Session, p: &Value) -> Result<Value> {
         }
         "pptx" | "potx" | "ppsx" | "deckcraft" | "outline" | "txt" => {
             let bytes = save_bytes(&st.doc, &format)?;
-            write_file(&path, &bytes)?;
+            write_whole(&path, &bytes)?;
             Ok(json!({"path": path, "bytes": bytes.len()}))
         }
         other => Err(bad("file.export", format!("unknown format `{other}`"))),

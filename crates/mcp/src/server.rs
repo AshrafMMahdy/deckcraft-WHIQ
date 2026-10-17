@@ -366,6 +366,13 @@ impl Server {
         } else {
             0
         };
+        // Contract tests only: jobs (open, export) take their delay on the job thread.
+        if self.shared.config.test_hooks
+            && matches!(name, "open_presentation" | "export")
+            && let (Some(d), Some(o)) = (raw_args.get("_delay_ms").cloned(), args.as_object_mut())
+        {
+            o.insert("_delay_ms".into(), d);
+        }
 
         // Gates: a document the server closed, a document still opening.
         if needs_document(name, &args) && !self.has_document() {
