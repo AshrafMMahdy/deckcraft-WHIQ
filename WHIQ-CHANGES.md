@@ -140,3 +140,12 @@ DrawingML: `prstDash`, `headEnd`/`tailEnd`, `custGeom`, `close`, alpha),
   slide only.
 - Busy is per process: one worker serves calls in order (one process per caller and document is
   the platform's model); a call cannot be preempted once it runs — jobs cover the long ones.
+
+## Test status (Linux x86_64 container, 2026-10-17)
+
+`cargo test` over every crate plus `deckcraft-cli`: 1635 passed, 13 failed, 6 ignored. The 13
+failures are all in `deckcraft-ui-egui` (egui_kittest: "No adapter found" — no GPU in the
+container; `replacefonts_tests::ribbon_button_opens_the_dialog_and_replaces` fails the same way on
+upstream `2cf4535`). The desktop app `apps/deckcraft` does not build here (no ALSA headers for
+`alsa-sys`). Everything the headless binary uses is green, including the 21 contract and deck
+tests and the smoke script.
