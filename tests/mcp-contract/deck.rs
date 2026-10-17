@@ -422,20 +422,22 @@ fn editing_in_place_keeps_media_animations_fonts_and_unknown_parts() {
                     .replace("</Types>", "<Default Extension=\"fntdata\" ContentType=\"application/x-fontdata\"/><Override PartName=\"/ppt/addin/state.xml\" ContentType=\"application/vnd.acme.state+xml\"/><Override PartName=\"/ppt/addin/slideNote.xml\" ContentType=\"application/vnd.acme.note+xml\"/></Types>")
                     .into_bytes(),
                 "ppt/_rels/presentation.xml.rels" => text
-                    .replace("</Relationships>", "<Relationship Id=\"rIdFont1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/font\" Target=\"fonts/font1.fntdata\"/><Relationship Id=\"rIdAcme\" Type=\"urn:acme:addin-state\" Target=\"addin/state.xml\"/></Relationships>")
+                    .replace("</Relationships>", "<Relationship Id=\"rIdFont1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/font\" Target=\"fonts/font1.fntdata\"/><Relationship Id=\"rIdAcme\" Type=\"urn:acme:addin-state\" Target=\"addin/state.xml\"/><Relationship Id=\"rIdShared\" Type=\"urn:acme:shared\" Target=\"addin/slideNote.xml\"/></Relationships>")
                     .into_bytes(),
                 "ppt/presentation.xml" => {
                     let at = text.find("<p:notesSz").unwrap();
                     let end = at + text[at..].find("/>").unwrap() + 2;
                     format!("{}<p:embeddedFontLst><p:embeddedFont><p:font typeface=\"Legacy Test\"/><p:regular r:id=\"rIdFont1\"/></p:embeddedFont></p:embeddedFontLst>{}", &text[..end], &text[end..]).into_bytes()
                 }
+                // The add-in's part takes `rId1`, an id DeckCraft's writer would give the layout.
                 "ppt/slides/_rels/slide2.xml.rels" => text
-                    .replace("</Relationships>", "<Relationship Id=\"rIdAcmeNote\" Type=\"urn:acme:slide-note\" Target=\"../addin/slideNote.xml\"/></Relationships>")
+                    .replace("Id=\"rId1\"", "Id=\"rIdLayout\"")
+                    .replace("</Relationships>", "<Relationship Id=\"rId1\" Type=\"urn:acme:slide-note\" Target=\"../addin/slideNote.xml\"/></Relationships>")
                     .into_bytes(),
                 "ppt/slides/slide2.xml" => {
                     let t = text.trim_end();
                     assert!(t.ends_with("</p:sld>"));
-                    format!("{}<p:extLst><p:ext uri=\"{{ACME-0001}}\"><acme:tag xmlns:acme=\"urn:acme\" note=\"kept\"/></p:ext></p:extLst></p:sld>", &t[..t.len() - "</p:sld>".len()]).into_bytes()
+                    format!("{}<p:extLst><p:ext uri=\"{{ACME-0001}}\"><acme:tag xmlns:acme=\"urn:acme\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" r:id=\"rId1\" note=\"kept\"/></p:ext></p:extLst></p:sld>", &t[..t.len() - "</p:sld>".len()]).into_bytes()
                 }
                 _ => data,
             };
@@ -472,7 +474,15 @@ fn editing_in_place_keeps_media_animations_fonts_and_unknown_parts() {
     assert!(slide.contains("Customer slide (edited)") && slide.contains("keep me"));
     // Unknown parts are linked again, under their ids.
     assert!(zip_text(&after, "ppt/_rels/presentation.xml.rels").contains("Id=\"rIdAcme\" Type=\"urn:acme:addin-state\""));
-    assert!(zip_text(&after, "ppt/slides/_rels/slide2.xml.rels").contains("Id=\"rIdAcmeNote\" Type=\"urn:acme:slide-note\""));
+    // The kept extension points at the add-in's part by id; the id still names that part, and the
+    // writer's own relationships took other ids.
+    let rels = zip_text(&after, "ppt/slides/_rels/slide2.xml.rels");
+    assert!(rels.contains("Id=\"rId1\" Type=\"urn:acme:slide-note\" Target=\"../addin/slideNote.xml\""), "{rels}");
+    assert_eq!(rels.matches("Id=\"rId1\"").count(), 1, "{rels}");
+    assert!(slide.contains("r:id=\"rId1\""), "the extension still points at it");
+    // A part linked from the deck and from a slide is written once and linked from both.
+    assert_eq!(names_after.iter().filter(|n| *n == "ppt/addin/slideNote.xml").count(), 1);
+    assert!(zip_text(&after, "ppt/_rels/presentation.xml.rels").contains("Id=\"rIdShared\" Type=\"urn:acme:shared\" Target=\"addin/slideNote.xml\""));
     let ct = zip_text(&after, "[Content_Types].xml");
     assert!(ct.contains("/ppt/addin/state.xml") && ct.contains("application/vnd.acme.note+xml"), "{ct}");
 }

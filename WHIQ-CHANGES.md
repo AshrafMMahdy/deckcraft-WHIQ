@@ -171,12 +171,25 @@ cancel answers at once, the call stops long before its end, queued calls dropped
 leaves no document), `crates/engine/src/tests_task.rs` (a cancelled build adds no deck; cancelled
 PDF, PNG and GIF exports write nothing; a cancelled read adds no document; PDF progress per page).
 
+## 8. Relationship ids of kept parts (round 2)
+
+- Kept parts are linked **first** in their holder's relationships (the presentation's, each
+  slide's), under their original ids, so the writer's own relationships (layout, notes, pictures…)
+  take other ids and can never take theirs. Should an original id be taken all the same, the part is
+  linked under a new id past every kept one, and every kept XML of that holder that names the old id
+  (the slide's or the presentation's extension list) is renumbered with it — relationship-id
+  attributes only, all in one pass (no chains). `crates/pptx/src/write/mod.rs` (`link_kept`,
+  `renumber_refs`).
+- Extension lists that point at kept parts are now kept too (upstream dropped every extension list
+  holding a relationship id); one pointing at anything else is still left out.
+- A part linked from both the presentation and a slide is written once and linked from both.
+- Tests: `kept_id_tests::a_taken_kept_id_is_renumbered_with_the_xml_that_names_it` (pptx unit
+  test), `editing_in_place_keeps_media_animations_fonts_and_unknown_parts` (an add-in part on `rId1`
+  — an id the writer would give the layout — named by a slide extension, and a part shared by the
+  deck and a slide).
+
 ## Not done / known limits
 
-- A relationship id kept from a file that collides with one the writer made is renamed, and kept
-  XML that pointed at the old id is not rewritten (rare: writer ids are `rIdN`).
-- A part linked both from the presentation and from a slide is written once and linked from the
-  slide only.
 - Busy is per process: one worker serves calls in order (one process per caller and document is
   the platform's model); a call cannot be preempted once it runs — jobs cover the long ones.
 

@@ -62,6 +62,8 @@ pub struct Exp<'a> {
     /// Parts kept from an unchanged chart (`ppt/…/keptN.ext`).
     n_kept: u32,
     pub slide_parts: HashMap<SlideId, String>,
+    /// WHIQ: kept parts written so far (lower-case names).
+    kept_written: std::collections::HashSet<String>,
     pub table_styles: Vec<String>,
     placeholder: Option<String>,
 }
@@ -540,6 +542,7 @@ pub fn export(p: &Presentation, main_ct: &str) -> Result<Vec<u8>, PptxError> {
         n_chartex: 0,
         n_kept: 0,
         slide_parts: HashMap::new(),
+        kept_written: Default::default(),
         table_styles: vec![],
         placeholder: None,
     };
@@ -547,6 +550,18 @@ pub fn export(p: &Presentation, main_ct: &str) -> Result<Vec<u8>, PptxError> {
         x.slide_parts.insert(s.id, format!("ppt/slides/slide{}.xml", i + 1));
     }
     let mut pres = Out::new("ppt/presentation.xml");
+    // WHIQ: kept parts linked from the presentation take their own ids first (see the slides).
+    let pres_renumbered = link_kept(&mut pres.rels, "ppt/presentation.xml", &p.kept_parts);
+    let patched_p;
+    let p: &Presentation = if pres_renumbered.is_empty() {
+        p
+    } else {
+        let mut c = p.clone();
+        c.raw_ext = c.raw_ext.as_deref().map(|r| renumber_refs(r, &pres_renumbered));
+        patched_p = c;
+        &patched_p
+    };
+    x.p = p;
 
     // Masters, themes and layouts.
     let mut master_rids = vec![];
@@ -644,6 +659,22 @@ pub fn export(p: &Presentation, main_ct: &str) -> Result<Vec<u8>, PptxError> {
     for (i, s) in p.slides.iter().enumerate() {
         let sname = format!("ppt/slides/slide{}.xml", i + 1);
         let mut so = Out::new(&sname);
+        // WHIQ: parts the slide linked that DeckCraft doesn't model are linked first, under their own
+        // ids, so the writer's ids never take theirs; should one be taken all the same, the slide's
+        // kept XML is renumbered with it.
+        let renumbered = link_kept(&mut so.rels, &sname, &s.kept_parts);
+        for k in s.kept_parts.iter().filter(|k| kept_name_ok(&k.name)) {
+            write_kept(&mut x.pkg, &mut x.kept_written, k);
+        }
+        let patched;
+        let s: &Slide = if renumbered.is_empty() {
+            s
+        } else {
+            let mut c = s.as_ref().clone();
+            c.raw_ext = c.raw_ext.as_deref().map(|r| renumber_refs(r, &renumbered));
+            patched = c;
+            &patched
+        };
         if let Some(lp) = layout_parts.get(&s.layout) {
             so.rels.add("slideLayout", &opc::relative(&sname, lp), false);
         }
@@ -670,13 +701,6 @@ pub fn export(p: &Presentation, main_ct: &str) -> Result<Vec<u8>, PptxError> {
             let rid = so.rels.add(RT_COMMENTS_MODERN, &opc::relative(&sname, &mname), false);
             x.pkg.xml_part(&mname, CT_COMMENTS_MODERN, modern_comments_xml(&s.comments, &cname, &mut authors));
             comment_rel = Some(rid);
-        }
-        // WHIQ: parts the slide linked that DeckCraft doesn't model, linked again under their ids.
-        for k in s.kept_parts.iter().filter(|k| !k.rel_type.is_empty() && kept_name_ok(&k.name)) {
-            so.rels.add_with_id(&k.rel_id, &k.rel_type, &opc::relative(&sname, &k.name));
-        }
-        for k in s.kept_parts.iter().filter(|k| kept_name_ok(&k.name)) {
-            write_kept(&mut x.pkg, k);
         }
         let xml = slide_xml(&mut x, &mut so, s, comment_rel.as_deref());
         x.pkg.xml_part(&sname, CT_SLIDE, xml);
@@ -718,28 +742,24 @@ pub fn export(p: &Presentation, main_ct: &str) -> Result<Vec<u8>, PptxError> {
     x.pkg.xml_part("ppt/presentation.xml", main_ct, pxml);
     // Kept parts never replace a part the writer makes (WHIQ: parts under ppt/ are kept too, when
     // the writer made no part of that name).
+    // (WHIQ: a part a slide kept too is written once and linked from both.)
     let kept: Vec<_> = p
         .kept_parts
         .iter()
         .filter(|k| {
             let n = k.name.to_ascii_lowercase();
             kept_name_ok(&n)
-                && !(n.starts_with("ppt/") && x.pkg.has(&n))
+                && !(n.starts_with("ppt/") && x.pkg.has(&n) && !x.kept_written.contains(&n))
                 && !n.starts_with("ppt/presentation.xml")
                 && n != "ppt/_rels/presentation.xml.rels"
         })
         .collect();
-    for k in kept.iter().filter(|k| !k.rel_type.is_empty() && !k.from_root) {
-        let target = opc::relative("ppt/presentation.xml", &k.name);
-        if k.rel_id.is_empty() {
-            pres.rels.add_new(&k.rel_type, &target, false);
-        } else {
-            pres.rels.add_with_id(&k.rel_id, &k.rel_type, &target);
-        }
+    for k in kept.iter().filter(|k| !k.rel_type.is_empty() && !k.from_root && k.rel_id.is_empty()) {
+        pres.rels.add_new(&k.rel_type, &opc::relative("ppt/presentation.xml", &k.name), false);
     }
     x.pkg.rels("ppt/presentation.xml", &pres.rels);
     for k in &kept {
-        write_kept(&mut x.pkg, k);
+        write_kept(&mut x.pkg, &mut x.kept_written, k);
     }
 
     // Document properties and package relationships.
@@ -768,11 +788,59 @@ fn kept_name_ok(name: &str) -> bool {
         && n != "_rels/.rels"
 }
 
-/// WHIQ: write a kept part once (two slides may keep the same one); never over a written part.
-fn write_kept(pkg: &mut opc::PackageOut, k: &deckcraft_model::KeptPart) {
+/// WHIQ: link the kept parts that carry a relationship from `holder`, under their original ids
+/// where free. Returns (old id, new id) for each one that had to be renumbered.
+fn link_kept(rels: &mut opc::RelsOut, holder: &str, kept: &[deckcraft_model::KeptPart]) -> Vec<(String, String)> {
+    let mut renumbered = vec![];
+    // Parts kept without an id of their own (custom XML…) are linked later, under fresh ids.
+    let linkable: Vec<&deckcraft_model::KeptPart> =
+        kept.iter().filter(|k| !k.rel_type.is_empty() && !k.rel_id.is_empty() && !k.from_root && kept_name_ok(&k.name)).collect();
+    let taken = |rels: &opc::RelsOut, id: &str| rels.items.iter().any(|i| i.0 == id);
+    // First every kept id that is free, then new ids (past all of those) for the ones taken.
+    let (free, clash): (Vec<_>, Vec<_>) = linkable.into_iter().partition(|k| !taken(rels, &k.rel_id));
+    for k in free {
+        rels.add_with_id(&k.rel_id, &k.rel_type, &opc::relative(holder, &k.name));
+    }
+    for k in clash {
+        let id = rels.add_with_id("", &k.rel_type, &opc::relative(holder, &k.name));
+        renumbered.push((k.rel_id.clone(), id));
+    }
+    renumbered
+}
+
+/// WHIQ: `xml` with every relationship-id attribute value in `map` (old → new) replaced, all at
+/// once (an id renumbered to another's old id is not renumbered twice).
+pub(crate) fn renumber_refs(xml: &str, map: &[(String, String)]) -> String {
+    let mut out = String::with_capacity(xml.len());
+    let mut rest = xml;
+    while let Some(i) = rest.find('"') {
+        let (head, tail) = rest.split_at(i + 1);
+        out.push_str(head);
+        let Some(j) = tail.find('"') else {
+            rest = tail;
+            break;
+        };
+        let value = tail.get(..j).unwrap_or_default();
+        // Only attribute values of relationship-id attributes (`r:id="…"`, `r:embed="…"`…).
+        let attr = head.trim_end_matches('"').trim_end_matches('=').rsplit([' ', '<', '\t', '\n', '\r']).next().unwrap_or("");
+        match map.iter().find(|(o, _)| o == value).filter(|_| crate::read::is_rel_attr(attr, value)) {
+            Some((_, new)) => out.push_str(new),
+            None => out.push_str(value),
+        }
+        out.push('"');
+        rest = tail.get(j + 1..).unwrap_or_default();
+    }
+    out.push_str(rest);
+    out
+}
+
+/// WHIQ: write a kept part once (two slides, or a slide and the deck, may keep the same one);
+/// never over a part the writer made.
+fn write_kept(pkg: &mut opc::PackageOut, written: &mut std::collections::HashSet<String>, k: &deckcraft_model::KeptPart) {
     if pkg.has(&k.name) {
         return;
     }
+    written.insert(k.name.to_ascii_lowercase());
     let data = if k.bytes.is_empty() { k.xml.clone().into_bytes() } else { k.bytes.clone() };
     if k.content_type.is_empty() {
         pkg.raw(&k.name, data);
@@ -1292,4 +1360,38 @@ fn app_xml(p: &Presentation) -> Vec<u8> {
     }
     w.close("Properties");
     w.finish()
+}
+
+#[cfg(test)]
+mod kept_id_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    /// WHIQ: a kept part whose id the writer already gave out is linked under a new one, and the
+    /// kept XML that pointed at the old id is renumbered with it (all at once: no chains).
+    #[test]
+    fn a_taken_kept_id_is_renumbered_with_the_xml_that_names_it() {
+        let mut rels = opc::RelsOut::default();
+        rels.add("slideLayout", "../slideLayouts/slideLayout1.xml", false); // rId1
+        let kept = vec![
+            deckcraft_model::KeptPart { name: "ppt/x/a.xml".into(), rel_type: "urn:a".into(), rel_id: "rId1".into(), ..Default::default() },
+            deckcraft_model::KeptPart { name: "ppt/x/b.xml".into(), rel_type: "urn:b".into(), rel_id: "rId2".into(), ..Default::default() },
+        ];
+        let map = link_kept(&mut rels, "ppt/slides/slide1.xml", &kept);
+        assert_eq!(map.len(), 1);
+        let (old, new) = map.first().unwrap();
+        assert_eq!(old, "rId1");
+        assert_ne!(new, "rId1");
+        assert_ne!(new, "rId2", "never another kept part's id");
+        let xml = r#"<p:ext uri="{X}"><a:t r:id="rId1" val="rId1"/><b:t r:embed="rId2"/></p:ext>"#;
+        let out = renumber_refs(xml, &map);
+        assert!(out.contains(&format!(r#"r:id="{new}""#)), "{out}");
+        assert!(out.contains(r#"val="rId1""#), "only relationship attributes change: {out}");
+        assert!(out.contains(r#"r:embed="rId2""#), "{out}");
+        let ids: Vec<&String> = rels.items.iter().map(|i| &i.0).collect();
+        let mut unique = ids.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(ids.len(), unique.len(), "ids stay unique: {ids:?}");
+    }
 }

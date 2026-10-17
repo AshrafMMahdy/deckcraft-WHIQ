@@ -632,7 +632,6 @@ pub fn import_with(bytes: &[u8], on_slide: &mut dyn FnMut(usize, usize) -> bool)
         let part = Part::new(&pkg, path, doc);
         let layout = part.rels.first_of("slideLayout").and_then(|r| layout_by_part.get(&opc::norm(&r.target)).copied()).unwrap_or(fallback_layout);
         let mut slide = read_slide(&mut imp, &part, doc, *id, layout);
-        slide.kept_parts = foreign_parts(&pkg, path, SLIDE_KNOWN_RELS);
         // Notes.
         if let Some(n) = part.rels.first_of("notesSlide")
             && let Some(nd) = load(&pkg, &n.target)
@@ -673,9 +672,12 @@ pub fn import_with(bytes: &[u8], on_slide: &mut dyn FnMut(usize, usize) -> bool)
                 p.sections.push(Section { name: s.attr("name").unwrap_or("").to_string(), slides });
             }
         }
+        // WHIQ: an extension pointing only at parts kept verbatim is kept too (their ids are kept).
+        let kept_ids: Vec<String> =
+            foreign_parts(&pkg, &pres_path, PRES_KNOWN_RELS).into_iter().map(|k| k.rel_id).filter(|i| !i.is_empty()).collect();
         let kept: String = ext
             .children_named("ext")
-            .filter(|e| e.attr("uri") != Some(crate::SECTION_EXT_URI) && !has_rel_refs(e))
+            .filter(|e| e.attr("uri") != Some(crate::SECTION_EXT_URI) && rel_refs(e).iter().all(|id| kept_ids.contains(id)))
             .map(|e| pres_part.keep(e))
             .collect();
         if !kept.is_empty() {
@@ -1239,7 +1241,11 @@ fn read_slide(imp: &mut Imp, part: &Part, doc: &Doc, id: SlideId, layout: Layout
     if let Some(t) = root.child("timing") {
         s.animations = timing::animations(imp, part, &ctx, t, &s.shapes);
     }
-    if let Some(ext) = root.child("extLst").filter(|e| !has_rel_refs(e)) {
+    // WHIQ: parts linked with relationships we don't model are kept; an extension list that points
+    // only at those (or at nothing) is kept with them.
+    s.kept_parts = foreign_parts(imp.pkg, &part.name, SLIDE_KNOWN_RELS);
+    let kept_ids: Vec<&str> = s.kept_parts.iter().map(|k| k.rel_id.as_str()).filter(|i| !i.is_empty()).collect();
+    if let Some(ext) = root.child("extLst").filter(|e| rel_refs(e).iter().all(|id| kept_ids.contains(&id.as_str()))) {
         s.raw_ext = Some(ext.elements().map(|e| part.keep(e)).collect());
     }
     s
