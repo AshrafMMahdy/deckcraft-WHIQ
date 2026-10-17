@@ -331,16 +331,33 @@ impl RelsOut {
         if let Some((id, ..)) = self.items.iter().find(|(_, t, tg, e)| *t == ty && tg == target && *e == external) {
             return id.clone();
         }
-        let id = format!("rId{}", self.items.len() + 1);
+        let id = self.fresh_id();
         self.items.push((id.clone(), ty, target.to_string(), external));
         id
     }
     /// Always add a new relationship even if an identical one exists.
     pub fn add_new(&mut self, kind: &str, target: &str, external: bool) -> String {
         let ty = if kind.starts_with("http") { kind.to_string() } else { format!("{RT_BASE}{kind}") };
-        let id = format!("rId{}", self.items.len() + 1);
+        let id = self.fresh_id();
         self.items.push((id.clone(), ty, target.to_string(), external));
         id
+    }
+    /// WHIQ: add a relationship under `id` when that id is free (kept XML may point at it), else
+    /// under a fresh one. Returns the id used.
+    pub fn add_with_id(&mut self, id: &str, kind: &str, target: &str) -> String {
+        let free = !id.is_empty() && !self.items.iter().any(|(i, ..)| i == id);
+        let ty = if kind.starts_with("http") || kind.contains(':') { kind.to_string() } else { format!("{RT_BASE}{kind}") };
+        let id = if free { id.to_string() } else { self.fresh_id() };
+        self.items.push((id.clone(), ty, target.to_string(), false));
+        id
+    }
+    /// `rId<n>` not yet used (ids kept from a file may sit anywhere in the sequence).
+    fn fresh_id(&self) -> String {
+        let mut n = self.items.len() + 1;
+        while self.items.iter().any(|(i, ..)| *i == format!("rId{n}")) {
+            n += 1;
+        }
+        format!("rId{n}")
     }
     pub fn to_xml(&self) -> Vec<u8> {
         let mut w = W::new();
@@ -379,6 +396,10 @@ impl Default for PackageOut {
 
 impl PackageOut {
     /// Add an XML part with its content type override.
+    /// WHIQ: is there a part named `name` (case-insensitively) already?
+    pub fn has(&self, name: &str) -> bool {
+        self.files.iter().any(|(n, ..)| n.eq_ignore_ascii_case(name))
+    }
     pub fn xml_part(&mut self, name: &str, content_type: &str, data: Vec<u8>) {
         self.overrides.push((format!("/{name}"), content_type.to_string()));
         self.files.push((name.to_string(), data, true));

@@ -671,6 +671,13 @@ pub fn export(p: &Presentation, main_ct: &str) -> Result<Vec<u8>, PptxError> {
             x.pkg.xml_part(&mname, CT_COMMENTS_MODERN, modern_comments_xml(&s.comments, &cname, &mut authors));
             comment_rel = Some(rid);
         }
+        // WHIQ: parts the slide linked that DeckCraft doesn't model, linked again under their ids.
+        for k in s.kept_parts.iter().filter(|k| !k.rel_type.is_empty() && kept_name_ok(&k.name)) {
+            so.rels.add_with_id(&k.rel_id, &k.rel_type, &opc::relative(&sname, &k.name));
+        }
+        for k in s.kept_parts.iter().filter(|k| kept_name_ok(&k.name)) {
+            write_kept(&mut x.pkg, k);
+        }
         let xml = slide_xml(&mut x, &mut so, s, comment_rel.as_deref());
         x.pkg.xml_part(&sname, CT_SLIDE, xml);
         x.pkg.rels(&sname, &so.rels);
@@ -709,31 +716,30 @@ pub fn export(p: &Presentation, main_ct: &str) -> Result<Vec<u8>, PptxError> {
     x.pkg.xml_part("ppt/tableStyles.xml", CT_TABLE_STYLES, ts);
     let pxml = presentation_xml(&mut x, &mut pres, &master_rids, notes_master_rid.as_deref(), handout_rid.as_deref(), &slide_rids);
     x.pkg.xml_part("ppt/presentation.xml", main_ct, pxml);
-    // Kept parts never replace a part the writer makes.
+    // Kept parts never replace a part the writer makes (WHIQ: parts under ppt/ are kept too, when
+    // the writer made no part of that name).
     let kept: Vec<_> = p
         .kept_parts
         .iter()
         .filter(|k| {
             let n = k.name.to_ascii_lowercase();
-            !n.is_empty()
-                && !n.contains("..")
-                && !n.starts_with("ppt/")
-                && !n.starts_with("docprops/core")
-                && !n.starts_with("docprops/app")
-                && !n.starts_with("[content_types]")
-                && n != "_rels/.rels"
+            kept_name_ok(&n)
+                && !(n.starts_with("ppt/") && x.pkg.has(&n))
+                && !n.starts_with("ppt/presentation.xml")
+                && n != "ppt/_rels/presentation.xml.rels"
         })
         .collect();
     for k in kept.iter().filter(|k| !k.rel_type.is_empty() && !k.from_root) {
-        pres.rels.add_new(&k.rel_type, &opc::relative("ppt/presentation.xml", &k.name), false);
+        let target = opc::relative("ppt/presentation.xml", &k.name);
+        if k.rel_id.is_empty() {
+            pres.rels.add_new(&k.rel_type, &target, false);
+        } else {
+            pres.rels.add_with_id(&k.rel_id, &k.rel_type, &target);
+        }
     }
     x.pkg.rels("ppt/presentation.xml", &pres.rels);
     for k in &kept {
-        if k.content_type.is_empty() {
-            x.pkg.raw(&k.name, k.xml.clone().into_bytes());
-        } else {
-            x.pkg.xml_part(&k.name, &k.content_type, k.xml.clone().into_bytes());
-        }
+        write_kept(&mut x.pkg, k);
     }
 
     // Document properties and package relationships.
@@ -748,6 +754,31 @@ pub fn export(p: &Presentation, main_ct: &str) -> Result<Vec<u8>, PptxError> {
     }
     x.pkg.rels("", &root);
     x.pkg.finish()
+}
+
+/// A kept part may be written at this name: inside the package, not one the writer always makes.
+fn kept_name_ok(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    !n.is_empty()
+        && !n.contains("..")
+        && !n.starts_with('/')
+        && !n.starts_with("docprops/core")
+        && !n.starts_with("docprops/app")
+        && !n.starts_with("[content_types]")
+        && n != "_rels/.rels"
+}
+
+/// WHIQ: write a kept part once (two slides may keep the same one); never over a written part.
+fn write_kept(pkg: &mut opc::PackageOut, k: &deckcraft_model::KeptPart) {
+    if pkg.has(&k.name) {
+        return;
+    }
+    let data = if k.bytes.is_empty() { k.xml.clone().into_bytes() } else { k.bytes.clone() };
+    if k.content_type.is_empty() {
+        pkg.raw(&k.name, data);
+    } else {
+        pkg.xml_part(&k.name, &k.content_type, data);
+    }
 }
 
 fn layout_xml(x: &mut Exp, o: &mut Out, l: &Layout) -> Vec<u8> {

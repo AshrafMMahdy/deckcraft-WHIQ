@@ -249,6 +249,7 @@ fn kept_parts(pkg: &Package, pres_path: &str) -> Vec<deckcraft_model::KeptPart> 
                 xml,
                 rel_type: ty.to_string(),
                 from_root,
+                ..Default::default()
             });
             // The part's own relationships (customXml item → itemProps) and their targets.
             let rp = opc::rels_path(&name);
@@ -266,6 +267,114 @@ fn kept_parts(pkg: &Package, pres_path: &str) -> Vec<deckcraft_model::KeptPart> 
                     }
                 }
                 out.push(KeptPart { name: rp, xml: rels_xml, ..Default::default() });
+            }
+        }
+    }
+    out
+}
+
+/// WHIQ: relationship kinds (the type URI's last segment) the reader models from the presentation part.
+const PRES_KNOWN_RELS: &[&str] = &[
+    "slideMaster",
+    "slide",
+    "notesMaster",
+    "handoutMaster",
+    "theme",
+    "presProps",
+    "viewProps",
+    "tableStyles",
+    "commentAuthors",
+    "authors",
+    "font",
+    "customXml",
+    "tags",
+    "custom-properties",
+    "classificationlabels",
+    // Macros cannot live in a .pptx; the writer never writes a macro-enabled package.
+    "vbaProject",
+];
+
+/// WHIQ: relationship kinds the reader models from a slide part (their targets are read into the
+/// slide's shapes, notes, comments and timing).
+const SLIDE_KNOWN_RELS: &[&str] = &[
+    "slideLayout",
+    "notesSlide",
+    "image",
+    "video",
+    "audio",
+    "media",
+    "chart",
+    "chartEx",
+    "chartUserShapes",
+    "diagramData",
+    "diagramLayout",
+    "diagramQuickStyle",
+    "diagramColors",
+    "diagramDrawing",
+    "hyperlink",
+    "comments",
+    "oleObject",
+    "package",
+    "tags",
+    "vmlDrawing",
+    "slide",
+    "model3d",
+    "customXml",
+    "themeOverride",
+    "control",
+    "ctrlProp",
+    "activeXControlBinary",
+    "slideUpdateInfo",
+    "authors",
+];
+
+/// WHIQ: the parts `holder` links with relationships the reader doesn't model, with every part
+/// they link in turn, kept verbatim so a save writes them back (unknown add-in data, printer
+/// settings, revision info, extensions' parts). Bounded: 200 parts, 8 levels.
+pub fn foreign_parts(pkg: &Package, holder: &str, known: &[&str]) -> Vec<deckcraft_model::KeptPart> {
+    use deckcraft_model::KeptPart;
+    let mut out: Vec<KeptPart> = Vec::new();
+    let kept = |name: &str, out: &mut Vec<KeptPart>| -> bool {
+        let n = name.to_ascii_lowercase();
+        if n.is_empty() || n.contains("..") || n.starts_with("[content_types]") || n == "_rels/.rels" || out.len() >= 200 {
+            return false;
+        }
+        if out.iter().any(|k| k.name.eq_ignore_ascii_case(name)) {
+            return false;
+        }
+        let Some(bytes) = pkg.get(name) else { return false };
+        let content_type = pkg.content_type(name).unwrap_or_default();
+        let (xml, bytes) = match std::str::from_utf8(bytes) {
+            Ok(t) if !t.contains('\0') => (t.to_string(), vec![]),
+            _ => (String::new(), bytes.to_vec()),
+        };
+        out.push(KeptPart { name: name.to_string(), content_type, xml, bytes, ..Default::default() });
+        true
+    };
+    for r in pkg.rels(holder).items.iter().filter(|r| !r.external && !known.contains(&r.kind.as_str())) {
+        if !kept(&r.target, &mut out) {
+            continue;
+        }
+        if let Some(k) = out.last_mut() {
+            k.rel_type = r.ty.clone();
+            k.rel_id = r.id.clone();
+        }
+        // What the kept part links in turn, and its relationships part.
+        let mut stack = vec![(r.target.clone(), 0usize)];
+        while let Some((part, depth)) = stack.pop() {
+            let rp = opc::rels_path(&part);
+            if depth > 8 || pkg.get(&rp).is_none() {
+                continue;
+            }
+            for sub in pkg.rels(&part).items.iter().filter(|s| !s.external) {
+                if kept(&sub.target, &mut out) {
+                    stack.push((sub.target.clone(), depth + 1));
+                }
+            }
+            if let Some(b) = pkg.get(&rp)
+                && !out.iter().any(|k| k.name == rp)
+            {
+                out.push(KeptPart { name: rp.clone(), xml: String::from_utf8_lossy(b).into_owned(), ..Default::default() });
             }
         }
     }
@@ -513,6 +622,7 @@ pub fn import(bytes: &[u8]) -> Result<Presentation, PptxError> {
         let part = Part::new(&pkg, path, doc);
         let layout = part.rels.first_of("slideLayout").and_then(|r| layout_by_part.get(&opc::norm(&r.target)).copied()).unwrap_or(fallback_layout);
         let mut slide = read_slide(&mut imp, &part, doc, *id, layout);
+        slide.kept_parts = foreign_parts(&pkg, path, SLIDE_KNOWN_RELS);
         // Notes.
         if let Some(n) = part.rels.first_of("notesSlide")
             && let Some(nd) = load(&pkg, &n.target)
@@ -669,6 +779,12 @@ pub fn import(bytes: &[u8]) -> Result<Presentation, PptxError> {
     }
 
     p.kept_parts = kept_parts(&pkg, &pres_path);
+    // WHIQ: unmodelled parts linked from the presentation part come along too.
+    for k in foreign_parts(&pkg, &pres_path, PRES_KNOWN_RELS) {
+        if !p.kept_parts.iter().any(|e| e.name.eq_ignore_ascii_case(&k.name)) {
+            p.kept_parts.push(k);
+        }
+    }
 
     inherit_placeholder_geometry(&mut p);
     default_text_anchor(&mut p);

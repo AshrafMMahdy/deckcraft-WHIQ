@@ -353,3 +353,117 @@ fn a_deck_built_from_a_company_template_takes_its_theme_masters_and_layouts() {
     let slide = m.ok("inspect_slide", json!({"index": 1}));
     assert_eq!(slide["title"], "Old look", "content kept");
 }
+
+#[test]
+fn export_png_at_a_scale_pdf_and_outline() {
+    let dir = scratch("export");
+    let mut m = start(&dir);
+    m.ok("build_deck", json!({"title": "Exported", "slides": [{"layout": "bullets", "title": "First point", "bullets": ["a"]}, {"layout": "quote", "title": "Q", "quote": "q"}]}));
+    m.ok("export", json!({"path": "half.png", "slide": 0, "scale": 0.5}));
+    assert_eq!(png_size(&std::fs::read(dir.join("half.png")).unwrap()), (480, 270));
+    m.ok("export", json!({"path": "double.png", "slide": 1, "scale": 2}));
+    assert_eq!(png_size(&std::fs::read(dir.join("double.png")).unwrap()), (1920, 1080));
+    let r = m.ok("export", json!({"path": "all.png", "all": true, "scale": 0.25}));
+    assert_eq!(r["files"].as_array().unwrap().len(), 3);
+    m.ok("export", json!({"path": "deck.pdf"}));
+    assert!(std::fs::read(dir.join("deck.pdf")).unwrap().starts_with(b"%PDF"));
+    m.ok("export", json!({"path": "notes.pdf", "layout": "notes"}));
+    m.ok("export", json!({"path": "outline.txt"}));
+    let outline = std::fs::read_to_string(dir.join("outline.txt")).unwrap();
+    assert!(outline.contains("Exported") && outline.contains("First point"), "{outline}");
+    let r = m.call("render_slide", json!({"slide": 0, "scale": 0.5}));
+    assert_eq!(r["content"][0]["type"], "image");
+    assert_eq!(r["structuredContent"]["width"], 480);
+}
+
+fn store(z: &mut zip::ZipWriter<std::fs::File>, name: &str, data: &[u8]) {
+    z.start_file(name, zip::write::SimpleFileOptions::default()).unwrap();
+    z.write_all(data).unwrap();
+}
+
+/// Editing a customer's deck in place keeps what DeckCraft does not change: pictures (byte for
+/// byte), animations, embedded fonts, extension XML and parts it does not model at all.
+#[test]
+fn editing_in_place_keeps_media_animations_fonts_and_unknown_parts() {
+    let dir = scratch("lossless");
+    let mut m = start(&dir);
+    let pic = picture(&mut m, &dir, "photo.png");
+    m.ok("new_presentation", json!({}));
+    m.ok("add_slide", json!({"layout": "titleAndContent", "title": "Customer slide", "body": "keep me"}));
+    m.ok("insert_picture", json!({"path": pic.to_str().unwrap(), "x": 500, "y": 200, "w": 300, "h": 170}));
+    m.ok("run_command", json!({"command": "animation.add", "params": {"effect": "fade", "class": "entrance"}}));
+    m.ok("save_presentation", json!({"path": "base.pptx"}));
+
+    // The customer's copy: an embedded font, an add-in's part on the presentation and on the
+    // slide, and an extension element on the slide (none of which DeckCraft models).
+    let base = dir.join("base.pptx");
+    let font = std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/fonts/tests/fixtures/legacy-regular.ttf")).unwrap();
+    let customer = dir.join("customer.pptx");
+    {
+        let mut src = zip::ZipArchive::new(std::fs::File::open(&base).unwrap()).unwrap();
+        let mut z = zip::ZipWriter::new(std::fs::File::create(&customer).unwrap());
+        for i in 0..src.len() {
+            let mut f = src.by_index(i).unwrap();
+            let name = f.name().to_string();
+            let mut data = vec![];
+            std::io::Read::read_to_end(&mut f, &mut data).unwrap();
+            let text = String::from_utf8(data.clone()).unwrap_or_default();
+            let data = match name.as_str() {
+                "[Content_Types].xml" => text
+                    .replace("</Types>", "<Default Extension=\"fntdata\" ContentType=\"application/x-fontdata\"/><Override PartName=\"/ppt/addin/state.xml\" ContentType=\"application/vnd.acme.state+xml\"/><Override PartName=\"/ppt/addin/slideNote.xml\" ContentType=\"application/vnd.acme.note+xml\"/></Types>")
+                    .into_bytes(),
+                "ppt/_rels/presentation.xml.rels" => text
+                    .replace("</Relationships>", "<Relationship Id=\"rIdFont1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/font\" Target=\"fonts/font1.fntdata\"/><Relationship Id=\"rIdAcme\" Type=\"urn:acme:addin-state\" Target=\"addin/state.xml\"/></Relationships>")
+                    .into_bytes(),
+                "ppt/presentation.xml" => {
+                    let at = text.find("<p:notesSz").unwrap();
+                    let end = at + text[at..].find("/>").unwrap() + 2;
+                    format!("{}<p:embeddedFontLst><p:embeddedFont><p:font typeface=\"Legacy Test\"/><p:regular r:id=\"rIdFont1\"/></p:embeddedFont></p:embeddedFontLst>{}", &text[..end], &text[end..]).into_bytes()
+                }
+                "ppt/slides/_rels/slide2.xml.rels" => text
+                    .replace("</Relationships>", "<Relationship Id=\"rIdAcmeNote\" Type=\"urn:acme:slide-note\" Target=\"../addin/slideNote.xml\"/></Relationships>")
+                    .into_bytes(),
+                "ppt/slides/slide2.xml" => {
+                    let t = text.trim_end();
+                    assert!(t.ends_with("</p:sld>"));
+                    format!("{}<p:extLst><p:ext uri=\"{{ACME-0001}}\"><acme:tag xmlns:acme=\"urn:acme\" note=\"kept\"/></p:ext></p:extLst></p:sld>", &t[..t.len() - "</p:sld>".len()]).into_bytes()
+                }
+                _ => data,
+            };
+            store(&mut z, &name, &data);
+        }
+        store(&mut z, "ppt/fonts/font1.fntdata", &font);
+        store(&mut z, "ppt/addin/state.xml", b"<?xml version=\"1.0\"?><state xmlns=\"urn:acme\">deck-level add-in data</state>");
+        store(&mut z, "ppt/addin/slideNote.xml", b"<?xml version=\"1.0\"?><note xmlns=\"urn:acme\">slide-level add-in data</note>");
+        z.finish().unwrap();
+    }
+
+    // Open, edit one title in place, save over the same file.
+    m.ok("open_presentation", json!({"path": "customer.pptx"}));
+    let title = shapes(&mut m, 1).into_iter().find(|s| s["placeholder"] == "title").unwrap();
+    m.ok("go_to_slide", json!({"index": 1}));
+    m.ok("set_text", json!({"id": title["id"], "text": "Customer slide (edited)"}));
+    let r = m.ok("save_presentation", json!({}));
+    assert_eq!(r["previous_files_renamed"][0]["previous"], json!(dir.join("OLD_customer.pptx").to_str().unwrap()), "{r}");
+
+    let (before, after) = (dir.join("OLD_customer.pptx"), dir.join("customer.pptx"));
+    let names_after = zip_names(&after);
+    // Every part is still there.
+    let missing: Vec<String> = zip_names(&before).into_iter().filter(|n| !names_after.contains(n)).collect();
+    assert!(missing.is_empty(), "parts lost: {missing:?}");
+    // Media byte for byte.
+    for n in zip_names(&before).iter().filter(|n| n.starts_with("ppt/media/") || n.starts_with("ppt/fonts/") || n.starts_with("ppt/addin/")) {
+        assert_eq!(zip_bytes(&before, n), zip_bytes(&after, n), "{n} changed");
+    }
+    // The embedded font is still declared; the animation is still there; extension XML kept.
+    assert!(zip_text(&after, "ppt/presentation.xml").contains("Legacy Test"));
+    let slide = zip_text(&after, "ppt/slides/slide2.xml");
+    assert!(slide.contains("<p:timing>") && slide.contains("presetID=\"10\""), "the fade entrance is kept");
+    assert!(slide.contains("ACME-0001") && slide.contains("note=\"kept\""), "extension kept");
+    assert!(slide.contains("Customer slide (edited)") && slide.contains("keep me"));
+    // Unknown parts are linked again, under their ids.
+    assert!(zip_text(&after, "ppt/_rels/presentation.xml.rels").contains("Id=\"rIdAcme\" Type=\"urn:acme:addin-state\""));
+    assert!(zip_text(&after, "ppt/slides/_rels/slide2.xml.rels").contains("Id=\"rIdAcmeNote\" Type=\"urn:acme:slide-note\""));
+    let ct = zip_text(&after, "[Content_Types].xml");
+    assert!(ct.contains("/ppt/addin/state.xml") && ct.contains("application/vnd.acme.note+xml"), "{ct}");
+}

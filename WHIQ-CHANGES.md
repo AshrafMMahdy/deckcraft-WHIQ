@@ -107,3 +107,36 @@ DrawingML: `prstDash`, `headEnd`/`tailEnd`, `custGeom`, `close`, alpha),
 - Test: `a_deck_built_from_a_company_template_takes_its_theme_masters_and_layouts` (template made
   with a custom palette and fonts, a logo on its master and a renamed layout; checks the content
   type, theme XML, master picture, layout names and that slides sit on the template's layouts).
+
+## 5. Export and lossless in-place editing
+
+- Export (upstream, now covered by the contract suite): slide PNG at any scale (`scale: 0.5` →
+  480 × 270), every slide (as a job for big decks), PDF (slides / notes / handouts; raster slide
+  artwork with a text layer — vector PDF is phase 2), outline text, GIF. Test:
+  `export_png_at_a_scale_pdf_and_outline`.
+- **Unmodelled parts survive an open → edit → save.** Upstream kept only custom XML, sensitivity
+  labels and custom properties. The reader now also keeps every part the presentation or a slide
+  links with a relationship it does not model (add-in data, printer settings, revision info,
+  extension parts…), with everything those parts link in turn, as text or bytes, with their
+  content types and original relationship ids; the writer links them again (kept ids when free —
+  relationship ids are now always unique, `RelsOut::fresh_id`) and never over a part it wrote.
+  Macros (`vbaProject`) are left out: a .pptx cannot carry them. Media, animations, embedded fonts,
+  slide extension lists, opaque objects (SmartArt, OLE) were already modelled upstream; the test
+  proves them. Files: `crates/pptx/src/read/mod.rs` (`foreign_parts`, `PRES_KNOWN_RELS`,
+  `SLIDE_KNOWN_RELS`), `crates/pptx/src/write/mod.rs` (`write_kept`, `kept_name_ok`),
+  `crates/pptx/src/opc.rs` (`add_with_id`, `has`), `crates/model/src/lib.rs` (`Slide.kept_parts`,
+  `KeptPart.bytes`, `KeptPart.rel_id`). Test:
+  `editing_in_place_keeps_media_animations_fonts_and_unknown_parts` (a customer copy with an
+  embedded font, deck- and slide-level add-in parts and a slide extension; every part name kept,
+  media/font/add-in bytes identical, the fade entrance and the extension still in the slide XML,
+  relationships and content types back).
+
+## Not done / known limits
+
+- PDF export is raster (upstream); a vector PDF is phase 2 of the contract.
+- A relationship id kept from a file that collides with one the writer made is renamed, and kept
+  XML that pointed at the old id is not rewritten (rare: writer ids are `rIdN`).
+- A part linked both from the presentation and from a slide is written once and linked from the
+  slide only.
+- Busy is per process: one worker serves calls in order (one process per caller and document is
+  the platform's model); a call cannot be preempted once it runs — jobs cover the long ones.

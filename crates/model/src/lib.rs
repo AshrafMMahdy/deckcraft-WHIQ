@@ -630,6 +630,10 @@ pub struct Slide {
     /// Unmodelled XML kept for round-trip (custom data).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_ext: Option<String>,
+    /// WHIQ: parts this slide links with relationships DeckCraft doesn't model, kept verbatim
+    /// (with their own related parts) and linked again on save.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kept_parts: Vec<KeptPart>,
 }
 
 impl Default for Slide {
@@ -649,6 +653,7 @@ impl Default for Slide {
             color_map: None,
             tags: vec![],
             raw_ext: None,
+            kept_parts: vec![],
         }
     }
 }
@@ -960,6 +965,12 @@ pub struct KeptPart {
     pub rel_type: String,
     /// Linked from the package root rather than from the presentation part.
     pub from_root: bool,
+    /// WHIQ: the part's bytes when it is not text (`xml` is then empty).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub bytes: Vec<u8>,
+    /// WHIQ: the relationship id it was linked by, kept when free so kept XML still points at it.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub rel_id: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
