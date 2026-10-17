@@ -140,6 +140,12 @@ impl Backend for Headless {
     fn describe(&self) -> String {
         "headless (in-process engine; no window)".into()
     }
+    fn session(&mut self) -> Option<&mut Session> {
+        Some(&mut self.session)
+    }
+    fn automation_roots(&self) -> Option<Arc<AutomationRoots>> {
+        self.roots.clone()
+    }
 }
 
 impl Headless {

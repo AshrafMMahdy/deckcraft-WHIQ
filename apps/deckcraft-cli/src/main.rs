@@ -591,14 +591,31 @@ fn mcp(args: &[String]) -> Result<(), String> {
     let mut connect: Option<String> = None;
     let mut sample = false;
     let mut roots_args = automation_args::AutomationArgs::new(None, None);
+    let mut config = deckcraft_mcp::Config::default();
     let mut it = args.iter().cloned();
     while let Some(a) = it.next() {
         if roots_args.consume(&a, &mut it)? {
             continue;
         }
-        match a.as_str() {
-            "--connect" => connect = Some(it.next().ok_or("--connect needs a port or host:port")?),
+        // `--flag value` or `--flag=value`.
+        let (flag, inline) = a.split_once('=').map_or((a.as_str(), None), |(f, v)| (f, Some(v.to_string())));
+        let mut value = |what: &str| -> Result<String, String> {
+            match inline.clone() {
+                Some(v) => Ok(v),
+                None => it.next().ok_or_else(|| format!("{flag} needs {what}")),
+            }
+        };
+        let number = |v: String| -> Result<u64, String> { v.trim().parse::<u64>().map_err(|_| format!("{flag}: `{v}` is not a whole number")) };
+        match flag {
+            "--connect" => connect = Some(value("a port or host:port")?),
             "--sample" => sample = true,
+            "--author" => config.author = value("a name")?,
+            "--busy-after-ms" => config.busy_after_ms = number(value("milliseconds")?)?.max(1),
+            "--idle-evict-secs" => config.idle_evict_secs = Some(number(value("seconds")?)?.max(1)),
+            "--max-memory-mb" => config.max_memory_mb = Some(number(value("megabytes")?)?.max(16)),
+            "--max-result-bytes" => config.max_result_bytes = (number(value("bytes")?)?.clamp(4096, 64 * 1024 * 1024)) as usize,
+            "--open-job-mb" => config.open_job_bytes = number(value("megabytes")?)?.saturating_mul(1024 * 1024),
+            "--export-job-slides" => config.export_job_slides = number(value("a slide count")?)?.max(1) as usize,
             "--help" | "-h" => {
                 outln!("{}", help_page("mcp"));
                 return Ok(());
@@ -625,14 +642,26 @@ so drop --connect (or use --connect without the roots)"
                 file_access::confine_process(roots.clone());
                 let show = |root: Option<&std::path::Path>| root.map_or_else(|| "none".to_string(), |r| r.display().to_string());
                 eprintln!("deckcraft-cli: files confined: read root {}, write root {}", show(roots.read_root()), show(roots.write_root()));
+                config.read_root = roots.read_root().map(std::path::Path::to_path_buf);
+                config.write_root = roots.write_root().map(std::path::Path::to_path_buf);
+                // WHIQ: relative paths are resolved inside the write root.
+                if let Some(w) = roots.write_root()
+                    && let Err(e) = std::env::set_current_dir(w)
+                {
+                    eprintln!("deckcraft-cli: can't make the write root the working folder ({e}); relative paths follow the start folder");
+                }
                 h = h.with_automation_roots(Some(roots));
             }
             Box::new(h)
         }
     };
-    let mut server = Server::new(backend);
-    let stdin = std::io::stdin();
-    server.serve(stdin.lock(), std::io::stdout()).map_err(|e| e.to_string())
+    let found = config.write_root.as_deref().map(deckcraft_mcp::scan_recovered).unwrap_or_default();
+    let server = Server::with_config(backend, config);
+    for r in found {
+        eprintln!("deckcraft-cli: recovered file waiting: {}", r.path);
+        server.shared().add_recovered(r);
+    }
+    server.serve(std::io::BufReader::new(std::io::stdin()), std::io::stdout()).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

@@ -17,3 +17,12 @@ path = "src/main.rs"
 deckcraft-engine = { workspace = true }
 deckcraft-mcp = { workspace = true }
 serde_json = { workspace = true }
+
+# WHIQ contract suite: drives the built binary over stdio (tests/mcp-contract/).
+[[test]]
+name = "mcp_contract"
+path = "../../tests/mcp-contract/contract.rs"
+
+[dev-dependencies]
+zip = { workspace = true }
+image = { workspace = true }

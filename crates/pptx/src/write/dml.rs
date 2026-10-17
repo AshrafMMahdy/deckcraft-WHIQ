@@ -749,8 +749,23 @@ fn run_text(w: &mut W, x: &mut Exp, o: &mut Out, text: &str, props: &RunProps) {
 pub fn paragraph(w: &mut W, x: &mut Exp, o: &mut Out, p: &Paragraph, math: bool, index: usize) {
     w.open0("a:p");
     let def = (p.def_props != RunProps::default()).then_some(&p.def_props);
-    if p.level > 0 || !is_default_ppr(&p.props) || def.is_some() {
-        ppr(w, x, o, "a:pPr", Some(p.level), &p.props, def);
+    // WHIQ: a paragraph with no direction of its own whose first strong character is
+    // right-to-left is written right-to-left (and right-aligned unless it aligns itself), the
+    // way DeckCraft lays it out, so PowerPoint shows it the same.
+    let auto_rtl;
+    let props = if p.props.rtl.is_none() && deckcraft_model::bidi::first_strong_is_rtl(&p.text()) {
+        let mut q = p.props.clone();
+        q.rtl = Some(true);
+        if q.align.is_none() {
+            q.align = Some(deckcraft_model::text::Align::Right);
+        }
+        auto_rtl = q;
+        &auto_rtl
+    } else {
+        &p.props
+    };
+    if p.level > 0 || !is_default_ppr(props) || def.is_some() {
+        ppr(w, x, o, "a:pPr", Some(p.level), props, def);
     }
     for (ri, r) in p.runs.iter().enumerate() {
         match &r.kind {

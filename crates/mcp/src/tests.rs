@@ -120,21 +120,24 @@ fn invalid_id_never_falls_back_to_selection() {
     tool(&mut s, "run_command", json!({"command": "shape.inspect", "params": {"id": title_id}}));
 }
 
+/// WHIQ contract §5: arguments outside the schema are a warning on a successful call, not a
+/// failure (they were refused before the fork).
 #[test]
-fn unknown_tool_arguments_are_refused() {
+fn unknown_tool_arguments_are_warnings() {
     let mut s = Server::new(Box::new(Headless::new()));
     tool(&mut s, "new_presentation", json!({}));
     let charts = |v: &Value| v["shapes"].as_array().unwrap().iter().filter(|sh| sh["kind"] == "chart").count();
     let before = charts(&tool(&mut s, "inspect_slide", json!({})));
     let r = call(&mut s, 2, "tools/call", json!({"name": "insert_chart", "arguments": {"type": "column", "data": [["x", "A"], ["q1", 1]]}}));
-    assert_eq!(r["result"]["isError"], true);
-    let msg = r["result"]["content"][0]["text"].as_str().unwrap();
-    assert!(msg.contains("unknown argument \"data\"") && msg.contains("categories") && msg.contains("series"), "{msg}");
-    assert_eq!(charts(&tool(&mut s, "inspect_slide", json!({}))), before, "a refused call inserts nothing");
+    assert_eq!(r["result"]["isError"], false, "{r}");
+    let warnings = r["result"]["structuredContent"]["warnings"].as_array().unwrap();
+    let w = warnings[0].as_str().unwrap();
+    assert!(w.contains("unknown argument `data`") && w.contains("categories") && w.contains("series"), "{w}");
+    assert_eq!(charts(&tool(&mut s, "inspect_slide", json!({}))), before + 1);
     let r = call(&mut s, 3, "tools/call", json!({"name": "list_commands", "arguments": {"query": "theme", "limit": 1}}));
-    assert_eq!(r["result"]["isError"], true);
-    let msg = r["result"]["content"][0]["text"].as_str().unwrap();
-    assert!(msg.contains("unknown arguments \"limit\", \"query\"") && msg.contains("filter"), "{msg}");
+    assert_eq!(r["result"]["isError"], false, "{r}");
+    assert!(r["result"]["structuredContent"]["warnings"].to_string().contains("query"), "{r}");
+    assert_eq!(r["result"]["structuredContent"]["result"].as_array().unwrap().len(), 1, "limit is honoured");
     // The command's own parameters stay inside `params`.
     tool(&mut s, "run_command", json!({"command": "slide.new", "params": {"layout": "blank"}}));
     let tools = call(&mut s, 4, "tools/list", json!({}));

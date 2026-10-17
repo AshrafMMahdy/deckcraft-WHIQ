@@ -13,3 +13,7 @@ deckcraft-engine = { workspace = true }
 deckcraft-render = { workspace = true }
 serde_json = { workspace = true }
 log = { workspace = true }
+# WHIQ contract: recovered-file stamps, memory reporting, auto-save on SIGTERM / Ctrl+C.
+chrono = { workspace = true }
+memory-stats = "1"
+ctrlc = { version = "3.4", features = ["termination"] }

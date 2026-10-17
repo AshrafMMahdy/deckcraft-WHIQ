@@ -715,7 +715,16 @@ fn shape_para(ctx: &Ctx, shape: &Shape, body: &TextBody, pi: usize, scale: f64, 
             rtl: false,
         };
     };
-    let props = resolve::para(ctx, shape, para);
+    let mut props = resolve::para(ctx, shape, para);
+    // WHIQ: a paragraph that sets no direction of its own takes its base direction from its first
+    // strong character (UAX #9 P2/P3), so an Arabic paragraph is right-to-left and, unless the
+    // paragraph aligns itself, right-aligned.
+    if para.props.rtl.is_none() && deckcraft_model::bidi::first_strong_is_rtl(&para.text()) {
+        props.rtl = Some(true);
+        if para.props.align.is_none() && matches!(props.align, None | Some(Align::Left)) {
+            props.align = Some(Align::Right);
+        }
+    }
     let rtl = props.rtl.unwrap_or(false);
     let mut styles: Vec<Style> = vec![];
     let mut faces: Vec<Arc<FontFace>> = vec![];

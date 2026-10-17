@@ -15,14 +15,21 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
 
+mod autosave;
 mod backend;
+pub mod contract;
 mod headless;
+mod jobs;
+mod runtime;
 mod server;
+pub mod state;
 mod tools;
 
+pub use autosave::scan as scan_recovered;
 pub use backend::{Backend, Remote};
 pub use headless::Headless;
-pub use server::{PROTOCOL_VERSION, Server};
+pub use server::{PROTOCOL_VERSION, Server, status_value};
+pub use state::Config;
 pub use tools::{ToolResult, call_tool, tool_definitions};
 
 /// Default control-channel port of the desktop app.

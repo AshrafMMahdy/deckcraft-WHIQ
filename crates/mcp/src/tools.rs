@@ -57,7 +57,36 @@ fn obj(props: Value, required: &[&str]) -> Value {
     o
 }
 fn tool(name: &str, title: &str, desc: &str, schema: Value, read_only: bool) -> Value {
-    json!({"name": name, "title": title, "description": desc, "inputSchema": schema, "annotations": {"title": title, "readOnlyHint": read_only, "openWorldHint": false}})
+    let (destructive, idempotent) = hints(name, read_only);
+    let mut schema = schema;
+    // WHIQ: every tool takes the caller's name (comments and document properties carry it).
+    if let Some(props) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+        props.insert("caller".into(), json!({"type": "string", "description": "Who is making this call (author of comments and of the saved file); default: the server's --author"}));
+    }
+    json!({"name": name, "title": title, "description": desc, "inputSchema": schema, "annotations": {
+        "title": title,
+        "readOnlyHint": read_only,
+        "destructiveHint": destructive,
+        "idempotentHint": idempotent,
+        "openWorldHint": false
+    }})
+}
+
+/// WHIQ contract §8: `(destructiveHint, idempotentHint)` per tool. Destructive: may delete or
+/// overwrite (replacing text, deleting via keys or commands, saving with `overwrite`). Idempotent:
+/// calling twice with the same arguments leaves the same state.
+fn hints(name: &str, read_only: bool) -> (bool, bool) {
+    if read_only {
+        return (false, true);
+    }
+    match name {
+        "run_command" | "batch" | "call_app" | "key" | "pointer" | "type_text" => (true, false),
+        "save_presentation" | "export" | "build_deck" => (true, false),
+        "set_text" | "adopt_template" => (true, true),
+        "close_presentation" => (true, false),
+        "go_to_slide" | "select" | "select_tool" => (false, true),
+        _ => (false, false),
+    }
 }
 
 const APP_ONLY: &str = " Desktop app only (`deckcraft-cli mcp --connect PORT`).";
@@ -68,7 +97,10 @@ pub fn tool_definitions() -> Vec<Value> {
             "list_commands",
             "List commands",
             "Every command (id, label, ribbon/menu place, shortcut, parameter summary, whether it is enabled now). Filter by a substring of id or label.",
-            obj(json!({"filter": string("Substring of the id or label, e.g. `format.` or `slide`")}), &[]),
+            obj(
+                json!({"filter": string("Substring of the id or label, e.g. `format.` or `slide`"), "offset": int("Skip this many (continue_from of a truncated answer)"), "limit": int("At most this many")}),
+                &[],
+            ),
             true,
         ),
         tool(
@@ -101,25 +133,30 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "open_presentation",
             "Open presentation",
-            "Open a .deckcraft or .pptx file by path.",
-            obj(json!({"path": string("File path")}), &["path"]),
+            "Open a .deckcraft, .pptx or .potx file by path (relative paths are inside the write root). A very large file opens as a job: the answer is a job_id; poll job_status.",
+            obj(json!({"path": string("File path"), "async": boolean("Open as a job even when the file is small")}), &["path"]),
             false,
         ),
         tool(
             "save_presentation",
             "Save presentation",
-            "Save the active presentation (.deckcraft or .pptx by extension).",
-            obj(json!({"path": string("File path (optional when it was opened from a file)")}), &[]),
+            "Save the active presentation (.deckcraft, .pptx or .potx template by extension). An existing file is never silently replaced: it is renamed OLD_<name> first (the answer says so) unless overwrite is true.",
+            obj(
+                json!({"path": string("File path (optional when it was opened from a file); relative paths are inside the write root"), "format": {"type": "string", "enum": ["pptx", "potx", "ppsx", "deckcraft"], "description": "Format (default: from the extension)"}, "overwrite": boolean("Replace an existing file instead of renaming it OLD_<name>")}),
+                &[],
+            ),
             false,
         ),
         tool(
             "export",
             "Export",
-            "Export slides: png/jpeg (one slide, or all with all:true), pptx, deckcraft, outline text, pdf (slides, notes pages or handouts), or an animated gif of the deck (one frame per slide).",
+            "Export slides: png/jpeg (one slide, or all with all:true), pptx/potx, deckcraft, outline text, pdf (slides, notes pages or handouts), or an animated gif of the deck (one frame per slide). Exporting every slide of a large deck runs as a job (answer: job_id; poll job_status). Existing files are renamed OLD_<name> unless overwrite is true.",
             obj(
                 json!({
                     "path": string("Output path"),
-                    "format": {"type": "string", "enum": ["png", "jpeg", "pptx", "deckcraft", "outline", "pdf", "gif"], "description": "Output format (default: from the path's extension)"},
+                    "format": {"type": "string", "enum": ["png", "jpeg", "pptx", "potx", "deckcraft", "outline", "pdf", "gif"], "description": "Output format (default: from the path's extension)"},
+                    "overwrite": boolean("Replace existing files instead of renaming them OLD_<name>"),
+                    "async": boolean("Run as a job even for a small deck"),
                     "slide": int("Slide index for images"),
                     "all": boolean("All slides (images)"),
                     "scale": num("Pixels per point for images (default 2)"),
@@ -149,15 +186,18 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "inspect_document",
             "Inspect presentation",
-            "Slides (index, id, title, layout, shape count, transition, animations, notes), sections, theme, layouts, media and the selection.",
-            obj(json!({}), &[]),
+            "Slides (index, id, title, layout, shape count, transition, animations, notes), sections, theme, layouts, media and the selection. Long slide lists are paged with offset/limit.",
+            obj(json!({"offset": int("First slide to list (continue_from of a truncated answer)"), "limit": int("At most this many slides")}), &[]),
             true,
         ),
         tool(
             "inspect_slide",
             "Inspect slide",
             "One slide's shapes with ids, kinds, boxes [x,y,w,h], placeholder types, text, fills, tables, charts; plus background, transition, animations, notes.",
-            obj(json!({"index": int("Slide index (default: current)")}), &[]),
+            obj(
+                json!({"index": int("Slide index (default: current)"), "offset": int("First shape to list"), "limit": int("At most this many shapes")}),
+                &[],
+            ),
             true,
         ),
         tool(
@@ -165,7 +205,7 @@ pub fn tool_definitions() -> Vec<Value> {
             "Render slide",
             "Render a slide to a PNG image and return it, to check your work visually.",
             obj(
-                json!({"slide": int("Slide index (default: current)"), "scale": num("Pixels per point (default 1 = 960×540 for 16:9)"), "edit": boolean("Show placeholder prompts like the editor")}),
+                json!({"slide": int("Slide index (default: current)"), "scale": num("Pixels per point (default 1 = 960×540 for 16:9)"), "edit": boolean("Show placeholder prompts like the editor"), "path": string("Write the PNG to this file instead of returning it")}),
                 &[],
             ),
             true,
@@ -281,6 +321,79 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool("screenshot", "Screenshot", &format!("Screenshot of the whole DeckCraft window (UI included).{APP_ONLY}"), obj(json!({}), &[]), true),
         tool(
+            "build_deck",
+            "Build deck",
+            "Build a whole deck from a JSON spec in one call, in the platform's nine layouts: bullets, two-column (left/right or bullets split), table (auto-paged over slides, header repeated), callout, kpi (2-4 {label, value} cards or `Label: Value` bullets), section, quote, chart (chart: {kind: bar|line|pie|…, categories, series:[{name, values}]} or a numeric table), image (image: {path, position: full|left|right|logo, caption}). Every slide takes `notes` (speaker notes) and inline **bold** / *italic* / `code`. An image slide takes `overlays` drawn over the picture in percent of its box: [{kind: rect|ellipse|line|text|path, x, y, w, h, color, label, points: \"5,50 12,48\", dashed, arrow: end|both, filled}] (a line's w/h are its end point). theme: corporate|slate|warm|mono or {bg, text, heading, muted, accent, accent2, tableHeadBg, tableHeadText, bandBg, bandText, fontHead, fontBody}; template: a company .pptx/.potx whose theme, masters and layouts the deck uses. Saves to `path` when given (.pptx, .potx template, .deckcraft); an existing file is renamed OLD_<name> unless overwrite.",
+            obj(
+                json!({
+                    "slides": {"type": "array", "description": "Slide specs in order: {layout, title, notes, bullets, paragraphs, left, right, table, kpis, quote, attribution, text, chart, image, images, overlays}", "items": {"type": "object"}},
+                    "title": string("Title slide heading (and the deck's title)"),
+                    "subtitle": string("Title slide subtitle"),
+                    "titleSlide": boolean("Make the title slide (default true when title is given)"),
+                    "theme": {"description": "Preset name or palette object", "oneOf": [{"type": "string"}, {"type": "object"}]},
+                    "template": string("Company .pptx/.potx to take theme, masters and layouts from"),
+                    "logo": string("Logo image for every slide (bottom right)"),
+                    "slideNumbers": boolean("Slide numbers (default true)"),
+                    "notes": string("Speaker notes of the title slide"),
+                    "path": string("Save the deck here (.pptx, .potx, .deckcraft)"),
+                    "overwrite": boolean("Replace an existing file instead of renaming it OLD_<name>")
+                }),
+                &["slides"],
+            ),
+            false,
+        ),
+        tool(
+            "add_overlays",
+            "Add picture overlays",
+            "Draw the overlay vocabulary over a picture on the current slide: rect, ellipse, line, text and path (freeform) marks, solid or dashed, lines and paths with an arrow at the end or both ends, paths closed and filled; x, y, w, h and points in percent of the picture box (relativeTo: image to measure against the picture itself when it is letterboxed). Native, editable shapes.",
+            obj(
+                json!({
+                    "id": int("Picture shape id (default: the selected picture, else the first picture on the slide)"),
+                    "overlays": {"type": "array", "items": {"type": "object"}, "description": "[{kind, x, y, w, h, color, label, points, dashed, arrow, filled}]"},
+                    "rows": {"type": "array", "items": {"type": "array"}, "description": "The platform's overlay table rows: [shape, x, y, w, h, colour, label, points?, style?] (a `shape` header row places the columns)"},
+                    "relativeTo": {"type": "string", "enum": ["box", "image"], "description": "Percentages of the picture box (default) or of the visible picture"}
+                }),
+                &[],
+            ),
+            false,
+        ),
+        tool(
+            "adopt_template",
+            "Adopt company template",
+            "Restyle the open deck with a company .pptx/.potx: its theme (colours, fonts), slide masters and layouts (logo and decorations included); each slide moves to the template layout of the same kind. Save as .potx to write a template.",
+            obj(json!({"path": string("The .pptx/.potx template")}), &["path"]),
+            false,
+        ),
+        tool(
+            "close_presentation",
+            "Close presentation",
+            "Close the active presentation. Unsaved work is never discarded: it is auto-saved to a recovered file first and the answer names it.",
+            obj(json!({}), &[]),
+            false,
+        ),
+        tool(
+            "server_status",
+            "Server status",
+            "Version, memory, open presentations, running jobs, file roots, recovered files and limits. Always answers at once, even while other work runs.",
+            obj(json!({}), &[]),
+            true,
+        ),
+        tool(
+            "job_status",
+            "Job status",
+            "Progress and result of a job (a large open or an export of many slides) by job_id. Results stay available after the client timed out.",
+            obj(json!({"job_id": string("The job_id a call returned")}), &["job_id"]),
+            true,
+        ),
+        tool("list_jobs", "List jobs", "Every job of this server: id, kind, state, progress, result.", obj(json!({}), &[]), true),
+        tool(
+            "evict",
+            "Evict documents",
+            "Free memory now: auto-save every open presentation with unsaved work to a recovered file, then close them all (for supervisors). The next call names the files.",
+            obj(json!({}), &[]),
+            false,
+        ),
+        tool(
             "call_app",
             "Call app method",
             &format!("Call any control-channel method (ui.click, ui.set, ui.dialog.*, ui.inspect…).{APP_ONLY}"),
@@ -305,37 +418,8 @@ fn wrap(r: Result<Value, String>) -> ToolResult {
     }
 }
 
-/// Keys other than the tool's schema properties are refused, so a misspelled argument does not
-/// succeed with the tool's defaults. Keys inside a free object such as `run_command`'s `params`
-/// belong to the command and are left for the command to read.
-fn unknown_argument_error(name: &str, args: &Value) -> Option<String> {
-    let defs = tool_definitions();
-    let def = defs.iter().find(|t| t.get("name").and_then(Value::as_str) == Some(name))?;
-    let mut allowed: Vec<&str> = def
-        .get("inputSchema")
-        .and_then(|s| s.get("properties"))
-        .and_then(Value::as_object)
-        .map(|p| p.keys().map(String::as_str).collect())
-        .unwrap_or_default();
-    allowed.sort_unstable();
-    let obj = args.as_object()?;
-    let mut unknown: Vec<&str> = obj.keys().map(String::as_str).filter(|k| !allowed.contains(k)).collect();
-    unknown.sort_unstable();
-    let first = unknown.first()?;
-    let expected = if allowed.is_empty() { "none".to_string() } else { allowed.join(", ") };
-    let (what, list) = if unknown.len() == 1 {
-        ("unknown argument", format!("{first:?}"))
-    } else {
-        ("unknown arguments", unknown.iter().map(|k| format!("{k:?}")).collect::<Vec<_>>().join(", "))
-    };
-    Some(format!("{name}: {what} {list} (expected: {expected})"))
-}
-
 pub fn call_tool(b: &mut dyn Backend, name: &str, a: &Value) -> ToolResult {
     let a = if a.is_object() { a.clone() } else { json!({}) };
-    if let Some(msg) = unknown_argument_error(name, &a) {
-        return ToolResult::error(msg);
-    }
     match name {
         "list_commands" => wrap(b.call("engine.commands", json!({})).map(|v| {
             let f = a.get("filter").and_then(Value::as_str).unwrap_or("").to_lowercase();
@@ -445,6 +529,9 @@ pub fn call_tool(b: &mut dyn Backend, name: &str, a: &Value) -> ToolResult {
             wrap(exec(b, "insert.table", p))
         }
         "insert_chart" => wrap(exec(b, "insert.chart", a)),
+        "build_deck" => wrap(exec(b, "deck.build", a)),
+        "add_overlays" => wrap(exec(b, "picture.overlay", a)),
+        "adopt_template" => wrap(exec(b, "design.adoptTemplate", a)),
         "select" => wrap(exec(b, "edit.select", a)),
         "pointer" => wrap(b.call("ui.pointer", a)),
         "select_tool" => wrap(b.call("ui.tool.select", a)),

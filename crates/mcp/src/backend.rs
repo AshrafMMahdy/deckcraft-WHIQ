@@ -12,13 +12,21 @@ const MAX_REPLY_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Something that answers control-channel methods (`engine.execute`, `document.inspect`,
 /// `ui.pointer`, `ui.render`, …). See `deckcraft_ui_egui::control` for the full list.
-pub trait Backend {
+pub trait Backend: Send {
     /// Call one method. `Ok` carries the `result`, `Err` the error message.
     fn call(&mut self, method: &str, params: Value) -> Result<Value, String>;
     /// True when a real UI is attached (`ui.screenshot`, `ui.click`, dialogs… work).
     fn has_ui(&self) -> bool;
     /// Short human description ("headless", "connected to 127.0.0.1:7979").
     fn describe(&self) -> String;
+    /// The in-process session, when there is one (headless): jobs, auto-save and eviction use it.
+    fn session(&mut self) -> Option<&mut deckcraft_engine::Session> {
+        None
+    }
+    /// The folders file access is confined to, when this backend confines it.
+    fn automation_roots(&self) -> Option<std::sync::Arc<deckcraft_engine::file_access::AutomationRoots>> {
+        None
+    }
 }
 
 /// A running DeckCraft app, reached through its loopback control port.
