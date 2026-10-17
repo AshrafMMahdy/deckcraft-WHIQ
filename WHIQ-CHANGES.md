@@ -29,7 +29,7 @@ Build note: the binary embeds the Arabic fallback font (Noto Sans Arabic) from a
 | §6 paths, atomic saves, OLD_ | Upstream confinement kept (`--automation-read-root/--automation-write-root`, links followed, symlink escapes refused). Relative paths now resolve inside the write root (the server's working folder). Saves stay temp + fsync + rename, now also fsync of the folder; an existing file is never replaced silently: it is renamed `OLD_<name>` (`OLD_2_<name>`… if taken) first and the answer lists `previous_files_renamed` and a `notice`; `overwrite: true` replaces. Applies to every write a call makes (save, export, PNG sequences, PDF, build_deck, recovered files). Answers report absolute paths. | `crates/engine/src/io.rs` (`keep_previous`, `old_name_for`), `apps/deckcraft-cli/src/main.rs` | `saves_keep_the_previous_file_as_old`, `paths_are_confined_to_the_roots`, upstream `mcp_roots.rs` |
 | §7 caller identity | `--author NAME` at start; every tool takes `caller`. Comments are authored by it; saving sets `lastModifiedBy` (and `creator` when empty) in `docProps/core.xml`; `build_deck` sets both. | `server.rs`, `tools.rs` | `the_caller_is_named_on_comments_and_files` |
 | §8 annotations | `readOnlyHint` only on reads (`list_commands`, `inspect_*`, `render_slide`, `screenshot`, `server_status`, `job_status`, `list_jobs`); `destructiveHint` on tools that can delete or overwrite (`run_command`, `batch`, `call_app`, `key`, `pointer`, `type_text`, `save_presentation`, `export`, `build_deck`, `set_text`, `adopt_template`, `close_presentation`); `idempotentHint` on reads, `go_to_slide`, `select`, `select_tool`, `set_text`, `adopt_template`. `structuredContent` on every result (an object; arrays come as `{result: […]}`). | `crates/mcp/src/tools.rs` | `annotations_tell_reads_from_writes` (and every answer in the suite is checked by `common::Mcp`) |
-| §10 bidi | A paragraph with no direction of its own takes its base direction from its first strong character (UAX #9 P2/P3): Arabic is RTL and right-aligned unless the paragraph aligns itself — in layout (`crates/text`) and in the saved file (`a:pPr rtl="1" algn="r"`, `crates/pptx` writer), so PowerPoint shows it the same. Arabic shaping and the Arabic fallback font come from upstream (harfrust, Noto Sans Arabic via craft-fonts); PDF export is raster today. | `crates/text/src/lib.rs` (`shape_para`), `crates/pptx/src/write/dml.rs` (`paragraph`) | `arabic_paragraphs_are_right_to_left_by_default` |
+| §10 bidi | A paragraph with no direction of its own takes its base direction from its first strong character (UAX #9 P2/P3): Arabic is RTL and right-aligned unless the paragraph aligns itself — in layout (`crates/text`) and in the saved file (`a:pPr rtl="1" algn="r"`, `crates/pptx` writer), so PowerPoint shows it the same. Arabic shaping and the Arabic fallback font come from upstream (harfrust, Noto Sans Arabic via craft-fonts); the vector PDF keeps Arabic as shaped, real text (§6 below). | `crates/text/src/lib.rs` (`shape_para`), `crates/pptx/src/write/dml.rs` (`paragraph`) | `arabic_paragraphs_are_right_to_left_by_default` |
 
 Other server changes: `close_presentation` (auto-saves unsaved work first) and `evict` tools;
 `Backend` gained `session()` / `automation_roots()` (default `None`) and is `Send`;
@@ -111,8 +111,8 @@ DrawingML: `prstDash`, `headEnd`/`tailEnd`, `custGeom`, `close`, alpha),
 ## 5. Export and lossless in-place editing
 
 - Export (upstream, now covered by the contract suite): slide PNG at any scale (`scale: 0.5` →
-  480 × 270), every slide (as a job for big decks), PDF (slides / notes / handouts; raster slide
-  artwork with a text layer — vector PDF is phase 2), outline text, GIF. Test:
+  480 × 270), every slide (as a job for big decks), PDF (slides / notes / handouts; vector artwork
+  with real text since round 2, see §6), outline text, GIF. Test:
   `export_png_at_a_scale_pdf_and_outline`.
 - **Unmodelled parts survive an open → edit → save.** Upstream kept only custom XML, sensitivity
   labels and custom properties. The reader now also keeps every part the presentation or a slide
@@ -131,9 +131,30 @@ DrawingML: `prstDash`, `headEnd`/`tailEnd`, `custGeom`, `close`, alpha),
   media/font/add-in bytes identical, the fade entrance and the extension still in the slide XML,
   relationships and content types back).
 
+## 6. Vector PDF (round 2)
+
+Slides are written as vector artwork with text as text, in every page layout (slides, notes pages,
+handouts); `raster: true` (export / `file.export`) keeps the upstream picture-per-slide export with
+its invisible text layer. How: the renderer now draws on a `Canvas` trait (`crates/render/src/canvas.rs`)
+instead of `vello_cpu::RenderContext` directly — `RenderContext` implements it unchanged for pixels,
+and a `Recorder` keeps the drawing as a display list (fills, strokes, layers, text runs).
+`crates/pdf/src/vector.rs` writes the list: paths with solid colours and linear/radial/sweep
+gradients (spread modes, paint transforms), strokes (width, caps, joins, dashes), clip and opacity
+layers, pictures as embedded images at the export `dpi` (tiled and mirrored fills included), and
+text runs as glyphs of the embedded font subset with a ToUnicode map built from the run's logical
+characters (search, select, copy; Arabic stays shaped and joined, marks placed by glyph offsets).
+What PDF cannot express — blur filters (shadows, glows, soft edges), masks, non-normal blend modes,
+picture-painted strokes — is painted to pixels for just that layer and placed as an image under the
+vector artwork. Links (URLs and slide jumps) and bookmarks are kept as before. The recorded list
+replayed onto pixels matches the renderer (test), so nothing is drawn differently.
+Tests: `crates/pdf/src/tests.rs` (`slides_are_vector_artwork_with_real_text_unless_raster`,
+`a_recorded_slide_replays_like_the_rendered_one`, the upstream link/bookmark/notes/handout tests),
+`tests/mcp-contract/deck.rs` (`export_png_at_a_scale_pdf_and_outline`: embedded fonts, no slide
+pictures, `raster: true` still a picture per slide), the smoke script (pdftotext finds the text).
+A 13-slide built deck: 37 KB vector vs ~1 MB raster.
+
 ## Not done / known limits
 
-- PDF export is raster (upstream); a vector PDF is phase 2 of the contract.
 - A relationship id kept from a file that collides with one the writer made is renamed, and kept
   XML that pointed at the old id is not rewritten (rare: writer ids are `rIdN`).
 - A part linked both from the presentation and from a slide is written once and linked from the

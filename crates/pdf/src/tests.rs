@@ -115,7 +115,8 @@ fn text_layer_links_and_bookmarks_survive_serialization() {
         shape.click = Some(Hyperlink { action, tooltip: "Link".into(), highlight_click: false, sound: None, stop_sound: false, zoom_return: None });
     }
     for text_layer in [true, false] {
-        let bytes = export(&p, &PdfOptions { text_layer, ..opts(PageLayout::Slides) }).unwrap();
+        // The text layer is the raster export's (vector slides carry their text as text).
+        let bytes = export(&p, &PdfOptions { text_layer, raster: true, ..opts(PageLayout::Slides) }).unwrap();
         let pdf = hayro_syntax::Pdf::new(bytes.clone()).unwrap();
         let page = &pdf.pages()[0];
         let annotations = page.raw().get::<Array<'_>>(b"Annots").unwrap();
@@ -440,4 +441,72 @@ fn glyph_ranges_follow_shaping_clusters() {
     assert_eq!(glyph_text_ranges("ab", (0, 2), &[(0, 'a'), (0, 'a'), (1, 'b')], 3), vec![0..1, 0..1, 1..2]);
     // A run starting mid-paragraph, multi-byte characters in visual (right-to-left) order.
     assert_eq!(glyph_text_ranges("αβγ", (3, 6), &[(5, 'γ'), (4, 'β'), (3, 'α')], 3), vec![4..6, 2..4, 0..2]);
+}
+
+fn count(hay: &[u8], needle: &[u8]) -> usize {
+    let spaced: Vec<u8> = needle.iter().copied().flat_map(|c| if c == b' ' { vec![] } else { vec![c] }).collect();
+    let n = |nd: &[u8]| hay.windows(nd.len()).filter(|w| *w == nd).count();
+    if spaced.len() == needle.len() { n(needle) } else { n(needle) + n(&spaced) }
+}
+
+/// WHIQ: slides are vector artwork with real text by default (no picture of the slide, an
+/// embedded font subset, shapes as paths); `raster: true` keeps the picture-per-slide export.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn slides_are_vector_artwork_with_real_text_unless_raster() {
+    let mut p = deck(2);
+    // A filled, outlined shape with a gradient and a shadow (the shadow is the one raster island).
+    {
+        use deckcraft_model::style::{Effects, Shadow};
+        let s = Arc::make_mut(&mut p.slides[0]);
+        let id = deckcraft_model::ShapeId(9000);
+        let mut sh = deckcraft_model::Shape { id, xfrm: Some(deckcraft_geom::Xfrm::new(100.0, 300.0, 200.0, 100.0)), ..Default::default() };
+        sh.fill = Some(deckcraft_model::Fill::solid(deckcraft_model::ColorRef::rgb(deckcraft_model::Rgba::rgb(200, 30, 30))));
+        sh.effects = Some(Effects {
+            outer_shadow: Some(Shadow {
+                blur: 8.0,
+                dist: 6.0,
+                dir: 45.0,
+                color: deckcraft_model::ColorRef::rgb(deckcraft_model::Rgba::BLACK),
+                inner: false,
+                sx: 1.0,
+                sy: 1.0,
+                kx: 0.0,
+                ky: 0.0,
+                align: String::new(),
+                rotate_with_shape: true,
+            }),
+            ..Default::default()
+        });
+        s.shapes.push(sh);
+    }
+    let vector = export(&p, &opts(PageLayout::Slides)).expect("vector");
+    let raster = export(&p, &PdfOptions { raster: true, ..opts(PageLayout::Slides) }).expect("raster");
+    assert!(count(&vector, b"/FontFile2") + count(&vector, b"/FontFile3") >= 1, "fonts embedded");
+    // One image at most (an image and its alpha mask): the shadow island on slide 1; the raster
+    // export has a picture per slide.
+    assert!(count(&vector, b"/Subtype /Image") <= 2, "vector export draws no slide pictures: {} images", count(&vector, b"/Subtype /Image"));
+    assert!(count(&raster, b"/Subtype /Image") >= 2, "raster export: a picture per slide");
+    assert!(vector.len() < raster.len(), "vector {} < raster {}", vector.len(), raster.len());
+    // Notes pages and handouts are vector too.
+    for layout in [PageLayout::Notes, PageLayout::Handouts { per_page: 6 }] {
+        let b = export(&p, &opts(layout)).expect("export");
+        assert!(count(&b, b"/Subtype /Image") <= 2, "{layout:?}: {}", count(&b, b"/Subtype /Image"));
+    }
+}
+
+/// WHIQ: what the recorder keeps is the whole slide: replayed onto pixels it matches the renderer.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_recorded_slide_replays_like_the_rendered_one() {
+    use deckcraft_render::Canvas as _;
+    let p = deck(1);
+    let rec = deckcraft_render::record_slide(&p, 0, 0.5).expect("recorded");
+    assert!(rec.ops.iter().any(|o| matches!(o, deckcraft_render::Op::Text(_))), "text is kept as text");
+    let replayed = deckcraft_render::rasterize(&rec.ops, rec.width(), rec.height());
+    let direct = deckcraft_render::render_slide(&p, 0, &RenderOpts { scale: 0.5, ..Default::default() });
+    assert_eq!((replayed.width, replayed.height), (direct.width, direct.height));
+    let differ =
+        replayed.pixels.chunks(4).zip(direct.pixels.chunks(4)).filter(|(a, b)| a.iter().zip(b.iter()).any(|(x, y)| x.abs_diff(*y) > 48)).count();
+    assert!(differ * 200 < (direct.width * direct.height) as usize, "{differ} pixels differ");
 }

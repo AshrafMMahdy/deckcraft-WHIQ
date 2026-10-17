@@ -1115,6 +1115,7 @@ version = "0.7.0"
 dependencies = [
  "craft-pdf",
  "deckcraft-fonts",
+ "deckcraft-geom",
  "deckcraft-model",
  "deckcraft-render",
  "deckcraft-text",
@@ -1124,6 +1125,8 @@ dependencies = [
  "log",
  "serde",
  "thiserror 2.0.21",
+ "vello_common 0.2.0",
+ "vello_cpu 0.2.0",
  "wasm-bindgen-test",
 ]
 

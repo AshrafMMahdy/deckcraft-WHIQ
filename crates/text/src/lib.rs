@@ -59,6 +59,8 @@ pub struct GlyphRun {
     pub gradient: Option<deckcraft_model::style::Gradient>,
     /// Shadow and glow behind the glyphs (`a:rPr/a:effectLst`).
     pub effects: Option<RunEffects>,
+    /// WHIQ: the characters `chars` covers, in logical order (vector PDF keeps text as text).
+    pub text: String,
     /// East Asian vertical text (`eaVert`): each glyph stands upright, turned a quarter turn
     /// back about the centre of its em box ([`GlyphRun::upright_centre`]) inside text that is
     /// laid out turned a quarter turn.
@@ -1972,6 +1974,7 @@ fn layout_scaled(ctx: &Ctx, shape: &Shape, body: &TextBody, bp: &BodyProps, opts
                 gradient: None,
                 effects: None,
                 upright: false,
+                text: String::new(),
             };
             if body.paragraphs.get(line.para).is_some_and(|p| p.is_empty()) && opts.prompt_color.is_none() {
                 out.empty_bullets.push(run);
@@ -2013,6 +2016,7 @@ fn layout_scaled(ctx: &Ctx, shape: &Shape, body: &TextBody, bp: &BodyProps, opts
                     gradient: st.gradient.clone(),
                     effects: st.effects,
                     upright: cell.upright,
+                    text: String::new(),
                 });
                 cur_key = key;
             }
@@ -2122,6 +2126,11 @@ fn layout_scaled(ctx: &Ctx, shape: &Shape, body: &TextBody, bp: &BodyProps, opts
     out.lines = all_lines.into_iter().map(|(l, ..)| l).collect();
     // Merge adjacent decorations of the same colour on the same line.
     out.decos = merge_decos(std::mem::take(&mut out.decos));
+    for r in &mut out.runs {
+        if let Some(p) = shaped_paras.get(r.para) {
+            r.text = (r.chars.0..r.chars.1).filter_map(|i| p.cells.get(i).map(|c| c.ch)).collect();
+        }
+    }
     out
 }
 

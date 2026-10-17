@@ -11,6 +11,8 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
 
+mod vector;
+
 use std::collections::HashMap;
 
 use craft_pdf::write::{self, Metadata, Writer, backend as krilla};
@@ -18,7 +20,7 @@ use craft_pdf::write::{self, Metadata, Writer, backend as krilla};
 use deckcraft_fonts::FontDb;
 use deckcraft_model::Presentation;
 use deckcraft_model::text::Action as ClickAction;
-use deckcraft_render::{PlacedText, RenderOpts};
+use deckcraft_render::{Canvas as _, PlacedText, RenderOpts};
 use krilla::action::{Action, LinkAction};
 use krilla::annotation::{Annotation, LinkAnnotation, Target};
 use krilla::destination::XyzDestination;
@@ -79,6 +81,9 @@ pub struct PdfOptions {
     pub title: Option<String>,
     /// Handout/notes page size in points (default US Letter portrait; see [`paper_size`]).
     pub paper: (f64, f64),
+    /// WHIQ: draw slide artwork as one picture at `dpi` (with the invisible text layer) instead of
+    /// vector artwork with real text (the default).
+    pub raster: bool,
 }
 
 impl Default for PdfOptions {
@@ -92,6 +97,7 @@ impl Default for PdfOptions {
             frame_slides: true,
             title: None,
             paper: (612.0, 792.0),
+            raster: false,
         }
     }
 }
@@ -408,6 +414,28 @@ impl Exporter<'_> {
         Ok(font)
     }
 
+    /// WHIQ: slide `i` as vector artwork with real text in `b`. `false` when the slide could not be
+    /// recorded (the caller draws it as a picture instead).
+    fn vector_slide(&mut self, s: &mut Surface, i: usize, b: Rect, scale: f64) -> Result<bool> {
+        let Some(rec) = deckcraft_render::record_slide(self.pres, i, scale) else { return Ok(false) };
+        let canvas = (rec.width(), rec.height());
+        s.push_transform(&vector::transform_of(vector::canvas_to_page(b, canvas)));
+        let clipped = match vector::clip_rect(canvas.0, canvas.1) {
+            Some(c) => {
+                s.push_clip_path(&c, &krilla::paint::FillRule::NonZero);
+                true
+            }
+            None => false,
+        };
+        let mut w = vector::VectorWriter { fonts: &mut self.fonts, images: HashMap::new(), canvas, texts: 0, islands: 0 };
+        let r = w.ops(s, &rec.ops);
+        if clipped {
+            s.pop();
+        }
+        s.pop();
+        r.map(|()| true)
+    }
+
     /// Slide `i` drawn into `b` (page points).
     fn slide(&mut self, s: &mut Surface, i: usize, b: Rect) -> Result<()> {
         let pres = self.pres;
@@ -415,7 +443,12 @@ impl Exporter<'_> {
         let k = b.width() / sw;
         // Raster at the requested dpi relative to the box size on paper.
         let scale = (b.width() / 72.0 * self.opts.dpi.clamp(36.0, 600.0)) / sw;
-        let img = deckcraft_render::render_slide(pres, i, &RenderOpts { scale, threads: 4, ..Default::default() });
+        let vector = !self.opts.raster && self.vector_slide(s, i, b, scale)?;
+        let img = if vector {
+            deckcraft_render::Image::default()
+        } else {
+            deckcraft_render::render_slide(pres, i, &RenderOpts { scale, threads: 4, ..Default::default() })
+        };
         if img.width > 0 && img.height > 0 {
             let (w, h) = (img.width, img.height);
             // Taken, not copied: a print-resolution slide is ~16 MB.
@@ -448,7 +481,7 @@ impl Exporter<'_> {
                 s.set_stroke(None);
             }
         }
-        if self.opts.text_layer {
+        if self.opts.text_layer && !vector {
             let view = Affine::translate((b.x0, b.y0)) * Affine::scale(k);
             for pt in deckcraft_render::place_slide(pres, i).texts {
                 self.text_layer(s, &pt, view, false)?;
@@ -624,7 +657,7 @@ impl Exporter<'_> {
 /// `cells` holds each glyph's shaping-cluster head (paragraph character index); a cluster runs to the
 /// next head in the run, so a ligature maps to all its characters and every glyph of a cluster shares
 /// its range (krilla then writes the text once).
-fn glyph_text_ranges(text: &str, chars: (usize, usize), cells: &[(usize, char)], n: usize) -> Vec<std::ops::Range<usize>> {
+pub(crate) fn glyph_text_ranges(text: &str, chars: (usize, usize), cells: &[(usize, char)], n: usize) -> Vec<std::ops::Range<usize>> {
     let starts: Vec<usize> = text.char_indices().map(|(b, _)| b).collect();
     let byte = |ci: usize| ci.checked_sub(chars.0).and_then(|i| starts.get(i).copied()).unwrap_or(text.len());
     let mut heads: Vec<usize> = cells.iter().map(|c| c.0).collect();
@@ -634,7 +667,7 @@ fn glyph_text_ranges(text: &str, chars: (usize, usize), cells: &[(usize, char)],
     (0..n).map(|gi| cells.get(gi).map_or(text.len()..text.len(), |&(ci, _)| byte(ci)..byte(end(ci)))).collect()
 }
 
-fn to_path(bp: &kurbo::BezPath) -> Option<krilla::geom::Path> {
+pub(crate) fn to_path(bp: &kurbo::BezPath) -> Option<krilla::geom::Path> {
     use kurbo::PathEl;
     let mut pb = krilla::geom::PathBuilder::new();
     for el in bp.elements() {

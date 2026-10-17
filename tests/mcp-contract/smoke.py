@@ -158,9 +158,13 @@ def main():
         m.ok("export", {"path": "slide.png", "scale": 0.5})
         m.ok("export", {"path": "deck.pdf"})
         m.ok("export", {"path": "outline.txt"})
-        assert open(os.path.join(folder, "deck.pdf"), "rb").read(4) == b"%PDF"
+        pdf = open(os.path.join(folder, "deck.pdf"), "rb").read()
+        assert pdf[:4] == b"%PDF" and (b"/FontFile2" in pdf or b"/FontFile3" in pdf), "vector PDF with embedded fonts"
+        if shutil.which("pdftotext"):
+            txt = subprocess.run(["pdftotext", os.path.join(folder, "deck.pdf"), "-"], capture_output=True, text=True).stdout
+            assert "From the template" in txt, txt
         assert "From the template" in open(os.path.join(folder, "outline.txt"), encoding="utf-8").read()
-        step("export: PNG at scale 0.5, PDF, outline")
+        step("export: PNG at scale 0.5, vector PDF with real text, outline")
 
         m.ok("open_presentation", {"path": "review.pptx"})
         sl = m.ok("inspect_slide", {"index": 1})

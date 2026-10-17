@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::canvas::Canvas;
 use deckcraft_fonts::{FontDb, FontFace};
 use deckcraft_metafile::{HAlign, Item, PlacedItem, Text, Tile, VAlign};
 use kurbo::{Affine, BezPath, Rect, Shape as _};
@@ -134,7 +135,7 @@ pub fn rasterize(bytes: &[u8], side: u32) -> Option<image::RgbaImage> {
 }
 
 /// Draws `draw` inside the device-context clip. No region is the default clip.
-fn clipped(ctx: &mut RenderContext, region: Option<&BezPath>, draw: impl FnOnce(&mut RenderContext)) {
+fn clipped(ctx: &mut dyn Canvas, region: Option<&BezPath>, draw: impl FnOnce(&mut dyn Canvas)) {
     if let Some(region) = region {
         ctx.push_clip_layer(region);
         draw(ctx);
@@ -154,7 +155,7 @@ struct Glyph {
 }
 
 /// Draws a text item; `m` maps its text space to the output.
-fn draw_text(ctx: &mut RenderContext, t: &Text, m: Affine) {
+fn draw_text(ctx: &mut dyn Canvas, t: &Text, m: Affine) {
     let db = FontDb::global();
     let font = &t.font;
     let family = if font.family.trim().is_empty() { "Arial" } else { font.family.trim() };

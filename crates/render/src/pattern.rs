@@ -7,9 +7,10 @@
 
 use std::sync::Arc;
 
+use crate::canvas::Canvas;
 use deckcraft_color::Rgba;
 use kurbo::{Affine, BezPath};
-use vello_cpu::{Pixmap, RenderContext, peniko};
+use vello_cpu::{Pixmap, peniko};
 
 /// Side of one pattern cell, in points.
 pub const CELL: f64 = 0.75;
@@ -94,7 +95,7 @@ fn premul(c: Rgba, alpha: f64) -> vello_cpu::color::PremulRgba8 {
 
 /// Fill `path` (in the space `m` maps to the output) with preset `name` in `fg` on `bg`, faded by
 /// `alpha`.
-pub fn fill(ctx: &mut RenderContext, name: &str, fg: Rgba, bg: Rgba, alpha: f64, path: &BezPath, m: Affine) {
+pub fn fill(ctx: &mut dyn Canvas, name: &str, fg: Rgba, bg: Rgba, alpha: f64, path: &BezPath, m: Affine) {
     let det = m.determinant();
     if !det.is_finite() || det.abs() <= 1e-12 {
         return;

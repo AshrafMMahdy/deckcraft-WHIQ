@@ -1,5 +1,6 @@
 //! Tables: cell fills from the table style (or overrides), borders, and cell text.
 
+use crate::canvas::Canvas;
 use deckcraft_color::{ColorTransform, Rgba, SchemeSlot};
 use deckcraft_model::resolve::Ctx;
 use deckcraft_model::style::{ColorRef, Fill};
@@ -8,7 +9,7 @@ use deckcraft_model::text::{Anchor, TextBody, TextDir};
 use deckcraft_model::{Presentation, Shape};
 use deckcraft_text::Fields;
 use kurbo::{Affine, BezPath, Rect, Shape as _};
-use vello_cpu::{RenderContext, peniko};
+use vello_cpu::peniko;
 
 use crate::color;
 
@@ -319,7 +320,7 @@ thread_local! {
 /// Draws the table; returns the box its cells cover (table space), which grows with their text.
 #[allow(clippy::too_many_arguments)]
 pub fn draw(
-    ctx: &mut RenderContext,
+    ctx: &mut dyn Canvas,
     pres: &Presentation,
     rctx: &Ctx,
     t: &Table,

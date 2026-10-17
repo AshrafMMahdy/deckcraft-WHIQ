@@ -1280,8 +1280,16 @@ fn build_slide(b: &mut Builder, i: usize, spec: &Value) -> Result<Vec<Slide>> {
         if !b.template {
             s.background = Some(Background::Fill { fill: Builder::solid(th.band_bg) });
         }
-        let st =
-            TextStyle { size: 32.0, bold: true, italic: false, color: th.band_text, align: Some(Align::Left), anchor: Anchor::Middle, shrink: true, head: true };
+        let st = TextStyle {
+            size: 32.0,
+            bold: true,
+            italic: false,
+            color: th.band_text,
+            align: Some(Align::Left),
+            anchor: Anchor::Middle,
+            shrink: true,
+            head: true,
+        };
         let rect = b.r(0.8, GH / 2.0 - 0.8, GW - 1.6, 1.2);
         b.set_title(&mut s, &[PhType::Title, PhType::CtrTitle], if title.is_empty() { "Section" } else { &title }, rect, &st)?;
         if let Some(sub) = spec.get("subtitle").and_then(Value::as_str).filter(|t| !t.trim().is_empty()) {
@@ -1641,7 +1649,16 @@ fn build(s: &mut Session, p: &Value) -> Result<Value> {
         if !b.template {
             s.background = Some(Background::Fill { fill: Builder::solid(th.band_bg) });
         }
-        let st = TextStyle { size: 40.0, bold: true, italic: false, color: th.band_text, align: Some(Align::Left), anchor: Anchor::Top, shrink: true, head: true };
+        let st = TextStyle {
+            size: 40.0,
+            bold: true,
+            italic: false,
+            color: th.band_text,
+            align: Some(Align::Left),
+            anchor: Anchor::Top,
+            shrink: true,
+            head: true,
+        };
         let rect = b.r(0.8, 2.4, GW - 1.6, 1.6);
         b.set_title(&mut s, &[PhType::CtrTitle, PhType::Title], t, rect, &st)?;
         if let Some(sub) = str_param(&p, "subtitle").filter(|t| !t.trim().is_empty()) {

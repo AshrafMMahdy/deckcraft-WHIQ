@@ -2,12 +2,12 @@
 //! in the old text to their place in the new one, growing or shrinking to the new size; the rest
 //! of the old text fades out and the rest of the new one fades in, both riding the moving box.
 
+use crate::canvas::Canvas;
 use deckcraft_geom::Xfrm;
 use deckcraft_model::resolve::Ctx;
 use deckcraft_model::{Shape, ShapeId};
 use deckcraft_text::{Fields, GlyphRun, Opts, TextLayout};
 use kurbo::{Affine, Point, Vec2};
-use vello_cpu::RenderContext;
 
 use crate::{color, draw_glyph, draw_layout, shape_geometry, text_transform};
 
@@ -111,7 +111,7 @@ fn lerp(a: f64, b: f64, t: f64) -> f64 {
 /// Draw the morphing text of `a` (old slide, `ca`) and `b` (new slide, `cb`); `now` is the box both
 /// frame shapes share at this moment, `view` the slide-to-pixels transform.
 pub(crate) fn draw(
-    ctx: &mut RenderContext,
+    ctx: &mut dyn Canvas,
     (ca, a, fa): (&Ctx, &Shape, &dyn Fields),
     (cb, b, fb): (&Ctx, &Shape, &dyn Fields),
     m: &TextMorph,

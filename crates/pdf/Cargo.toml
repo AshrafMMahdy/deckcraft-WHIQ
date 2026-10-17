@@ -14,12 +14,16 @@ deckcraft-fonts = { workspace = true }
 deckcraft-text = { workspace = true }
 deckcraft-render = { workspace = true }
 craft-pdf = { workspace = true }
+# WHIQ vector export: the renderer's recorded paints (colours, gradients, pictures, filters).
+vello_cpu = { workspace = true }
+vello_common = { workspace = true }
 kurbo = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
 
 [dev-dependencies]
+deckcraft-geom = { workspace = true }
 hayro-syntax = { version = "=0.7.2", default-features = false, features = ["std"] }
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]

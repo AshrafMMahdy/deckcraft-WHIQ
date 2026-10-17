@@ -9,6 +9,7 @@
 
 mod bevel;
 mod camera;
+pub mod canvas;
 mod chart;
 mod chartex;
 mod colr;
@@ -47,6 +48,8 @@ use deckcraft_text::{Fields, Opts};
 use kurbo::{Affine, BezPath, PathEl, Point, Rect, Shape as _, Vec2};
 use vello_common::filter_effects::{EdgeMode, Filter, FilterPrimitive};
 use vello_cpu::{RenderContext, Resources, peniko};
+
+pub use canvas::{Canvas, Op, Recorder, TextOp, rasterize, record_slide, replay};
 
 pub use deckcraft_anim::{transition_frame, transition_layers, uses_slide_parts};
 pub use extent::{Region, TILE, layout_extent, pasteboard_region, slide_extent};
@@ -492,7 +495,7 @@ pub fn render_layout(pres: &Presentation, master: usize, layout: Option<usize>, 
     }
 }
 
-fn output_size(pres: &Presentation, opts: &RenderOpts) -> (u16, u16) {
+pub(crate) fn output_size(pres: &Presentation, opts: &RenderOpts) -> (u16, u16) {
     let (w, h) = opts
         .size
         .unwrap_or(((pres.slide_size.width * opts.scale).round().max(1.0) as u32, (pres.slide_size.height * opts.scale).round().max(1.0) as u32));
@@ -640,7 +643,7 @@ impl Renderer {
     }
 
     /// Background plus the master and layout graphics the slide shows.
-    fn backdrop(&mut self, ctx: &mut RenderContext, f: &Frame, rctx: &Ctx, slide: &Slide, view: Affine) {
+    fn backdrop(&mut self, ctx: &mut dyn Canvas, f: &Frame, rctx: &Ctx, slide: &Slide, view: Affine) {
         self.background(ctx, f, rctx, Some(slide), view);
         let (show_layout, show_master) = resolve::show_master_shapes(slide, rctx.layout);
         if show_master {
@@ -671,6 +674,18 @@ impl Renderer {
             }
         }
         self.finish(ctx, w, h)
+    }
+
+    /// WHIQ: draw slide `index` onto any canvas (a [`Recorder`] for vector export).
+    pub(crate) fn slide_into(&mut self, ctx: &mut dyn Canvas, pres: &Presentation, slide: &Slide, index: usize, opts: &RenderOpts) {
+        let view = Affine::translate((opts.offset.0, opts.offset.1)) * Affine::scale(opts.scale);
+        let f = Frame { pres, opts, fields: Self::fields(pres, index, opts) };
+        if let Some(rctx) = Ctx::for_slide(pres, slide) {
+            self.backdrop(ctx, &f, &rctx, slide, view);
+            for s in &slide.shapes {
+                self.shape(ctx, &f, &rctx, s, view, 0);
+            }
+        }
     }
 
     fn slide_part(&mut self, pres: &Presentation, slide: &Slide, index: usize, part: SlidePart, opts: &RenderOpts) -> Image {
@@ -792,7 +807,7 @@ impl Renderer {
         Image { width: w as u32, height: h as u32, pixels }
     }
 
-    fn background(&mut self, ctx: &mut RenderContext, f: &Frame, rctx: &Ctx, slide: Option<&Slide>, view: Affine) {
+    fn background(&mut self, ctx: &mut dyn Canvas, f: &Frame, rctx: &Ctx, slide: Option<&Slide>, view: Affine) {
         let (fill, ph) = resolve::background(rctx, slide);
         let r = Rect::new(0.0, 0.0, f.pres.slide_size.width, f.pres.slide_size.height);
         ctx.set_transform(view);
@@ -805,7 +820,7 @@ impl Renderer {
         self.bg = Some((fill, ph, view));
     }
 
-    fn shape(&mut self, ctx: &mut RenderContext, f: &Frame, rctx: &Ctx, s: &Shape, parent: Affine, depth: usize) {
+    fn shape(&mut self, ctx: &mut dyn Canvas, f: &Frame, rctx: &Ctx, s: &Shape, parent: Affine, depth: usize) {
         if depth == 0 {
             let outer = std::mem::replace(&mut self.view, parent);
             self.shape_at(ctx, f, rctx, s, parent, depth);
@@ -842,7 +857,7 @@ impl Renderer {
         (tw, th, m * Affine::scale_non_uniform(1.0 / sx, 1.0 / sy))
     }
 
-    fn shape_at(&mut self, ctx: &mut RenderContext, f: &Frame, rctx: &Ctx, s: &Shape, parent: Affine, depth: usize) {
+    fn shape_at(&mut self, ctx: &mut dyn Canvas, f: &Frame, rctx: &Ctx, s: &Shape, parent: Affine, depth: usize) {
         if depth > 32 || (s.hidden && !f.opts.show_hidden) || f.opts.skip.contains(&s.id) {
             return;
         }
@@ -984,18 +999,7 @@ impl Renderer {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn geometry_shape(
-        &mut self,
-        ctx: &mut RenderContext,
-        f: &Frame,
-        rctx: &Ctx,
-        s: &Shape,
-        m: Affine,
-        w: f64,
-        h: f64,
-        st: &ShapeState,
-        depth: usize,
-    ) {
+    fn geometry_shape(&mut self, ctx: &mut dyn Canvas, f: &Frame, rctx: &Ctx, s: &Shape, m: Affine, w: f64, h: f64, st: &ShapeState, depth: usize) {
         let (geo, fades) = match self.paths.iter().find(|p| p.id == s.id) {
             Some(pm) => self.morphs.geometry(pm, s, w, h),
             None => (shape_geometry(s, w, h), Vec::new()),
@@ -1353,7 +1357,7 @@ impl Renderer {
 
     fn effects_below(
         &mut self,
-        ctx: &mut RenderContext,
+        ctx: &mut dyn Canvas,
         rctx: &Ctx,
         e: &Effects,
         ph: Option<Rgba>,
@@ -1564,7 +1568,7 @@ fn blur(sigma: f64) -> Filter {
 /// line belongs to; `path` itself when `None`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn stroke(
-    ctx: &mut RenderContext,
+    ctx: &mut dyn Canvas,
     rctx: &Ctx,
     line: &Line,
     ph: Option<Rgba>,
@@ -1912,7 +1916,7 @@ fn trim_ends(path: &BezPath, start: f64, end: f64) -> BezPath {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn arrowheads(ctx: &mut RenderContext, rctx: &Ctx, line: &Line, ph: Option<Rgba>, geo: &Geometry, rel: Affine, m: Affine, lw: f64) {
+fn arrowheads(ctx: &mut dyn Canvas, rctx: &Ctx, line: &Line, ph: Option<Rgba>, geo: &Geometry, rel: Affine, m: Affine, lw: f64) {
     let Some(sp) = geo.paths.iter().find(|p| p.stroke) else { return };
     let Some(((a, a2), (b, b2))) = end_points(&sp.path) else { return };
     // The outline's ends in the space the arrowheads are sized and drawn in.
@@ -1930,7 +1934,7 @@ fn arrowheads(ctx: &mut RenderContext, rctx: &Ctx, line: &Line, ph: Option<Rgba>
         }
         _ => None,
     };
-    let set_paint = |ctx: &mut RenderContext| match &grad {
+    let set_paint = |ctx: &mut dyn Canvas| match &grad {
         Some(g) => ctx.set_paint(g.clone()),
         None => ctx.set_paint(color(col, 1.0)),
     };
@@ -2046,7 +2050,7 @@ pub(crate) fn glyph(face: &deckcraft_fonts::FontFace, gid: u32) -> Arc<BezPath> 
 }
 
 /// Draw a text body into shape space `m` within the text rect.
-pub fn draw_text(ctx: &mut RenderContext, rctx: &Ctx, s: &Shape, body: &TextBody, tr: Rect, m: Affine, fields: &dyn Fields, prompt: Option<Rgba>) {
+pub fn draw_text(ctx: &mut dyn Canvas, rctx: &Ctx, s: &Shape, body: &TextBody, tr: Rect, m: Affine, fields: &dyn Fields, prompt: Option<Rgba>) {
     let l = deckcraft_text::layout(rctx, s, body, &Opts { rect: tr, fields, prompt_color: prompt, no_shrink: false });
     draw_layout(ctx, &l, tr, m);
 }
@@ -2087,15 +2091,15 @@ pub fn text_warp(rctx: &Ctx, s: &Shape, tr: Rect) -> Option<deckcraft_geom::warp
 }
 
 /// Draw an already laid-out text block.
-pub fn draw_layout(ctx: &mut RenderContext, l: &deckcraft_text::TextLayout, tr: Rect, m: Affine) {
+pub fn draw_layout(ctx: &mut dyn Canvas, l: &deckcraft_text::TextLayout, tr: Rect, m: Affine) {
     draw_layout_with(ctx, l, tr, m, &[]);
 }
 
 /// Draw a laid-out text block with per-paragraph animation states.
-pub fn draw_layout_with(ctx: &mut RenderContext, l: &deckcraft_text::TextLayout, tr: Rect, m: Affine, paras: &[(usize, ParaState)]) {
+pub fn draw_layout_with(ctx: &mut dyn Canvas, l: &deckcraft_text::TextLayout, tr: Rect, m: Affine, paras: &[(usize, ParaState)]) {
     let para = |i: usize| paras.iter().find(|(p, _)| *p == i).map(|(_, s)| *s).unwrap_or_default();
     let m = text_transform(m, tr, l.rotation);
-    let deco = |ctx: &mut RenderContext, d: &deckcraft_text::Deco| {
+    let deco = |ctx: &mut dyn Canvas, d: &deckcraft_text::Deco| {
         let ps = para(d.para);
         if !ps.visible || ps.opacity <= 0.001 {
             return;
@@ -2125,6 +2129,10 @@ pub fn draw_layout_with(ctx: &mut RenderContext, l: &deckcraft_text::TextLayout,
             continue;
         }
         let m = m * Affine::translate(ps.offset);
+        // WHIQ: a canvas that keeps text as text (vector PDF) takes plain-coloured runs whole.
+        if run.gradient.as_ref().is_none_or(|g| g.stops.is_empty()) && !run.face.is_color() && ctx.text_run(run, m, ps.opacity) {
+            continue;
+        }
         // A gradient fill starts over on every line and spans that line's text (from its top to
         // its bottom, from its first to its last character), as in PowerPoint.
         let mut grads: Vec<(usize, peniko::Gradient)> = Vec::new();
@@ -2162,7 +2170,7 @@ pub(crate) fn glyph_place(run: &deckcraft_text::GlyphRun, gid: u32, x: f64, y: f
 
 /// Fill an underline, strikethrough or highlight with the current paint and transform: its box,
 /// its dashes, or its zigzag stroked.
-pub(crate) fn fill_deco(ctx: &mut RenderContext, d: &deckcraft_text::Deco) {
+pub(crate) fn fill_deco(ctx: &mut dyn Canvas, d: &deckcraft_text::Deco) {
     if let Some((pts, w)) = d.wave() {
         let mut path = BezPath::new();
         for (i, p) in pts.iter().enumerate() {
@@ -2206,7 +2214,7 @@ enum TextEffect {
 }
 
 /// Draw `run`'s shadow or glow (if it has one) under its glyphs, placed by `m`.
-fn text_effect(ctx: &mut RenderContext, run: &deckcraft_text::GlyphRun, which: TextEffect, m: Affine, opacity: f64) {
+fn text_effect(ctx: &mut dyn Canvas, run: &deckcraft_text::GlyphRun, which: TextEffect, m: Affine, opacity: f64) {
     let Some(fx) = run.effects else { return };
     let k = run.size / run.face.upem.max(1.0);
     let skew = if run.fake_italic { Affine::new([1.0, 0.0, -0.2, 1.0, 0.0, 0.0]) } else { Affine::IDENTITY };
@@ -2243,14 +2251,14 @@ fn text_effect(ctx: &mut RenderContext, run: &deckcraft_text::GlyphRun, which: T
 }
 
 /// Draw glyph `gid` of `run` with its origin (on the baseline) mapped by `at`, faded by `opacity`.
-pub(crate) fn draw_glyph(ctx: &mut RenderContext, run: &deckcraft_text::GlyphRun, gid: u32, at: Affine, opacity: f64) {
+pub(crate) fn draw_glyph(ctx: &mut dyn Canvas, run: &deckcraft_text::GlyphRun, gid: u32, at: Affine, opacity: f64) {
     draw_glyph_with(ctx, run, gid, at, opacity, None);
 }
 
 /// [`draw_glyph`], filled with `fill` (a gradient laid out in the text's space, and the map from
 /// the glyph's origin to that space) instead of the run's colour.
 fn draw_glyph_with(
-    ctx: &mut RenderContext,
+    ctx: &mut dyn Canvas,
     run: &deckcraft_text::GlyphRun,
     gid: u32,
     at: Affine,

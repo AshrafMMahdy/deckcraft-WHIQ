@@ -366,7 +366,16 @@ fn export_png_at_a_scale_pdf_and_outline() {
     let r = m.ok("export", json!({"path": "all.png", "all": true, "scale": 0.25}));
     assert_eq!(r["files"].as_array().unwrap().len(), 3);
     m.ok("export", json!({"path": "deck.pdf"}));
-    assert!(std::fs::read(dir.join("deck.pdf")).unwrap().starts_with(b"%PDF"));
+    let vector = std::fs::read(dir.join("deck.pdf")).unwrap();
+    assert!(vector.starts_with(b"%PDF"));
+    // Vector artwork with real text (an embedded font subset), unless raster is asked for.
+    let has = |b: &[u8], n: &[u8]| b.windows(n.len()).any(|w| w == n);
+    assert!(has(&vector, b"/FontFile2") || has(&vector, b"/FontFile3"), "fonts embedded");
+    assert!(!has(&vector, b"/Subtype /Image") && !has(&vector, b"/Subtype/Image"), "no slide pictures in the vector PDF");
+    m.ok("export", json!({"path": "raster.pdf", "raster": true}));
+    let raster = std::fs::read(dir.join("raster.pdf")).unwrap();
+    assert!(has(&raster, b"/Subtype /Image") || has(&raster, b"/Subtype/Image"), "raster: slide pictures");
+    assert!(vector.len() * 3 < raster.len(), "vector {} vs raster {}", vector.len(), raster.len());
     m.ok("export", json!({"path": "notes.pdf", "layout": "notes"}));
     m.ok("export", json!({"path": "outline.txt"}));
     let outline = std::fs::read_to_string(dir.join("outline.txt")).unwrap();

@@ -11,9 +11,10 @@
 
 use std::sync::Arc;
 
+use crate::canvas::Canvas;
 use deckcraft_color::Rgba;
 use kurbo::{Affine, BezPath, PathEl, Point, Rect};
-use vello_cpu::{Pixmap, RenderContext, peniko};
+use vello_cpu::{Pixmap, peniko};
 
 /// Longest side of the rasterised gradient, in pixels (bilinear sampling smooths the rest).
 const MAX_SIDE: f64 = 384.0;
@@ -223,7 +224,7 @@ pub fn ramp(stops: &[(f64, Rgba)]) -> Vec<Rgba> {
 /// Fill `path` with a `rect` or `shape` path gradient of `stops` (sorted and expanded, see
 /// `ramp::expand`) over `bounds`, faded by `alpha`; `m` maps the path to the output.
 #[allow(clippy::too_many_arguments)]
-pub fn fill(ctx: &mut RenderContext, kind: &str, focus: [f64; 4], stops: &[(f64, Rgba)], bounds: Rect, path: &BezPath, m: Affine, alpha: f64) {
+pub fn fill(ctx: &mut dyn Canvas, kind: &str, focus: [f64; 4], stops: &[(f64, Rgba)], bounds: Rect, path: &BezPath, m: Affine, alpha: f64) {
     if bounds.width() <= 0.0 || bounds.height() <= 0.0 || !bounds.is_finite() || stops.is_empty() {
         return;
     }
@@ -364,7 +365,7 @@ mod tests {
     #[test]
     fn a_dense_shape_gradient_renders_promptly() {
         let path = many_segment_square(20_000);
-        let mut ctx = RenderContext::new(400, 400);
+        let mut ctx = vello_cpu::RenderContext::new(400, 400);
         let stops = [(0.0, Rgba::rgb(0, 0, 0)), (1.0, Rgba::rgb(255, 255, 255))];
         let t = std::time::Instant::now();
         fill(&mut ctx, "shape", CENTRE, &stops, Rect::new(0.0, 0.0, 200.0, 200.0), &path, Affine::scale(2.0), 1.0);

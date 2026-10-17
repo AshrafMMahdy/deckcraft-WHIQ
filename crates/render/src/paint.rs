@@ -1,18 +1,19 @@
 //! Fills: solid, gradient, picture and pattern paints.
 
+use crate::canvas::Canvas;
 use deckcraft_color::Rgba;
 use deckcraft_geom::preset::FillMode;
 use deckcraft_model::resolve::Ctx;
 use deckcraft_model::style::{ColorRef, Fill, GradientShape, PictureFill, PictureMode};
 use deckcraft_model::{PhType, Presentation};
 use kurbo::{Affine, BezPath, Point, Rect, Shape as _};
-use vello_cpu::{RenderContext, peniko};
+use vello_cpu::peniko;
 
 use crate::{color, images, shade};
 
 #[allow(clippy::too_many_arguments)]
 pub fn fill_path(
-    ctx: &mut RenderContext,
+    ctx: &mut dyn Canvas,
     rctx: &Ctx,
     fill: &Fill,
     ph: Option<Rgba>,
@@ -182,7 +183,7 @@ pub fn circle_gradient(focus: [f64; 4], bounds: Rect, tile: Rect) -> peniko::Gra
 
 /// Draw a picture fill into `bounds` (shape-local) honouring crop and stretch/tile modes; an animated
 /// GIF shows its frame at `gif_time` seconds.
-pub fn picture(ctx: &mut RenderContext, pres: &Presentation, pf: &PictureFill, bounds: Rect, m: Affine, gif_time: Option<f64>) {
+pub fn picture(ctx: &mut dyn Canvas, pres: &Presentation, pf: &PictureFill, bounds: Rect, m: Affine, gif_time: Option<f64>) {
     let Some(item) = pres.media(pf.media) else {
         missing(ctx, bounds);
         return;
@@ -279,7 +280,7 @@ pub fn tile_origin(bounds: Rect, align: &str, tile: (f64, f64), offset: (f64, f6
     Point::new(bounds.x0 + ax * (bounds.width() - tile.0) + ox, bounds.y0 + ay * (bounds.height() - tile.1) + oy)
 }
 
-fn draw_image(ctx: &mut RenderContext, image: &vello_cpu::Image, iw: f64, ih: f64, dest: Rect, m: Affine, alpha: f64) {
+fn draw_image(ctx: &mut dyn Canvas, image: &vello_cpu::Image, iw: f64, ih: f64, dest: Rect, m: Affine, alpha: f64) {
     let t = m * Affine::translate(dest.origin().to_vec2()) * Affine::scale_non_uniform(dest.width() / iw, dest.height() / ih);
     ctx.set_transform(t);
     if alpha < 0.999 {
@@ -292,7 +293,7 @@ fn draw_image(ctx: &mut RenderContext, image: &vello_cpu::Image, iw: f64, ih: f6
     }
 }
 
-fn missing(ctx: &mut RenderContext, b: Rect) {
+fn missing(ctx: &mut dyn Canvas, b: Rect) {
     ctx.set_paint(peniko::Color::from_rgba8(230, 230, 230, 255));
     ctx.fill_rect(&b);
     ctx.set_paint(peniko::Color::from_rgba8(160, 160, 160, 255));
@@ -306,7 +307,7 @@ fn missing(ctx: &mut RenderContext, b: Rect) {
 }
 
 /// The speaker / film glyph on audio and video objects without a poster.
-pub fn media_glyph(ctx: &mut RenderContext, video: bool, b: Rect) {
+pub fn media_glyph(ctx: &mut dyn Canvas, video: bool, b: Rect) {
     let s = b.width().min(b.height());
     let c = b.center();
     if video {
@@ -343,7 +344,7 @@ pub fn media_glyph(ctx: &mut RenderContext, video: bool, b: Rect) {
 }
 
 /// A content-type icon drawn in empty picture/chart/table placeholders.
-pub fn placeholder_icon(ctx: &mut RenderContext, kind: PhType, b: Rect) {
+pub fn placeholder_icon(ctx: &mut dyn Canvas, kind: PhType, b: Rect) {
     let s = (b.width().min(b.height()) * 0.18).clamp(10.0, 48.0);
     let c = Point::new(b.center().x, b.center().y - s * 0.3);
     let r = Rect::new(c.x - s / 2.0, c.y - s / 2.0, c.x + s / 2.0, c.y + s / 2.0);

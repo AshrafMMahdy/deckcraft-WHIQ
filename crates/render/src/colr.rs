@@ -1,13 +1,14 @@
 //! Colour glyphs (OpenType `COLR` v0 and v1, colours from `CPAL`), as colour emoji fonts draw
 //! them: layers of glyph outlines filled with solid colours or gradients.
 
+use crate::canvas::Canvas;
 use deckcraft_color::Rgba;
 use deckcraft_fonts::FontFace;
 use kurbo::{Affine, BezPath, Point, Rect};
 use skrifa::color::{Brush, ColorPainter, ColorStop, CompositeMode, Extend, Transform};
 use skrifa::raw::types::BoundingBox;
 use skrifa::{GlyphId, MetadataProvider};
-use vello_cpu::{RenderContext, peniko};
+use vello_cpu::peniko;
 
 /// Nesting depth of clips and layers past which a glyph opens no more (hostile fonts).
 const MAX_DEPTH: usize = 64;
@@ -15,7 +16,7 @@ const MAX_DEPTH: usize = 64;
 /// Paint `gid` of `face` as a colour glyph, its origin mapped by `at` (y down, points) at `scale`
 /// points per font unit. `fg` is the text colour (palette index 0xFFFF) and `alpha` fades it all.
 /// False when the glyph has no colour version, so the caller draws the plain outline.
-pub fn paint(ctx: &mut RenderContext, face: &FontFace, gid: u32, at: Affine, scale: f64, fg: Rgba, alpha: f64) -> bool {
+pub fn paint(ctx: &mut dyn Canvas, face: &FontFace, gid: u32, at: Affine, scale: f64, fg: Rgba, alpha: f64) -> bool {
     let Some(font) = face.skrifa() else { return false };
     let glyphs = font.color_glyphs();
     let Some(glyph) = glyphs.get(GlyphId::new(gid)) else { return false };
@@ -40,7 +41,7 @@ pub fn paint(ctx: &mut RenderContext, face: &FontFace, gid: u32, at: Affine, sca
 }
 
 struct Painter<'a> {
-    ctx: &'a mut RenderContext,
+    ctx: &'a mut dyn Canvas,
     face: &'a FontFace,
     base: Affine,
     /// Transforms pushed by the glyph (font units), innermost last.
