@@ -286,11 +286,15 @@ their stages; the open job is seen in "reading the file" while it runs).
   caller and document is the platform's model); a running call stops at its next safe point on
   `cancel` (§7), and long work runs as jobs alongside it.
 
-## Test status (Linux x86_64 container, 2026-10-17)
+## Test status (Linux x86_64 container, 2026-10-17, after round 2)
 
-`cargo test` over every crate plus `deckcraft-cli`: 1635 passed, 13 failed, 6 ignored. The 13
-failures are all in `deckcraft-ui-egui` (egui_kittest: "No adapter found" — no GPU in the
-container; `replacefonts_tests::ribbon_button_opens_the_dialog_and_replaces` fails the same way on
-upstream `2cf4535`). The desktop app `apps/deckcraft` does not build here (no ALSA headers for
-`alsa-sys`). Everything the headless binary uses is green, including the 21 contract and deck
-tests and the smoke script.
+- Release binary, built with the release recipe (§9: `CRAFT_FONTS_DIR` at craft-fonts `43913056`,
+  `CRAFT_FONTS_REQUIRED=1`): `cargo test --release -p deckcraft-cli --test mcp_contract --test
+  mcp_deck` — 24 passed (17 contract, 7 deck); `python3 tests/mcp-contract/smoke.py` passed.
+- `cargo test --no-fail-fast` over every crate plus `deckcraft-cli`: 1648 passed, 12 failed, 6
+  ignored. All 12 failures are in `deckcraft-ui-egui` and have one cause, `Failed to create render
+  state: CustomNativeAdapterSelectionError("No adapter found")` (egui_kittest needs a GPU; the
+  container has none). The desktop app `apps/deckcraft` does not build here (no ALSA headers for
+  `alsa-sys`). Everything the headless binary uses is green.
+- `cargo check --target x86_64-pc-windows-gnu -p deckcraft-cli` passes (the Windows memory and
+  checkpoint code type-checks); it was not run on Windows or macOS.

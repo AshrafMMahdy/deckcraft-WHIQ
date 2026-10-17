@@ -186,13 +186,17 @@ def main():
                 break
             time.sleep(0.1)
         assert j["state"] == "done", j
-        step(f"job {jid}: {len(j['result']['files'])} PNGs")
+        assert j["progress"] == 1.0 and j["stages"] == ["rendering slides"], j
+        step(f"job {jid}: {len(j['result']['files'])} PNGs, progress by stage ({j['steps']['done']}/{j['steps']['total']} slides)")
 
         e = m.call("go_to_slide", {"index": 999})
         err = e["structuredContent"]["error"]
         assert e["isError"] and err["code"] == "out_of_range" and err["next_step"], err
         st = m.ok("server_status")
-        step(f"structured error `{err['code']}`; server_status: {st['memory']['rss_mb']} MB, {len(st['documents'])} documents")
+        assert st["memory"]["measured"] and st["memory"]["rss_bytes"] > 0, st["memory"]
+        assert "every_edits" in st["checkpoints"], st
+        step(f"structured error `{err['code']}`; server_status: {st['memory']['rss_mb']} MB measured ({st['memory']['source'].split(':')[0]}), "
+             f"{len(st['documents'])} documents, checkpoints every {st['checkpoints']['every_edits']} edits / {st['checkpoints']['every_secs']} s")
     finally:
         stderr = m.close()
         if not keep:
