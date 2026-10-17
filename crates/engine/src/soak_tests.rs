@@ -13,8 +13,10 @@ use crate::*;
 
 /// Commands that touch the file system, other windows or real time; the soak drives the rest.
 fn skipped(id: &str) -> bool {
-    matches!(id, "file.close" | "file.open" | "file.save" | "file.saveAs" | "file.export" | "file.saveTemplate" | "file.openBytes" | "file.new")
-        || id.starts_with("window.")
+    matches!(
+        id,
+        "file.close" | "file.open" | "file.save" | "file.saveAs" | "file.export" | "file.saveTemplate" | "file.openBytes" | "file.new" | "deck.build"
+    ) || id.starts_with("window.")
         || id.starts_with("show.")
         || id.starts_with("media.")
 }

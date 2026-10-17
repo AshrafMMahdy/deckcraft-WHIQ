@@ -23,6 +23,10 @@ serde_json = { workspace = true }
 name = "mcp_contract"
 path = "../../tests/mcp-contract/contract.rs"
 
+[[test]]
+name = "mcp_deck"
+path = "../../tests/mcp-contract/deck.rs"
+
 [dev-dependencies]
 zip = { workspace = true }
 image = { workspace = true }

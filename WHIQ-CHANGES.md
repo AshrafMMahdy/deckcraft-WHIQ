@@ -39,3 +39,37 @@ unchanged for in-process use. New CLI flags: `--author`, `--busy-after-ms`, `--i
 help mcp`). Test hooks (`_delay_ms`, `_panic` arguments) work only with
 `DECKCRAFT_MCP_TEST_HOOKS=1`. New dependencies of `deckcraft-mcp`: `chrono` (workspace),
 `memory-stats`, `ctrlc` (MIT/Apache-2.0).
+
+## 2. build_deck — the platform's nine layouts (engine command `deck.build`, MCP tool `build_deck`)
+
+A whole deck from one JSON spec, reproducing the shapes of the platform's own writer
+(`shared/chat-engine/server/tools/write_doc_tier2.ts`, `renderPptx`) on its 13.333 × 7.5 in grid,
+scaled to the deck's slide size: the title slide (band background, accent rule, subtitle), the
+master decoration (bottom accent rule, optional logo, slide number field on every slide), the
+heading with its accent rule, and the layouts:
+
+| Layout | Spec keys | Drawn as |
+|---|---|---|
+| `bullets` (default) | `paragraphs`, `bullets` (strings with leading-space levels, or `{text, level}`), `quote` | paragraphs then bullets, quotes muted italic |
+| `two-column` | `left` / `right` (lists, or `{heading, bullets}`), else `bullets` split in half | two text columns |
+| `table` | `table` (`[[…]]`, `{header, rows}`), `rowsPerSlide?`, `fontSize?` | header-shaded, zebra rows, proportional column widths, **auto-paged** over as many slides as the rows need (by row height, or `rowsPerSlide`), header repeated, titles `Title (k/n)` |
+| `callout` | `text`, `bullets` | accent2 band with white text, bullets below |
+| `kpi` | `kpis: [{label, value}]` or `Label: Value` bullets (2–4) | cards, value size by length |
+| `section` | `title`, `subtitle?` | band-coloured divider on the Section Header layout |
+| `quote` | `quote`, `attribution` | accent2 band, italic, `— attribution` |
+| `chart` | `chart: {kind: bar\|column\|line\|pie\|…, categories, series}` or a numeric `table` | native chart in the theme palette, legend when several series, data labels except line |
+| `image` | `image` / `images`: `{path, position: full\|left\|right\|logo, caption}`, `overlays` | full (up to two side by side), half-slide left/right with the body narrowed beside it, logo top right |
+
+Every slide takes `notes` (speaker notes). Inline `**bold**`, `*italic*`, `` `code` `` become
+runs (no literal markers). Layout names are forgiving (`Two Columns`, `KPIs`, `divider`…); an
+unknown one draws as bullets with a warning, like the platform. Titles go into the layouts' title
+placeholders (so outline export and inspect see them). `theme`: `corporate` (default), `slate`,
+`warm`, `mono` (the platform's colours; open font families by default per AGENTS.md §1 — pass
+`fontHead` / `fontBody` to name others) or a palette object; the palette also goes into the master's
+theme. `path` saves (.pptx, .potx, .deckcraft) with the OLD_ rule. Everything missing or unreadable
+(a picture, a non-numeric chart table) is a `warnings` entry, never a failure.
+
+Files: `crates/engine/src/cmd/build.rs` (new), `crates/engine/src/cmd/mod.rs` (registration),
+`crates/mcp/src/tools.rs`. Tests: `tests/mcp-contract/deck.rs`
+(`the_nine_layouts_each_with_speaker_notes`, `a_long_table_pages_over_slides_with_its_header`),
+unit tests in `build.rs`. `deck.build` is skipped by the one-document soak test, like `file.new`.
