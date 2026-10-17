@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 
 use crate::backend::Backend;
 use crate::contract::{self, ErrorContext, ToolError, code};
-use crate::state::{Config, DocSnapshot, Evicted, Shared, rss_bytes};
+use crate::state::{Config, DocSnapshot, Evicted, Shared};
 use crate::tools::{ToolResult, call_tool, tool_definitions};
 
 /// The MCP revision we implement.
@@ -141,7 +141,6 @@ pub fn status_value(shared: &Shared) -> Value {
         .enumerate()
         .map(|(i, d)| json!({"index": i, "title": d.title, "path": d.path, "slides": d.slides, "dirty": d.dirty, "active": d.active}))
         .collect();
-    let rss = rss_bytes();
     json!({
         "server": "deckcraft",
         "version": env!("CARGO_PKG_VERSION"),
@@ -150,7 +149,8 @@ pub fn status_value(shared: &Shared) -> Value {
         "pid": std::process::id(),
         "uptime_ms": shared.started.elapsed().as_millis() as u64,
         "author": c.author,
-        "memory": {"rss_bytes": rss, "rss_mb": rss.map(|b| b / (1024 * 1024)), "limit_mb": c.max_memory_mb},
+        "memory": crate::state::memory_value(c.max_memory_mb),
+        "checkpoints": crate::checkpoint::status(shared),
         "roots": {"read": c.read_root.as_ref().map(|p| p.display().to_string()), "write": c.write_root.as_ref().map(|p| p.display().to_string())},
         "documents": docs,
         "jobs": {"running": shared.running_jobs(), "list": shared.jobs_value()},
@@ -783,7 +783,15 @@ impl Server {
             let (title, original) = (st.title(), st.path.clone());
             let unsaved = st.is_dirty() || st.path.is_none();
             let recovered = if unsaved {
-                match crate::autosave::write_recovered(&shared, roots.as_ref(), &st.doc, &title, original.as_deref(), reason) {
+                match crate::autosave::write_recovered(
+                    &shared,
+                    roots.as_ref(),
+                    &st.doc,
+                    &title,
+                    original.as_deref(),
+                    reason,
+                    Some((st.uid, st.revision)),
+                ) {
                     Ok(r) => Some(r.path),
                     Err(e) => {
                         // Never discard: a document that cannot be saved stays open.
@@ -846,6 +854,8 @@ impl Server {
                     .iter()
                     .enumerate()
                     .map(|(i, d)| DocSnapshot {
+                        uid: d.uid,
+                        revision: d.revision,
                         title: d.title(),
                         path: d.path.clone(),
                         dirty: d.is_dirty(),

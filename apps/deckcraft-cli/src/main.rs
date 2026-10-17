@@ -615,6 +615,8 @@ fn mcp(args: &[String]) -> Result<(), String> {
             "--max-memory-mb" => config.max_memory_mb = Some(number(value("megabytes")?)?.max(16)),
             "--max-result-bytes" => config.max_result_bytes = (number(value("bytes")?)?.clamp(4096, 64 * 1024 * 1024)) as usize,
             "--open-job-mb" => config.open_job_bytes = number(value("megabytes")?)?.saturating_mul(1024 * 1024),
+            "--checkpoint-edits" => config.checkpoint_edits = number(value("an edit count (0: never)")?)?,
+            "--checkpoint-secs" => config.checkpoint_secs = number(value("seconds (0: never)")?)?,
             "--export-job-slides" => config.export_job_slides = number(value("a slide count")?)?.max(1) as usize,
             "--help" | "-h" => {
                 outln!("{}", help_page("mcp"));

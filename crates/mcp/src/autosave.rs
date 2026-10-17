@@ -13,7 +13,7 @@ use crate::state::{DocSnapshot, Recovered, Shared, now_rfc3339, stamp};
 
 /// The folder recovered files go to: the write root, else the presentation's own folder, else the
 /// system's temporary folder.
-fn recovery_dir(shared: &Shared, original: Option<&str>) -> PathBuf {
+pub(crate) fn recovery_dir(shared: &Shared, original: Option<&str>) -> PathBuf {
     if let Some(root) = &shared.config.write_root {
         return root.clone();
     }
@@ -24,14 +24,14 @@ fn recovery_dir(shared: &Shared, original: Option<&str>) -> PathBuf {
 }
 
 /// File-name-safe stem for `title`.
-fn safe_stem(s: &str) -> String {
+pub(crate) fn safe_stem(s: &str) -> String {
     let t: String = s.chars().map(|c| if c.is_alphanumeric() || matches!(c, '-' | '_' | ' ' | '.') { c } else { '_' }).collect();
     let t = t.trim().trim_matches('.').to_string();
     if t.is_empty() { "Presentation".into() } else { t.chars().take(80).collect() }
 }
 
 /// The format a recovered copy is written in: the original's when it is one we write losslessly.
-fn recovered_format(original: Option<&str>) -> &'static str {
+pub(crate) fn recovered_format(original: Option<&str>) -> &'static str {
     let ext = original.and_then(|p| Path::new(p).extension()).map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
     match ext.as_str() {
         "deckcraft" => "deckcraft",
@@ -49,6 +49,7 @@ pub fn write_recovered(
     title: &str,
     original: Option<&str>,
     reason: &str,
+    id: Option<(u64, u64)>,
 ) -> Result<Recovered, String> {
     let fmt = recovered_format(original);
     let stem = original.and_then(|p| Path::new(p).file_stem()).map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| title.to_string());
@@ -60,6 +61,10 @@ pub fn write_recovered(
     let r = Recovered { path, title: title.to_string(), original: original.map(String::from), reason: reason.to_string(), at: now_rfc3339() };
     eprintln!("deckcraft-cli: work auto-saved ({reason}) to {}", r.path);
     shared.add_recovered(r.clone());
+    // A full copy of the presentation now exists: its periodic checkpoint is superseded.
+    if let Some((uid, revision)) = id {
+        crate::checkpoint::superseded(shared, uid, revision);
+    }
     Ok(r)
 }
 
@@ -83,7 +88,7 @@ pub fn save_session(
         if !unsaved && !include_clean {
             continue;
         }
-        match write_recovered(shared, roots, &st.doc, &st.title(), st.path.as_deref(), reason) {
+        match write_recovered(shared, roots, &st.doc, &st.title(), st.path.as_deref(), reason, Some((st.uid, st.revision))) {
             Ok(r) => out.push(r),
             Err(e) => eprintln!("deckcraft-cli: auto-save of {} failed: {e}", st.title()),
         }
@@ -95,7 +100,7 @@ pub fn save_session(
 pub fn save_snapshots(shared: &Shared, roots: Option<&Arc<AutomationRoots>>, docs: &[DocSnapshot], reason: &str) -> Vec<Recovered> {
     docs.iter()
         .filter(|d| d.dirty || d.path.is_none())
-        .filter_map(|d| match write_recovered(shared, roots, &d.doc, &d.title, d.path.as_deref(), reason) {
+        .filter_map(|d| match write_recovered(shared, roots, &d.doc, &d.title, d.path.as_deref(), reason, Some((d.uid, d.revision))) {
             Ok(r) => Some(r),
             Err(e) => {
                 eprintln!("deckcraft-cli: auto-save of {} failed: {e}", d.title);

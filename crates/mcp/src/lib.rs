@@ -17,6 +17,7 @@
 
 mod autosave;
 mod backend;
+mod checkpoint;
 pub mod contract;
 mod headless;
 mod jobs;

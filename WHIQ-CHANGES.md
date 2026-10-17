@@ -222,6 +222,35 @@ Test: `craft_fonts_ship_real_italics_and_the_arabic_fallback` (`crates/fonts`): 
 fonts, every required family resolves Italic and Bold Italic to a real italic face, Calibri/Arial
 italics reach theirs, and an Arabic cluster in an Inter run falls back to the bundled Arabic face.
 
+## 10. Checkpoints against a hard kill; memory as the OS measures it (round 2)
+
+- SIGTERM, end of input, eviction and panics already auto-save (§1). A hard kill — Windows
+  `TerminateProcess`, the OOM killer, a power cut — runs nothing on the way out, so unsaved work is
+  now also **checkpointed** while the server runs: a background thread (`crates/mcp/src/checkpoint.rs`)
+  writes each presentation with unsaved work to `<name>.recovered-checkpoint-<id>.<ext>` (beside
+  the other recovered files: the write root) once it has `--checkpoint-edits` (default 10) edits
+  not in the checkpoint yet, or once the oldest of them is `--checkpoint-secs` (default 30) old;
+  `0` turns either trigger off. It works from the worker's snapshot of the last finished call, so
+  a long call never delays it and the worker never waits for it.
+- The checkpoint is replaced in place (temporary file, then rename: never a half-written file, no
+  pile of copies). It is removed once superseded — the presentation saved to its file, or a full
+  recovered copy written on close, eviction, SIGTERM or the end of input — and kept, and named in
+  the next answer, if the presentation goes away with work no other file holds. After a hard kill
+  the next run lists it in `recovered_files` with the other recovered files; it opens as a
+  presentation. `server_status.checkpoints` shows the triggers and the current checkpoint files.
+- Memory: `server_status.memory` (and the `--max-memory-mb` eviction) uses the process's resident
+  memory as the OS reports it, not an estimate: the working set from `GetProcessMemoryInfo` on
+  Windows, `resident_size` from `task_info(MACH_TASK_BASIC_INFO)` on macOS, `Rss` from
+  `/proc/self/smaps` on Linux (crate `memory-stats`), plus the committed size (Windows
+  `PagefileUsage`, macOS/Linux virtual size), with `measured` and the `source` named. The crate
+  type-checks for `x86_64-pc-windows-gnu` here (`cargo check --target x86_64-pc-windows-gnu -p
+  deckcraft-cli`); it was not run on Windows or macOS in this container.
+- Tests (`tests/mcp-contract/contract.rs`): `a_hard_kill_loses_little_thanks_to_checkpoints` (3
+  edits → checkpoint, not before; more edits replace it in place; SIGKILL; the next run names it and
+  it opens with every checkpointed slide; `memory.rss_bytes` is measured),
+  `checkpoints_follow_time_and_go_once_the_work_is_saved` (the time trigger; a save removes the
+  checkpoint; closing writes the recovered copy and removes the new one).
+
 ## Not done / known limits
 
 - Busy is per process: one worker serves calls in order (one process per caller and document is

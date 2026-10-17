@@ -31,6 +31,11 @@ pub struct Config {
     pub idle_evict_secs: Option<u64>,
     /// Evict open documents when the process uses more memory than this.
     pub max_memory_mb: Option<u64>,
+    /// Checkpoint (write the recovered file of) a presentation with unsaved work after this many
+    /// edits since its last checkpoint; 0: never by count.
+    pub checkpoint_edits: u64,
+    /// … or once its oldest unsaved edit is this many seconds old; 0: never by time.
+    pub checkpoint_secs: u64,
     /// `DECKCRAFT_MCP_TEST_HOOKS=1`: honour `_delay_ms` on calls and jobs (contract tests only).
     pub test_hooks: bool,
 }
@@ -48,6 +53,8 @@ impl Default for Config {
             busy_after_ms: 8_000,
             idle_evict_secs: None,
             max_memory_mb: None,
+            checkpoint_edits: 10,
+            checkpoint_secs: 30,
             test_hooks: std::env::var("DECKCRAFT_MCP_TEST_HOOKS").is_ok_and(|v| v == "1"),
         }
     }
@@ -93,6 +100,9 @@ impl Evicted {
 /// One open presentation as last seen by the worker.
 #[derive(Clone, Debug)]
 pub struct DocSnapshot {
+    /// The document's id (stable while it is open) and its edit counter.
+    pub uid: u64,
+    pub revision: u64,
     pub title: String,
     pub path: Option<String>,
     pub dirty: bool,
@@ -208,6 +218,8 @@ pub struct Shared {
     pub backend_description: Mutex<String>,
     /// The task of the call the worker is running (`cancel` stops it at its next safe point).
     current_task: Mutex<Option<std::sync::Arc<deckcraft_engine::task::Task>>>,
+    /// Checkpoints of the open presentations, by document id (see `checkpoint.rs`).
+    pub checkpoints: Mutex<BTreeMap<u64, crate::checkpoint::Checkpoint>>,
 }
 
 /// Lock, recovering from a poisoned lock (a panicking thread must not stop the server).
@@ -232,6 +244,7 @@ impl Shared {
             busy_replies: AtomicU64::new(0),
             backend_description: Mutex::new(String::new()),
             current_task: Mutex::new(None),
+            checkpoints: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -417,9 +430,35 @@ impl Shared {
     }
 }
 
-/// Resident memory of this process in bytes, where the platform reports it.
+/// Resident memory of this process in bytes, measured by the OS (not an estimate): the working
+/// set on Windows (`GetProcessMemoryInfo`), the resident size on macOS (`task_info`), the RSS from
+/// `/proc/self/smaps` on Linux.
 pub fn rss_bytes() -> Option<u64> {
     memory_stats::memory_stats().map(|m| m.physical_mem as u64)
+}
+
+/// The process's memory as the OS reports it, for `server_status`.
+pub fn memory_value(limit_mb: Option<u64>) -> Value {
+    let m = memory_stats::memory_stats();
+    let rss = m.map(|m| m.physical_mem as u64);
+    let committed = m.map(|m| m.virtual_mem as u64);
+    let source = if cfg!(windows) {
+        "GetProcessMemoryInfo: WorkingSetSize (rss), PagefileUsage (committed)"
+    } else if cfg!(target_os = "macos") {
+        "task_info(MACH_TASK_BASIC_INFO): resident_size (rss), virtual_size (committed)"
+    } else if cfg!(target_os = "linux") {
+        "/proc/self/smaps: Rss (rss), Size (committed)"
+    } else {
+        "memory-stats"
+    };
+    json!({
+        "rss_bytes": rss,
+        "rss_mb": rss.map(|b| b / (1024 * 1024)),
+        "committed_bytes": committed,
+        "limit_mb": limit_mb,
+        "measured": rss.is_some(),
+        "source": source,
+    })
 }
 
 /// `20261017-142530` (UTC) for recovered file names.

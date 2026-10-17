@@ -126,7 +126,7 @@ and prints its answer as JSON. COMMAND [PARAMS] runs a command, as run --cmd doe
     },
     Subcommand {
         name: "mcp",
-        usage: "mcp [--connect PORT] [--sample] [--automation-read-root DIR] [--automation-write-root DIR] [--author NAME] [--busy-after-ms MS] [--idle-evict-secs S] [--max-memory-mb MB] [--max-result-bytes N] [--open-job-mb MB] [--export-job-slides N]",
+        usage: "mcp [--connect PORT] [--sample] [--automation-read-root DIR] [--automation-write-root DIR] [--author NAME] [--busy-after-ms MS] [--idle-evict-secs S] [--max-memory-mb MB] [--max-result-bytes N] [--open-job-mb MB] [--export-job-slides N] [--checkpoint-edits N] [--checkpoint-secs S]",
         summary: "serve the commands to an agent over MCP on stdio",
         details: "Runs a Model Context Protocol server on stdin and stdout. It works on its own presentation without a
 window, or with --connect PORT (or host:port) on the DeckCraft app started with --control PORT.
@@ -143,6 +143,9 @@ exporting every slide of a deck of --export-job-slides (24) or more run as jobs 
 --max-result-bytes (262144) are trimmed with continue_from. Unsaved work is written to
 <name>.recovered-<stamp>.<ext> in the write root on SIGTERM, at the end of input, after --idle-evict-secs
 without a call, above --max-memory-mb, or after an internal error, and the next answer names the file.
+Against a hard kill, unsaved work is also checkpointed to <name>.recovered-checkpoint-<id>.<ext> after
+--checkpoint-edits (10) edits or once the oldest unsaved edit is --checkpoint-secs (30) old (0 turns
+either off); the next run lists the checkpoints it finds with the recovered files.
 Saving never replaces a file silently: the old one is renamed OLD_<name> unless the call passes
 overwrite: true. --author NAME (or a call's `caller`) is put on comments and on the saved file.",
     },

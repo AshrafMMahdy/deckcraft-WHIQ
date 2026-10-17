@@ -197,6 +197,15 @@ impl Mcp {
     }
 }
 
+impl Mcp {
+    /// A hard kill (SIGKILL on unix, `TerminateProcess` on Windows): nothing runs on the way out.
+    pub fn kill(mut self) -> String {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.stderr()
+    }
+}
+
 impl Drop for Mcp {
     fn drop(&mut self) {
         drop(self.stdin.take());

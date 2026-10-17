@@ -471,3 +471,81 @@ fn a_running_call_stops_at_a_safe_point_when_cancelled() {
     }
     assert_eq!(m.err("inspect_document", json!({}))["code"], "no_document");
 }
+
+/// Wait (up to 10 s) for a file in `dir` whose name contains `needle`.
+fn wait_for_file(dir: &std::path::Path, needle: &str) -> Vec<std::path::PathBuf> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let f = files_with(dir, needle);
+        if !f.is_empty() || Instant::now() > deadline {
+            return f;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+// §3 (WHIQ round 2) ─ periodic checkpoints: a hard kill (SIGKILL / TerminateProcess) loses at most
+// the last few edits, and the next run names the checkpoint.
+#[test]
+fn a_hard_kill_loses_little_thanks_to_checkpoints() {
+    let dir = scratch("checkpoint-edits");
+    let mut m = start(&dir, &["--checkpoint-edits", "3", "--checkpoint-secs", "0"], &[]);
+    m.ok("new_presentation", json!({}));
+    m.ok("add_slide", json!({"title": "one"}));
+    m.ok("add_slide", json!({"title": "two"}));
+    std::thread::sleep(Duration::from_millis(600));
+    assert!(files_with(&dir, ".recovered-checkpoint-").is_empty(), "2 edits: not yet due");
+    m.ok("add_slide", json!({"title": "three"}));
+    let found = wait_for_file(&dir, ".recovered-checkpoint-");
+    assert_eq!(found.len(), 1, "{}", m.stderr());
+    let st = m.ok("server_status", json!({}));
+    assert_eq!(st["checkpoints"]["every_edits"], 3, "{st}");
+    assert!(st["checkpoints"]["files"].to_string().contains(".recovered-checkpoint-"), "{st}");
+    assert!(st["memory"]["rss_bytes"].as_u64().unwrap() > 1024 * 1024, "measured by the OS: {st}");
+    assert_eq!(st["memory"]["measured"], true);
+    // More edits replace the same checkpoint in place (no pile of files, no OLD_ copies).
+    for t in ["four", "five", "six"] {
+        m.ok("add_slide", json!({"title": t}));
+    }
+    std::thread::sleep(Duration::from_millis(800));
+    assert_eq!(files_with(&dir, ".recovered-").len(), 1);
+    assert!(files_with(&dir, "OLD_").is_empty());
+    let stderr = m.kill();
+    let found = files_with(&dir, ".recovered-checkpoint-");
+    assert_eq!(found.len(), 1, "{stderr}");
+    // The next run names it; it opens with every checkpointed slide.
+    let mut m = start(&dir, &[], &[]);
+    let st = m.ok("server_status", json!({}));
+    let name = found[0].file_name().unwrap().to_str().unwrap().to_string();
+    assert!(st["recovered_files"].to_string().contains(&name), "{st}");
+    let r = m.ok("open_presentation", json!({"path": found[0].to_str().unwrap()}));
+    assert_eq!(r["slides"], 7, "{r}");
+}
+
+// The time trigger, and a save supersedes the checkpoint.
+#[test]
+fn checkpoints_follow_time_and_go_once_the_work_is_saved() {
+    let dir = scratch("checkpoint-secs");
+    let mut m = start(&dir, &["--checkpoint-edits", "0", "--checkpoint-secs", "1"], &[]);
+    m.ok("new_presentation", json!({}));
+    m.ok("add_slide", json!({"title": "one edit"}));
+    let t = Instant::now();
+    let found = wait_for_file(&dir, ".recovered-checkpoint-");
+    assert_eq!(found.len(), 1, "{}", m.stderr());
+    assert!(t.elapsed() >= Duration::from_millis(700), "not before the interval");
+    m.ok("save_presentation", json!({"path": "kept.pptx"}));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while found[0].exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(!found[0].exists(), "saved: the checkpoint is superseded");
+    // Unsaved again: a new checkpoint, named after the file; closing writes the recovered copy and
+    // the checkpoint goes.
+    m.ok("add_slide", json!({"title": "after the save"}));
+    let found = wait_for_file(&dir, "kept.recovered-checkpoint-");
+    assert_eq!(found.len(), 1, "{}", m.stderr());
+    let (ok, stderr) = m.close();
+    assert!(ok, "{stderr}");
+    assert!(!found[0].exists(), "{stderr}");
+    assert_eq!(files_with(&dir, "kept.recovered-").len(), 1, "{stderr}");
+}

@@ -234,7 +234,7 @@ pub fn serve(server: Server, input: impl BufRead + Send + 'static, output: impl 
     };
     let (server, roots) = roots;
     let out: Out = Arc::new(Mutex::new(Box::new(output)));
-    *lock(&RUNNING) = Some(Running { server: Arc::downgrade(&server), shared: Arc::clone(&shared), roots, out: Arc::clone(&out) });
+    *lock(&RUNNING) = Some(Running { server: Arc::downgrade(&server), shared: Arc::clone(&shared), roots: roots.clone(), out: Arc::clone(&out) });
     install_signal_handler();
 
     let queue = Arc::new(Queue { items: Mutex::new(VecDeque::new()), cv: Condvar::new(), closed: AtomicBool::new(false) });
@@ -323,6 +323,20 @@ pub fn serve(server: Server, input: impl BufRead + Send + 'static, output: impl 
         })?
     };
 
+    // The checkpointer (WHIQ): unsaved work goes to its checkpoint every N edits or seconds, so a
+    // hard kill loses little. It works from the worker's snapshots and never waits for a call.
+    let checkpointer = {
+        let (shared, stop, roots) = (Arc::clone(&shared), Arc::clone(&stop), roots.clone());
+        std::thread::Builder::new().name("deckcraft-mcp-checkpoint".into()).spawn(move || {
+            while !stop.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(200));
+                for path in crate::checkpoint::tick(&shared, roots.as_ref(), Instant::now()) {
+                    eprintln!("deckcraft-cli: checkpoint written to {path}");
+                }
+            }
+        })?
+    };
+
     // The reader.
     let mut read_error = None;
     for line in input.lines() {
@@ -361,6 +375,7 @@ pub fn serve(server: Server, input: impl BufRead + Send + 'static, output: impl 
     let _ = worker.join();
     stop.store(true, Ordering::SeqCst);
     let _ = dog.join();
+    let _ = checkpointer.join();
     // The end of input: unsaved work goes to recovered files, never away.
     {
         let mut s = lock(&server);
