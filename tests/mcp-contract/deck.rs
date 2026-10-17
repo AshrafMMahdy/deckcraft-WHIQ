@@ -289,3 +289,67 @@ fn overlays_go_on_an_existing_picture_from_the_platform_table() {
     let e = m.err("add_overlays", json!({"id": id, "overlays": []}));
     assert_eq!(e["code"], "invalid_argument", "{e}");
 }
+
+/// A company template: its theme (colours, fonts), masters with their logo and decorations, and
+/// its layouts, so a deck built from it looks like it; `.potx` saved with the template type.
+#[test]
+fn a_deck_built_from_a_company_template_takes_its_theme_masters_and_layouts() {
+    let dir = scratch("template");
+    let mut m = start(&dir);
+    let logo = picture(&mut m, &dir, "logo.png");
+    // The company's template: own palette and fonts, a logo on the master, renamed layouts.
+    m.ok("build_deck", json!({"titleSlide": false, "theme": {"accent": "#C0392B", "accent2": "#27AE60", "heading": "#2C3E50", "fontHead": "Merriweather", "fontBody": "Lato"}, "slides": [{"layout": "bullets", "title": "x", "bullets": ["y"]}]}));
+    m.ok("run_command", json!({"command": "view.slideMaster", "params": {"master": 0}}));
+    m.ok("insert_picture", json!({"path": logo.to_str().unwrap(), "x": 840, "y": 20, "w": 100, "h": 56}));
+    m.ok("run_command", json!({"command": "master.renameLayout", "params": {"name": "ACME Title", "master": 0, "layout": 0}}));
+    m.ok("run_command", json!({"command": "view.closeMaster"}));
+    m.ok("save_presentation", json!({"path": "acme.potx"}));
+    let potx = dir.join("acme.potx");
+    let ct = zip_text(&potx, "[Content_Types].xml");
+    assert!(ct.contains("application/vnd.openxmlformats-officedocument.presentationml.template.main+xml"), "{ct}");
+    let master_xml = zip_text(&potx, "ppt/slideMasters/slideMaster1.xml");
+    assert!(master_xml.contains("<p:pic>"), "the logo is on the template's master");
+    let tdoc = m.ok("inspect_document", json!({}));
+
+    // A deck built from it.
+    let r = m.ok(
+        "build_deck",
+        json!({"template": "acme.potx", "title": "Quarterly", "subtitle": "ACME", "slides": [
+        {"layout": "bullets", "title": "Agenda", "bullets": ["one", "two"], "notes": "n"},
+        {"layout": "section", "title": "Part 2"},
+        {"layout": "kpi", "title": "KPIs", "kpis": [{"label": "A", "value": "1"}, {"label": "B", "value": "2"}]}
+    ], "path": "quarterly.pptx"}),
+    );
+    assert_eq!(r["template"], true, "{r}");
+    let doc = m.ok("inspect_document", json!({}));
+    assert_eq!(doc["theme"], tdoc["theme"]);
+    assert_eq!(doc["fonts"]["major"], "Merriweather");
+    assert_eq!(doc["fonts"]["minor"], "Lato");
+    let lnames = |d: &Value| d["layouts"].as_array().unwrap().iter().map(|l| l["name"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+    assert_eq!(lnames(&doc), lnames(&tdoc), "the template's layouts");
+    assert!(lnames(&doc).contains(&"ACME Title".to_string()));
+    let out = dir.join("quarterly.pptx");
+    let theme = zip_text(&out, "ppt/theme/theme1.xml");
+    assert!(theme.contains("C0392B") && theme.contains("Merriweather"), "palette and fonts");
+    assert!(zip_text(&out, "ppt/slideMasters/slideMaster1.xml").contains("<p:pic>"), "the master's logo comes along");
+    // Titles sit in the template's own placeholders (no position of ours), on its title layout.
+    let s1 = zip_text(&out, "ppt/slides/slide1.xml");
+    assert!(s1.contains("type=\"ctrTitle\"") || s1.contains("type=\"title\""), "{s1}");
+    let rels = zip_text(&out, "ppt/slides/_rels/slide1.xml.rels");
+    let layout_part = rels.split("slideLayouts/").nth(1).unwrap().split('"').next().unwrap();
+    let layout_xml = zip_text(&out, &format!("ppt/slideLayouts/{layout_part}"));
+    assert!(layout_xml.contains("ACME Title"), "the title slide uses the template's title layout");
+
+    // adopt_template restyles a deck that is already built.
+    m.ok("new_presentation", json!({"theme": "Harbor"}));
+    m.ok("add_slide", json!({"layout": "titleAndContent", "title": "Old look", "body": "text"}));
+    let r = m.ok("adopt_template", json!({"path": "acme.potx"}));
+    assert_eq!(r["slides"], 2, "{r}");
+    let doc = m.ok("inspect_document", json!({}));
+    assert_eq!(doc["fonts"]["major"], "Merriweather");
+    assert_eq!(lnames(&doc), lnames(&tdoc));
+    m.ok("save_presentation", json!({"path": "restyled.pptx"}));
+    assert!(zip_text(&dir.join("restyled.pptx"), "ppt/theme/theme1.xml").contains("C0392B"));
+    let slide = m.ok("inspect_slide", json!({"index": 1}));
+    assert_eq!(slide["title"], "Old look", "content kept");
+}

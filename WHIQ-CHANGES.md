@@ -89,3 +89,21 @@ step). Tests: `overlay_regression_deck_renders_every_mark` (renders the regressi
 kept as `target/tmp/overlay-regression.png` and `.pptx` — and probes each mark's pixels and the
 DrawingML: `prstDash`, `headEnd`/`tailEnd`, `custGeom`, `close`, alpha),
 `overlays_go_on_an_existing_picture_from_the_platform_table`.
+
+## 4. Theme adoption from a company template, `.potx`
+
+- `build_deck {template: company.pptx|.potx}` builds on the template itself: its theme (colours,
+  fonts, effects), slide masters (logo and decorations included) and layouts; its own slides and
+  the pictures only they used are dropped. Titles fill the template layouts' own title
+  placeholders (position and look from the template); the title slide uses its Title layout,
+  sections its Section Header layout; content is drawn in the template's palette lifted the way
+  the platform's `deckTheme.ts` does (lt1 background, dk1 text, dk2 headings, accent1/2, forced
+  contrast, major/minor fonts).
+- `adopt_template {path}` (command `design.adoptTemplate`) restyles an open deck: the template's
+  masters and layouts replace the deck's (ids moved past the deck's, master media copied and
+  remapped), each slide moves to the template layout of the same kind (else the same name).
+- `.potx` save writes `application/vnd.openxmlformats-officedocument.presentationml.template.main+xml`
+  (upstream writer, now exercised by the tests).
+- Test: `a_deck_built_from_a_company_template_takes_its_theme_masters_and_layouts` (template made
+  with a custom palette and fonts, a logo on its master and a renamed layout; checks the content
+  type, theme XML, master picture, layout names and that slides sit on the template's layouts).
