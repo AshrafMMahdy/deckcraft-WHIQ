@@ -153,6 +153,24 @@ Tests: `crates/pdf/src/tests.rs` (`slides_are_vector_artwork_with_real_text_unle
 pictures, `raster: true` still a picture per slide), the smoke script (pdftotext finds the text).
 A 13-slide built deck: 37 KB vector vs ~1 MB raster.
 
+## 7. Cancelling a running call or a job (round 2)
+
+New tool `cancel` (answered by the reader thread, never waits): it stops the call running now at
+its next safe point, or the job `job_id`; `queued: true` also drops the calls waiting behind it
+(each answered `cancelled`). Every call runs inside a `deckcraft_engine::task::Task`
+(`crates/engine/src/task.rs`): progress and a cancel flag shared with the host. Safe points: between
+the slides `deck.build` makes (nothing is added to the session until the whole deck is built),
+between the slides a .pptx is read (`deckcraft_pptx::import_with`), between slides of an image export
+(the files written so far are named), between PDF pages (`PdfOptions::on_page`), between GIF frames,
+between the commands of a `batch`. A cancelled command fails with `cancelled` and the session puts
+the presentation back as it was before the command (the engine's rollback of failed commands), so
+it is always consistent. A cancelled open job never adds its file; a cancelled export job reports
+what it wrote. New error code `cancelled`, job state `cancelled`.
+Tests: `tests/mcp-contract/contract.rs` (`a_running_call_stops_at_a_safe_point_when_cancelled`:
+cancel answers at once, the call stops long before its end, queued calls dropped, a job cancelled
+leaves no document), `crates/engine/src/tests_task.rs` (a cancelled build adds no deck; cancelled
+PDF, PNG and GIF exports write nothing; a cancelled read adds no document; PDF progress per page).
+
 ## Not done / known limits
 
 - A relationship id kept from a file that collides with one the writer made is renamed, and kept

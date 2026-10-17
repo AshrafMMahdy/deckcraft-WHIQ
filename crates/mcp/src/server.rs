@@ -93,7 +93,7 @@ fn tool_def(name: &str) -> Option<Value> {
 fn needs_document(name: &str, args: &Value) -> bool {
     match name {
         "list_commands" | "new_presentation" | "open_presentation" | "build_deck" | "server_status" | "job_status" | "list_jobs" | "evict"
-        | "select_tool" | "screenshot" | "call_app" => false,
+        | "cancel" | "select_tool" | "screenshot" | "call_app" => false,
         "run_command" => !args.get("command").and_then(Value::as_str).is_some_and(command_needs_no_document),
         "batch" => !args
             .get("commands")
@@ -154,7 +154,7 @@ pub fn status_value(shared: &Shared) -> Value {
         "roots": {"read": c.read_root.as_ref().map(|p| p.display().to_string()), "write": c.write_root.as_ref().map(|p| p.display().to_string())},
         "documents": docs,
         "jobs": {"running": shared.running_jobs(), "list": shared.jobs_value()},
-        "current_call": shared.current().map(|(t, ms)| json!({"tool": t, "elapsed_ms": ms})),
+        "current_call": shared.current().map(|(t, ms)| json!({"tool": t, "elapsed_ms": ms, "progress": shared.current_progress()})),
         "idle_ms": shared.idle_for().as_millis() as u64,
         "calls": shared.calls.load(std::sync::atomic::Ordering::Relaxed),
         "busy_replies": shared.busy_replies.load(std::sync::atomic::Ordering::Relaxed),
@@ -361,12 +361,11 @@ impl Server {
         let caller =
             args.as_object_mut().and_then(|o| o.remove("caller")).and_then(|v| v.as_str().map(str::to_string)).filter(|c| !c.trim().is_empty());
         let overwrite = args.get("overwrite").and_then(Value::as_bool).unwrap_or(false);
-        if self.shared.config.test_hooks
-            && let Some(ms) = raw_args.get("_delay_ms").and_then(Value::as_u64)
-            && !matches!(name, "open_presentation" | "export")
-        {
-            std::thread::sleep(std::time::Duration::from_millis(ms.min(60_000)));
-        }
+        let delay_ms = if self.shared.config.test_hooks && !matches!(name, "open_presentation" | "export") {
+            raw_args.get("_delay_ms").and_then(Value::as_u64).unwrap_or(0).min(60_000)
+        } else {
+            0
+        };
 
         // Gates: a document the server closed, a document still opening.
         if needs_document(name, &args) && !self.has_document() {
@@ -407,15 +406,30 @@ impl Server {
                 // Contract tests only (DECKCRAFT_MCP_TEST_HOOKS=1): an internal failure mid-call.
                 std::panic::resume_unwind(Box::new(String::from("test hook: _panic")));
             }
+            // Contract tests only: slow work with a safe point every 20 ms.
+            let steps = delay_ms / 20;
+            for k in 0..steps {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                if let Err(e) = deckcraft_engine::task::step(k as usize, steps as usize) {
+                    let cx = me.error_context(name);
+                    return Err(contract::classify(&e.to_string(), &cx));
+                }
+            }
             me.dispatch(name, &args, author.as_deref(), overwrite)
         };
+        // The call's task: `cancel` (answered by the reader) stops it at its next safe point.
+        let task = deckcraft_engine::task::Task::new();
+        self.shared.set_current_task(Some(task.clone()));
         let caught = catch_unwind(AssertUnwindSafe(|| {
-            if overwrite || matches!(name, "server_status" | "job_status" | "list_jobs") {
-                (run(self), vec![])
-            } else {
-                deckcraft_engine::io::keep_previous(|| run(self))
-            }
+            deckcraft_engine::task::scope(task.clone(), || {
+                if overwrite || matches!(name, "server_status" | "job_status" | "list_jobs" | "cancel") {
+                    (run(self), vec![])
+                } else {
+                    deckcraft_engine::io::keep_previous(|| run(self))
+                }
+            })
         }));
+        self.shared.set_current_task(None);
         let (outcome, renamed) = match caught {
             Ok(r) => r,
             Err(payload) => {
@@ -472,6 +486,16 @@ impl Server {
                     ToolError::new(code::NOT_FOUND, format!("no job `{id}`"), "list_jobs shows the jobs of this server")
                         .with("candidates", json!(contract::closest(&id, ids.iter().map(String::as_str), 5)))
                 })
+            }
+            "cancel" => {
+                // In-process (the reader answers this while a call runs): only jobs can be running.
+                match args.get("job_id").map(|v| v.as_str().map(String::from).unwrap_or_else(|| v.to_string())) {
+                    Some(id) => match self.shared.cancel_job(&id) {
+                        Some(state) => Ok(Outcome::new(json!({"job_id": id, "state": state, "cancelled": state != "done" && state != "failed"}))),
+                        None => Err(ToolError::new(code::NOT_FOUND, format!("no job `{id}`"), "list_jobs shows the jobs of this server")),
+                    },
+                    None => Ok(Outcome::new(json!({"cancelled": false, "reason": "nothing else is running"}))),
+                }
             }
             "evict" => {
                 let ev = self.evict_all("evict");

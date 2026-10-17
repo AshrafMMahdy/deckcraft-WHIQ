@@ -106,6 +106,7 @@ pub enum JobState {
     Running,
     Done,
     Failed,
+    Cancelled,
 }
 
 impl JobState {
@@ -114,6 +115,7 @@ impl JobState {
             JobState::Running => "running",
             JobState::Done => "done",
             JobState::Failed => "failed",
+            JobState::Cancelled => "cancelled",
         }
     }
 }
@@ -131,22 +133,40 @@ pub struct Job {
     pub error: Option<Value>,
     /// An `open` job's parsed file, waiting for the worker to add it to the session.
     pub pending_open: Option<deckcraft_engine::cmd::file::LoadedFile>,
+    /// Progress and cancellation shared with the job's thread.
+    pub task: std::sync::Arc<deckcraft_engine::task::Task>,
 }
 
 impl Job {
+    /// Progress 0..1: what the job's thread reports at its safe points, at least what was set.
+    pub fn effective_progress(&self) -> f64 {
+        match self.state {
+            JobState::Done => 1.0,
+            _ => self.progress.max(self.task.fraction().unwrap_or(0.0) * 0.95),
+        }
+    }
+
     pub fn to_value(&self) -> Value {
         let elapsed = self.finished.unwrap_or_else(Instant::now).duration_since(self.started).as_millis() as u64;
+        let progress = self.effective_progress();
+        let (done, total) = self.task.progress();
         let mut v = json!({
             "job_id": self.id,
             "kind": self.kind,
             "detail": self.detail,
             "state": self.state.name(),
-            "progress": (self.progress * 1000.0).round() / 1000.0,
+            "progress": (progress * 1000.0).round() / 1000.0,
+            "stage": self.task.stage(),
+            "steps": {"done": done, "total": total},
             "elapsed_ms": elapsed,
         });
         match self.state {
+            JobState::Cancelled => {
+                v["result"] = self.result.clone().unwrap_or(Value::Null);
+                v["next_step"] = json!("the job was cancelled at a safe point; nothing past it was changed");
+            }
             JobState::Running => {
-                let retry = retry_hint(elapsed, self.progress);
+                let retry = retry_hint(elapsed, progress);
                 v["retry_after_ms"] = json!(retry);
                 v["next_step"] = json!(format!("call job_status {{job_id: \"{}\"}} again in about {retry} ms", self.id));
             }
@@ -186,6 +206,8 @@ pub struct Shared {
     pub calls: AtomicU64,
     pub busy_replies: AtomicU64,
     pub backend_description: Mutex<String>,
+    /// The task of the call the worker is running (`cancel` stops it at its next safe point).
+    current_task: Mutex<Option<std::sync::Arc<deckcraft_engine::task::Task>>>,
 }
 
 /// Lock, recovering from a poisoned lock (a panicking thread must not stop the server).
@@ -209,6 +231,7 @@ impl Shared {
             calls: AtomicU64::new(0),
             busy_replies: AtomicU64::new(0),
             backend_description: Mutex::new(String::new()),
+            current_task: Mutex::new(None),
         })
     }
 
@@ -227,6 +250,7 @@ impl Shared {
             result: None,
             error: None,
             pending_open: None,
+            task: deckcraft_engine::task::Task::new(),
         };
         let mut jobs = lock(&self.jobs);
         // Keep the table bounded: drop the oldest finished jobs past 200.
@@ -250,6 +274,34 @@ impl Shared {
             j.finished = Some(Instant::now());
             j.result = Some(result);
         });
+    }
+    pub fn job_cancelled(&self, id: &str, partial: Value) {
+        self.with_job(id, |j| {
+            j.state = JobState::Cancelled;
+            j.finished = Some(Instant::now());
+            j.result = Some(partial);
+            j.pending_open = None;
+        });
+    }
+    /// The task of job `id` (its thread runs inside it).
+    pub fn job_task(&self, id: &str) -> Option<std::sync::Arc<deckcraft_engine::task::Task>> {
+        self.with_job(id, |j| j.task.clone())
+    }
+    /// Ask job `id` to stop at its next safe point. `Some(state)` with its state now.
+    pub fn cancel_job(&self, id: &str) -> Option<&'static str> {
+        let want = id.trim().to_ascii_lowercase();
+        let want = if want.chars().all(|c| c.is_ascii_digit()) { format!("job-{want}") } else { want };
+        let mut jobs = lock(&self.jobs);
+        let j = jobs.get_mut(&want)?;
+        if j.state == JobState::Running {
+            j.task.cancel();
+            if j.pending_open.take().is_some() {
+                // Read but not yet added: dropping it changes nothing.
+                j.state = JobState::Cancelled;
+                j.finished = Some(Instant::now());
+            }
+        }
+        Some(j.state.name())
     }
     pub fn job_failed(&self, id: &str, error: Value) {
         self.with_job(id, |j| {
@@ -279,7 +331,7 @@ impl Shared {
         lock(&self.jobs)
             .values()
             .find(|j| j.kind == "open" && j.state == JobState::Running)
-            .map(|j| (j.id.clone(), j.progress, j.started.elapsed().as_millis() as u64))
+            .map(|j| (j.id.clone(), j.effective_progress(), j.started.elapsed().as_millis() as u64))
     }
     /// Parsed files waiting to be added to the session.
     pub fn take_pending_opens(&self) -> Vec<(String, deckcraft_engine::cmd::file::LoadedFile)> {
@@ -341,6 +393,24 @@ impl Shared {
     }
     pub fn set_current(&self, tool: Option<&str>) {
         *lock(&self.current) = tool.map(|t| (t.to_string(), Instant::now()));
+    }
+    pub fn set_current_task(&self, t: Option<std::sync::Arc<deckcraft_engine::task::Task>>) {
+        *lock(&self.current_task) = t;
+    }
+    /// Cancel the running call; `Some((tool, elapsed ms))` when one was running.
+    pub fn cancel_current(&self) -> Option<(String, u64)> {
+        let running = self.current()?;
+        if let Some(t) = lock(&self.current_task).as_ref() {
+            t.cancel();
+        }
+        Some(running)
+    }
+    /// Progress of the running call, when it reports any.
+    pub fn current_progress(&self) -> Option<Value> {
+        lock(&self.current_task).as_ref().map(|t| {
+            let (d, n) = t.progress();
+            json!({"done": d, "total": n, "stage": t.stage(), "cancelling": t.is_cancelled()})
+        })
     }
     pub fn current(&self) -> Option<(String, u64)> {
         lock(&self.current).as_ref().map(|(t, at)| (t.clone(), at.elapsed().as_millis() as u64))

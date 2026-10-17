@@ -34,16 +34,28 @@ pub fn spawn_open(shared: &Arc<Shared>, roots: Option<Arc<AutomationRoots>>, pat
     let id = shared.new_job("open", &path);
     let sh = Arc::clone(shared);
     let jid = id.clone();
+    let task = shared.job_task(&id).unwrap_or_default();
     let spawned = std::thread::Builder::new().name(format!("deckcraft-{jid}")).spawn(move || {
+        let t = task.clone();
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            file_access::confine(roots.as_ref(), || {
-                test_delay(&sh, &args);
-                sh.job_progress(&jid, 0.1);
-                deckcraft_engine::cmd::file::read_presentation_file(&path).map_err(|e| e.to_string())
+            deckcraft_engine::task::scope(t, || {
+                file_access::confine(roots.as_ref(), || {
+                    deckcraft_engine::task::stage("reading the file");
+                    test_delay(&sh, &args);
+                    sh.job_progress(&jid, 0.05);
+                    deckcraft_engine::cmd::file::read_presentation_file(&path).map_err(|e| e.to_string())
+                })
             })
         }));
+        if task.is_cancelled() {
+            sh.job_cancelled(&jid, json!({"opened": false}));
+            return;
+        }
         match r {
-            Ok(Ok(loaded)) => sh.set_pending_open(&jid, loaded),
+            Ok(Ok(loaded)) => {
+                task.set_stage("adding it to the session");
+                sh.set_pending_open(&jid, loaded)
+            }
             Ok(Err(e)) => sh.job_failed(&jid, error_value(&sh, "open_presentation", &e)),
             Err(_) => sh.job_failed(&jid, error_value(&sh, "open_presentation", "the file could not be read (internal error while parsing)")),
         }
@@ -67,14 +79,26 @@ pub fn spawn_export(
     let id = shared.new_job("export", &path);
     let sh = Arc::clone(shared);
     let jid = id.clone();
+    let task = shared.job_task(&id).unwrap_or_default();
     let spawned = std::thread::Builder::new().name(format!("deckcraft-{jid}")).spawn(move || {
+        let t = task.clone();
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            file_access::confine(roots.as_ref(), || {
-                test_delay(&sh, &args);
-                let run = || export(&sh, &jid, &doc, current, &args);
-                if overwrite { (run(), vec![]) } else { deckcraft_engine::io::keep_previous(run) }
+            deckcraft_engine::task::scope(t, || {
+                file_access::confine(roots.as_ref(), || {
+                    test_delay(&sh, &args);
+                    let run = || export(&sh, &jid, &doc, current, &args);
+                    if overwrite { (run(), vec![]) } else { deckcraft_engine::io::keep_previous(run) }
+                })
             })
         }));
+        if task.is_cancelled() {
+            let note = match &r {
+                Ok((Err(e), _)) => e.clone(),
+                _ => String::new(),
+            };
+            sh.job_cancelled(&jid, json!({"note": note}));
+            return;
+        }
         match r {
             Ok((Ok(mut v), renamed)) => {
                 if !renamed.is_empty() {
@@ -113,8 +137,11 @@ fn export(sh: &Shared, jid: &str, doc: &Presentation, current: usize, p: &Value)
                 return Err(format!("file.export: no slide {i}"));
             }
             let scale = f::image_scale(doc, scale);
-            let mut written = vec![];
+            let mut written: Vec<String> = vec![];
+            deckcraft_engine::task::stage("rendering slides");
             for (k, i) in slides.iter().enumerate() {
+                // A safe point between slides: the files written so far are whole.
+                deckcraft_engine::task::step(k, slides.len()).map_err(|e| format!("{e}; written so far: {}", written.join(", ")))?;
                 let img = deckcraft_render::render_slide(doc, *i, &deckcraft_render::RenderOpts { scale, ..Default::default() });
                 let dpi = deckcraft_render::dpi_for_scale(scale);
                 let bytes = if format == "png" { img.to_png_at(dpi) } else { img.to_jpeg_at(92, Some(dpi)) };
@@ -128,17 +155,18 @@ fn export(sh: &Shared, jid: &str, doc: &Presentation, current: usize, p: &Value)
                 };
                 write(&out, &bytes).map_err(|e| if written.is_empty() { e } else { format!("{e} (slides 1–{k} were written)") })?;
                 written.push(out);
-                sh.job_progress(jid, (k + 1) as f64 / slides.len().max(1) as f64);
+                sh.job_progress(jid, (k + 1) as f64 / slides.len().max(1) as f64 * 0.95);
             }
             Ok(json!({"files": written, "slides": slides.len()}))
         }
         "pdf" => {
-            sh.job_progress(jid, 0.1);
+            sh.job_progress(jid, 0.02);
             let bytes = f::pdf_bytes(doc, p).map_err(|e| e.to_string())?;
             write(&path, &bytes)?;
             Ok(json!({"path": path, "bytes": bytes.len()}))
         }
         "gif" => {
+            sh.job_progress(jid, 0.02);
             let mut gp = p.clone();
             if let Some(text) = p.get("slides").and_then(Value::as_str) {
                 gp["slides"] = json!(f::parse_slide_range(text, n).map_err(|e| e.to_string())?);
@@ -148,6 +176,8 @@ fn export(sh: &Shared, jid: &str, doc: &Presentation, current: usize, p: &Value)
             Ok(json!({"path": path, "bytes": bytes.len()}))
         }
         "pptx" | "potx" | "ppsx" | "deckcraft" | "outline" | "txt" => {
+            deckcraft_engine::task::stage("writing the file");
+            sh.job_progress(jid, 0.3);
             let bytes = f::save_bytes(doc, &format).map_err(|e| e.to_string())?;
             write(&path, &bytes)?;
             Ok(json!({"path": path, "bytes": bytes.len()}))

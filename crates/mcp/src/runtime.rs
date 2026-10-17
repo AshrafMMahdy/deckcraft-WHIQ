@@ -103,7 +103,7 @@ fn install_signal_handler() {
 }
 
 /// Answer the requests that never wait. `None`: queue it.
-fn fast_answer(msg: &Value, shared: &Arc<Shared>, server: &Arc<Mutex<Server>>) -> Option<Value> {
+fn fast_answer(msg: &Value, shared: &Arc<Shared>, server: &Arc<Mutex<Server>>, queue: &Queue, out: &Out) -> Option<Value> {
     let id = msg.get("id")?.clone();
     if !(id.is_string() || id.is_number()) {
         return None;
@@ -120,6 +120,48 @@ fn fast_answer(msg: &Value, shared: &Arc<Shared>, server: &Arc<Mutex<Server>>) -
             let args = params.get("arguments").cloned().unwrap_or(Value::Null);
             match name {
                 "server_status" => tool_result(status_value(shared)),
+                "cancel" => {
+                    let job = args.get("job_id").or_else(|| args.get("jobId")).map(|v| v.as_str().map(String::from).unwrap_or_else(|| v.to_string()));
+                    let mut answer = json!({});
+                    if let Some(id) = job {
+                        match shared.cancel_job(&id) {
+                            Some(state) => answer = json!({"job_id": id, "state": state, "cancelled": state != "done" && state != "failed"}),
+                            None => {
+                                return Some(
+                                    json!({"jsonrpc": "2.0", "id": id_of(msg), "result": tool_error(&ToolError::new(code::NOT_FOUND, format!("no job `{id}`"), "list_jobs shows the jobs of this server"))}),
+                                );
+                            }
+                        }
+                    } else {
+                        match shared.cancel_current() {
+                            Some((tool, ms)) => {
+                                answer = json!({"cancelled": true, "running": tool, "elapsed_ms": ms, "note": "it stops at its next safe point; its answer says `cancelled`"})
+                            }
+                            None => answer = json!({"cancelled": false, "reason": "nothing is running"}),
+                        }
+                    }
+                    if args.get("queued").and_then(Value::as_bool) == Some(true) {
+                        let dropped: Vec<Pending> = lock(&queue.items).drain(..).collect();
+                        let n = dropped.len();
+                        for p in dropped {
+                            if let Some(pid) = p.id.clone() {
+                                let e = ToolError::new(
+                                    code::CANCELLED,
+                                    "dropped from the queue by cancel {queued: true}",
+                                    "send the call again if it is still wanted",
+                                );
+                                let reply = if p.tool.is_some() {
+                                    json!({"jsonrpc": "2.0", "id": pid, "result": tool_error(&e)})
+                                } else {
+                                    json!({"jsonrpc": "2.0", "id": pid, "error": {"code": -32800, "message": e.reason, "data": e.to_value()}})
+                                };
+                                write_line(out, &reply);
+                            }
+                        }
+                        answer["dropped_from_queue"] = json!(n);
+                    }
+                    tool_result(answer)
+                }
                 "list_jobs" => {
                     adopt_if_free(shared, server);
                     tool_result(Value::Array(shared.jobs_value()))
@@ -158,6 +200,10 @@ fn adopt_if_free(shared: &Shared, server: &Arc<Mutex<Server>>) {
     {
         s.adopt_pending();
     }
+}
+
+fn id_of(msg: &Value) -> Value {
+    msg.get("id").cloned().unwrap_or(Value::Null)
 }
 
 fn busy_reply(p: &Pending, shared: &Shared) -> Option<Value> {
@@ -298,7 +344,7 @@ pub fn serve(server: Server, input: impl BufRead + Send + 'static, output: impl 
                 continue;
             }
         };
-        if let Some(r) = fast_answer(&msg, &shared, &server) {
+        if let Some(r) = fast_answer(&msg, &shared, &server, &queue, &out) {
             write_line(&out, &r);
             continue;
         }

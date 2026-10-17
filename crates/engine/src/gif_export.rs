@@ -219,7 +219,9 @@ pub fn encode(doc: &Presentation, opts: &GifOptions) -> Result<GifOutput> {
         if opts.loop_forever {
             enc.set_repeat(Repeat::Infinite).map_err(enc_err)?;
         }
-        for i in &frames {
+        crate::task::stage("rendering GIF frames");
+        for (k, i) in frames.iter().enumerate() {
+            crate::task::step(k, frames.len())?;
             let img = deckcraft_render::render_slide(doc, *i, &deckcraft_render::RenderOpts { scale, size: Some((w, h)), ..Default::default() });
             let buffer = image::RgbaImage::from_raw(w, h, on_white(&img, w, h))
                 .ok_or_else(|| EngineError::Other(format!("GIF export: slide {i} has no pixels")))?;

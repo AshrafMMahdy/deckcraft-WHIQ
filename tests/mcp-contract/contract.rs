@@ -419,3 +419,55 @@ fn arabic_paragraphs_are_right_to_left_by_default() {
         }
     }
 }
+
+// Round 2 ─ a running call can be cancelled: it stops at its next safe point and the document is
+// as it was before it; cancel answers at once; queued calls can be dropped; jobs can be cancelled.
+#[test]
+fn a_running_call_stops_at_a_safe_point_when_cancelled() {
+    let dir = scratch("cancel");
+    let mut m = start(&dir, &["--busy-after-ms", "30000"], HOOKS);
+    m.ok("new_presentation", json!({}));
+    let slow = m.send_call("inspect_document", json!({"_delay_ms": 20000}));
+    let queued1 = m.send_call("add_slide", json!({"title": "never"}));
+    let queued2 = m.send_call("inspect_slide", json!({}));
+    std::thread::sleep(Duration::from_millis(200));
+    let t = Instant::now();
+    let c = m.send_call("cancel", json!({"queued": true}));
+    let c = m.recv(c, Duration::from_secs(2));
+    assert!(t.elapsed() < Duration::from_secs(1), "cancel answers at once");
+    let sc = &c["result"]["structuredContent"];
+    assert_eq!(sc["cancelled"], true, "{c}");
+    assert_eq!(sc["running"], "inspect_document");
+    assert_eq!(sc["dropped_from_queue"], 2);
+    for q in [queued1, queued2] {
+        let r = m.recv(q, Duration::from_secs(2));
+        assert_eq!(r["result"]["structuredContent"]["error"]["code"], "cancelled", "{r}");
+    }
+    let r = m.recv(slow, Duration::from_secs(3));
+    assert_eq!(r["result"]["structuredContent"]["error"]["code"], "cancelled", "{r}");
+    assert!(t.elapsed() < Duration::from_secs(3), "stopped long before its 20 s");
+    // Nothing else changed, and the server goes on.
+    assert_eq!(m.ok("inspect_document", json!({}))["slides"].as_array().unwrap().len(), 1);
+    assert_eq!(m.ok("cancel", json!({}))["cancelled"], false, "nothing is running");
+
+    // (Real commands stopping between slides, pages and frames: crates/engine/src/tests_task.rs.)
+
+    // A job: the file it was reading is never added.
+    m.ok("save_presentation", json!({"path": "c.pptx"}));
+    m.ok("close_presentation", json!({}));
+    let r = m.ok("open_presentation", json!({"path": "c.pptx", "async": true, "_delay_ms": 1500}));
+    let id = r["job_id"].as_str().unwrap().to_string();
+    let c = m.ok("cancel", json!({"job_id": id}));
+    assert_eq!(c["cancelled"], true, "{c}");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let j = m.ok("job_status", json!({"job_id": id}));
+        if j["state"] != "running" {
+            assert_eq!(j["state"], "cancelled", "{j}");
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(m.err("inspect_document", json!({}))["code"], "no_document");
+}

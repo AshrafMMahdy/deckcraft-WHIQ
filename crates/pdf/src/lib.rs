@@ -39,6 +39,9 @@ use serde::{Deserialize, Serialize};
 pub enum PdfError {
     #[error("nothing to export (no slides in range)")]
     NoPages,
+    /// WHIQ: the page hook asked to stop.
+    #[error("the export was cancelled")]
+    Cancelled,
     #[error("PDF writer: {0}")]
     Write(String),
 }
@@ -81,6 +84,9 @@ pub struct PdfOptions {
     pub title: Option<String>,
     /// Handout/notes page size in points (default US Letter portrait; see [`paper_size`]).
     pub paper: (f64, f64),
+    /// WHIQ: told (pages done, pages) before each page; answering `false` stops the export.
+    #[serde(skip)]
+    pub on_page: Option<PageHook>,
     /// WHIQ: draw slide artwork as one picture at `dpi` (with the invisible text layer) instead of
     /// vector artwork with real text (the default).
     pub raster: bool,
@@ -98,7 +104,27 @@ impl Default for PdfOptions {
             title: None,
             paper: (612.0, 792.0),
             raster: false,
+            on_page: None,
         }
+    }
+}
+
+/// WHIQ: a callback before each page (progress, cancellation).
+#[derive(Clone)]
+pub struct PageHook(std::sync::Arc<dyn Fn(usize, usize) -> bool + Send + Sync>);
+
+impl PageHook {
+    pub fn new(f: impl Fn(usize, usize) -> bool + Send + Sync + 'static) -> Self {
+        PageHook(std::sync::Arc::new(f))
+    }
+    fn call(&self, done: usize, total: usize) -> bool {
+        (self.0)(done, total)
+    }
+}
+
+impl std::fmt::Debug for PageHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PageHook")
     }
 }
 
@@ -183,7 +209,13 @@ fn export_inner(pres: &Presentation, opts: &PdfOptions) -> Result<Vec<u8>> {
     }
     pdf.set_outline(outline);
 
-    for v in &pages {
+    let n_pages = pages.len();
+    for (pi, v) in pages.iter().enumerate() {
+        if let Some(h) = &opts.on_page
+            && !h.call(pi, n_pages)
+        {
+            return Err(PdfError::Cancelled);
+        }
         let (pw, ph) = match opts.layout {
             PageLayout::Slides => (sw, sh),
             _ => opts.paper,

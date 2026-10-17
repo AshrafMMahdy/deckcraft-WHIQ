@@ -496,6 +496,12 @@ pub fn import_theme(bytes: &[u8]) -> Result<(deckcraft_model::theme::Theme, Vec<
 }
 
 pub fn import(bytes: &[u8]) -> Result<Presentation, PptxError> {
+    import_with(bytes, &mut |_, _| true)
+}
+
+/// WHIQ: [`import`], telling `on_slide(done, total)` before each slide is read; reading stops
+/// (an error) when it answers `false` (the host cancelled).
+pub fn import_with(bytes: &[u8], on_slide: &mut dyn FnMut(usize, usize) -> bool) -> Result<Presentation, PptxError> {
     let pkg = Package::open(bytes)?;
     let root_rels = pkg.rels("");
     let pres_path = root_rels.first_of("officeDocument").map(|r| r.target.clone()).unwrap_or_else(|| "ppt/presentation.xml".into());
@@ -617,7 +623,11 @@ pub fn import(bytes: &[u8]) -> Result<Presentation, PptxError> {
 
     // Slides.
     let mut file_slide_ids: HashMap<u32, SlideId> = HashMap::new();
-    for (file_id, path, id) in &slide_ids {
+    let n_slides = slide_ids.len();
+    for (k, (file_id, path, id)) in slide_ids.iter().enumerate() {
+        if !on_slide(k, n_slides) {
+            return Err(PptxError::Unsupported("reading was cancelled".into()));
+        }
         let Some(doc) = docs.get(&opc::norm(path)) else { continue };
         let part = Part::new(&pkg, path, doc);
         let layout = part.rels.first_of("slideLayout").and_then(|r| layout_by_part.get(&opc::norm(&r.target)).copied()).unwrap_or(fallback_layout);

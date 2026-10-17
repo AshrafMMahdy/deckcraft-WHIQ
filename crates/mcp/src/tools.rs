@@ -84,7 +84,7 @@ fn hints(name: &str, read_only: bool) -> (bool, bool) {
         "save_presentation" | "export" | "build_deck" => (true, false),
         "set_text" | "adopt_template" => (true, true),
         "close_presentation" => (true, false),
-        "go_to_slide" | "select" | "select_tool" => (false, true),
+        "go_to_slide" | "select" | "select_tool" | "cancel" => (false, true),
         _ => (false, false),
     }
 }
@@ -386,6 +386,16 @@ pub fn tool_definitions() -> Vec<Value> {
             obj(json!({"job_id": string("The job_id a call returned")}), &["job_id"]),
             true,
         ),
+        tool(
+            "cancel",
+            "Cancel",
+            "Stop the call that is running now (or the job `job_id`) at its next safe point: between slides of a build, pages of an export, slides of a file being read, commands of a batch. The presentation is left as it was before the stopped command. queued: true also drops the calls waiting behind it (each is answered `cancelled`). Answers at once.",
+            obj(
+                json!({"job_id": string("A job to cancel instead of the running call"), "queued": boolean("Also drop the calls waiting in the queue")}),
+                &[],
+            ),
+            false,
+        ),
         tool("list_jobs", "List jobs", "Every job of this server: id, kind, state, progress, result.", obj(json!({}), &[]), true),
         tool(
             "evict",
@@ -446,6 +456,11 @@ pub fn call_tool(b: &mut dyn Backend, name: &str, a: &Value) -> ToolResult {
             let mut out = vec![];
             for c in a.get("commands").and_then(Value::as_array).cloned().unwrap_or_default() {
                 let id = c.get("command").and_then(Value::as_str).unwrap_or("");
+                // WHIQ: a safe point between commands.
+                if let Err(e) = deckcraft_engine::task::check() {
+                    out.push(json!({"command": id, "ok": false, "error": e.to_string()}));
+                    return ToolResult { content: vec![json!({"type": "text", "text": Value::Array(out).to_string()})], is_error: true };
+                }
                 match exec(b, id, c.get("params").cloned().unwrap_or(json!({}))) {
                     Ok(v) => out.push(json!({"command": id, "ok": true, "result": v})),
                     Err(e) => {

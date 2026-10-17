@@ -1679,7 +1679,10 @@ fn build(s: &mut Session, p: &Value) -> Result<Value> {
         Builder::notes(&mut s, str_param(&p, "notes"));
         slides.push(s);
     }
+    crate::task::stage("building slides");
     for (i, spec) in specs.iter().enumerate() {
+        // A safe point: nothing is added to the session until the whole deck is built.
+        crate::task::step(i, specs.len())?;
         if !spec.is_object() {
             b.warnings.push(format!("slide {i}: not an object, skipped"));
             continue;

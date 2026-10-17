@@ -8,6 +8,7 @@ use serde_json::{Map, Value, json};
 /// Error codes an agent can branch on.
 pub mod code {
     pub const BUSY: &str = "busy";
+    pub const CANCELLED: &str = "cancelled";
     pub const EVICTED: &str = "evicted";
     pub const TOO_LARGE: &str = "too_large";
     pub const NOT_FOUND: &str = "not_found";
@@ -88,6 +89,9 @@ pub fn classify(msg: &str, cx: &ErrorContext<'_>) -> ToolError {
         let root = cx.write_root.clone().unwrap_or_else(|| "(none: writing files is not granted)".into());
         return ToolError::new(code::FORBIDDEN, msg, format!("save inside the write root {root}; a bare file name such as `deck.pptx` lands there"))
             .with("write_root", json!(cx.write_root));
+    }
+    if l.contains("cancelled") {
+        return ToolError::new(code::CANCELLED, msg, "the call stopped at a safe point and changed nothing past it; call it again to do the work");
     }
     if l.contains("no presentation open") || l.contains("no document") || l.contains("no active") || l.contains("nothing is open") {
         return ToolError::new(code::NO_DOCUMENT, msg, "call new_presentation, open_presentation or build_deck first");

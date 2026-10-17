@@ -138,7 +138,9 @@ pub fn open_checked(name: &str, bytes: &[u8]) -> Result<(Presentation, Vec<Strin
 
 fn open_other(name: &str, bytes: &[u8]) -> Result<Presentation> {
     if deckcraft_pptx::sniff(bytes) {
-        let mut p = deckcraft_pptx::import(bytes).map_err(|e| EngineError::Other(e.to_string()))?;
+        crate::task::stage("reading slides");
+        let mut p = deckcraft_pptx::import_with(bytes, &mut |done, total| crate::task::step(done, total).is_ok())
+            .map_err(|e| if crate::task::check().is_err() { crate::task::cancelled() } else { EngineError::Other(e.to_string()) })?;
         deckcraft_format::repair(&mut p);
         return Ok(p);
     }
@@ -335,7 +337,19 @@ pub fn parse_slide_range(text: &str, count: usize) -> Result<Vec<usize>> {
 
 /// PDF bytes for `doc` with [`pdf_options`] from `p`.
 pub fn pdf_bytes(doc: &Presentation, p: &Value) -> Result<Vec<u8>> {
-    deckcraft_pdf::export(doc, &pdf_options(p, doc.slides.len())?).map_err(|e| EngineError::Other(e.to_string()))
+    let mut o = pdf_options(p, doc.slides.len())?;
+    // WHIQ: progress per page, and a safe point between pages.
+    if let Some(task) = crate::task::current() {
+        crate::task::stage("writing PDF pages");
+        o.on_page = Some(deckcraft_pdf::PageHook::new(move |done, total| {
+            task.set(done as u64, total as u64);
+            !task.is_cancelled()
+        }));
+    }
+    deckcraft_pdf::export(doc, &o).map_err(|e| match e {
+        deckcraft_pdf::PdfError::Cancelled => crate::task::cancelled(),
+        e => EngineError::Other(e.to_string()),
+    })
 }
 
 /// The output extensions [`format_for_path`] maps to a writer of that format.
@@ -498,7 +512,11 @@ fn export(s: &mut Session, p: &Value) -> Result<Value> {
             }
             let scale = image_scale(&st.doc, scale);
             let mut written = vec![];
+            crate::task::stage("rendering slides");
             for (k, i) in slides.iter().enumerate() {
+                // A safe point: the files written so far are whole; say which.
+                crate::task::step(k, slides.len())
+                    .map_err(|e| if written.is_empty() { e } else { EngineError::Other(format!("{e} (slides 1–{k} were written)")) })?;
                 let img = deckcraft_render::render_slide(&st.doc, *i, &deckcraft_render::RenderOpts { scale, ..Default::default() });
                 let bytes = picture_bytes(&img, &format, scale);
                 let out = if slides.len() == 1 {

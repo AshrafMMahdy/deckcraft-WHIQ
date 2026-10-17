@@ -25,6 +25,7 @@ pub mod recovery;
 pub mod sample;
 pub mod sounds;
 pub mod spell;
+pub mod task;
 pub mod templates;
 pub mod thesaurus;
 pub mod tools;
@@ -781,3 +782,5 @@ mod soak_tests;
 mod tests;
 #[cfg(test)]
 mod tests_keys;
+#[cfg(test)]
+mod tests_task;

@@ -63,6 +63,11 @@ pub fn import(bytes: &[u8]) -> Result<Presentation, PptxError> {
     read::import(bytes)
 }
 
+/// WHIQ: [`import`] with a callback before each slide (`false` stops: cancelled).
+pub fn import_with(bytes: &[u8], on_slide: &mut dyn FnMut(usize, usize) -> bool) -> Result<Presentation, PptxError> {
+    read::import_with(bytes, on_slide)
+}
+
 /// Read the theme of a `.thmx` file, or of a `.pptx` / `.potx`'s first master, with its media.
 pub fn import_theme(bytes: &[u8]) -> Result<(deckcraft_model::theme::Theme, Vec<deckcraft_model::MediaItem>), PptxError> {
     read::import_theme(bytes)
