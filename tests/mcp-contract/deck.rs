@@ -167,3 +167,125 @@ fn a_long_table_pages_over_slides_with_its_header() {
     let r = m.ok("build_deck", json!({"slides": [{"layout": "table", "title": "T", "table": rows, "rowsPerSlide": 20}]}));
     assert_eq!(r["slides"], 3);
 }
+
+/// Mean colour of the pixels within `r` of (x, y).
+fn around(img: &image::RgbaImage, x: f64, y: f64, r: i64) -> Vec<[u8; 3]> {
+    let mut v = vec![];
+    for dy in -r..=r {
+        for dx in -r..=r {
+            let (px, py) = (x as i64 + dx, y as i64 + dy);
+            if px >= 0 && py >= 0 && (px as u32) < img.width() && (py as u32) < img.height() {
+                let p = img.get_pixel(px as u32, py as u32);
+                v.push([p[0], p[1], p[2]]);
+            }
+        }
+    }
+    v
+}
+
+fn overlay_deck() -> Value {
+    json!({"titleSlide": false, "slides": [{
+        "layout": "image", "title": "Overlay regression", "image": {"path": "plain.png"}, "notes": "overlays",
+        "overlays": [
+            {"kind": "rect", "x": 10, "y": 10, "w": 25, "h": 20, "color": "#2B6CB0", "label": "Storage"},
+            {"kind": "ellipse", "x": 55, "y": 15, "w": 30, "h": 40, "color": "#C53030", "dashed": true, "label": "Crane radius"},
+            {"kind": "line", "x": 5, "y": 90, "w": 95, "h": 60, "color": "#2F855A", "arrow": "both"},
+            {"kind": "path", "points": "5,50 20,45 35,55 50,48", "color": "#DD6B20", "arrow": "end", "label": "Haul road"},
+            {"kind": "path", "points": [[60, 70], [80, 65], [90, 85], [65, 90]], "color": "#6B46C1", "filled": true, "label": "Compound"},
+            {"kind": "text", "x": 40, "y": 92, "w": 30, "h": 6, "color": "#1A202C", "label": "Gate 1"}
+        ]
+    }], "path": "overlays.pptx"})
+}
+
+/// The overlay regression deck: every mark kind, solid and dashed, arrowed, open and filled,
+/// labelled, rendered to PNG and probed where each mark must be (box: 43.2, 122.4, 873.6 × 288).
+#[test]
+fn overlay_regression_deck_renders_every_mark() {
+    let dir = scratch("overlays");
+    let mut m = start(&dir);
+    picture(&mut m, &dir, "plain.png");
+    let r = m.ok("build_deck", overlay_deck());
+    assert!(r["warnings"].as_array().unwrap().is_empty(), "{r}");
+    let png = dir.join("overlay-regression.png");
+    m.ok("render_slide", json!({"slide": 0, "scale": 1, "path": png.to_str().unwrap()}));
+    let bytes = std::fs::read(&png).unwrap();
+    // Kept for people to look at.
+    let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("overlay-regression.png");
+    let _ = std::fs::write(&out, &bytes);
+    let _ = std::fs::copy(dir.join("overlays.pptx"), PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("overlay-regression.pptx"));
+    let img = image::load_from_memory(&bytes).unwrap().to_rgba8();
+    assert_eq!((img.width(), img.height()), (960, 540));
+    let (bx, by, bw, bh) = (43.2, 122.4, 873.6, 288.0);
+    let at = |px: f64, py: f64| (bx + px / 100.0 * bw, by + py / 100.0 * bh);
+    let any = |pts: &[[u8; 3]], f: &dyn Fn([u8; 3]) -> bool| pts.iter().any(|p| f(*p));
+    let all = |pts: &[[u8; 3]], f: &dyn Fn([u8; 3]) -> bool| pts.iter().all(|p| f(*p));
+    let (r_, g_, b_) = (|p: [u8; 3]| i32::from(p[0]), |p: [u8; 3]| i32::from(p[1]), |p: [u8; 3]| i32::from(p[2]));
+    // Filled rectangle: tinted blue inside (away from its label).
+    let (x, y) = at(13.0, 12.0);
+    assert!(all(&around(&img, x, y, 2), &|p| b_(p) > r_(p) + 25), "rect fill at {x},{y}");
+    // Dashed ellipse: an outline, not filled; its left edge is red somewhere along a dash.
+    let (x, y) = at(70.0, 20.0);
+    assert!(all(&around(&img, x, y, 2), &|p| r_(p) > 200 && g_(p) > 200 && b_(p) > 200), "dashed ellipse is not filled");
+    let (x, y) = at(55.0, 35.0);
+    assert!(any(&around(&img, x, y, 6), &|p| r_(p) > g_(p) + 60 && r_(p) > b_(p) + 60), "ellipse outline at {x},{y}");
+    // Straight line with arrows: green at its middle.
+    let (x, y) = at(50.0, 75.0);
+    assert!(any(&around(&img, x, y, 3), &|p| g_(p) > r_(p) + 40 && g_(p) > b_(p) + 10), "line at {x},{y}");
+    // Open freeform route: orange along its first leg.
+    let (x, y) = at(12.5, 47.5);
+    assert!(any(&around(&img, x, y, 3), &|p| r_(p) > b_(p) + 80), "route at {x},{y}");
+    // Filled freeform compound: tinted purple inside.
+    let (x, y) = at(75.0, 75.0);
+    assert!(all(&around(&img, x, y, 2), &|p| b_(p) > g_(p) + 20 && r_(p) > g_(p)), "compound fill at {x},{y}");
+    // Text label: dark letters in its box.
+    let (x, y) = at(45.0, 94.5);
+    assert!(any(&around(&img, x, y, 8), &|p| r_(p) + g_(p) + b_(p) < 250), "label at {x},{y}");
+
+    // The shapes are native and editable: geometry and line ends in the file.
+    let xml = zip_text(&dir.join("overlays.pptx"), "ppt/slides/slide1.xml");
+    for needle in [
+        "<a:prstDash val=\"dash\"/>",
+        "<a:tailEnd type=\"triangle\"",
+        "<a:headEnd type=\"triangle\"",
+        "<a:custGeom>",
+        "<a:close/>",
+        "prst=\"ellipse\"",
+        "prst=\"line\"",
+        "<a:alpha val=\"35000\"/>",
+    ] {
+        assert!(xml.contains(needle), "{needle}");
+    }
+    let sh = shapes(&mut m, 0);
+    assert_eq!(sh.iter().filter(|s| s["name"].as_str().unwrap().starts_with("Overlay")).count(), 6 + 4, "6 marks, 4 labels");
+}
+
+/// The same vocabulary on a picture already on a slide (in place), from the platform's table rows.
+#[test]
+fn overlays_go_on_an_existing_picture_from_the_platform_table() {
+    let dir = scratch("overlay-existing");
+    let mut m = start(&dir);
+    let pic = picture(&mut m, &dir, "p.png");
+    m.ok("new_presentation", json!({}));
+    let id = m.ok("insert_picture", json!({"path": pic.to_str().unwrap(), "x": 100, "y": 100, "w": 400, "h": 225}))["id"].as_u64().unwrap();
+    let r = m.ok(
+        "add_overlays",
+        json!({"id": id, "rows": [
+            ["shape", "x", "y", "w", "h", "colour", "label", "points", "style"],
+            ["rect", "10", "10", "20", "20", "2b6cb0", "TP-001", "", "dashed"],
+            ["line", "0", "0", "100", "100", "C05621", "", "", "arrows"],
+            ["path", "", "", "", "", "6B46C1", "Route", "5,50 12,48 20,55", "arrow"],
+            ["text", "50", "50", "", "", "000000", "Note", "", ""]
+        ]}),
+    );
+    assert_eq!(r["ids"].as_array().unwrap().len(), 6, "{r}");
+    let sh = shapes(&mut m, 0);
+    let rect = sh.iter().find(|s| s["name"] == "Overlay: TP-001").unwrap();
+    assert_eq!(rect["box"], json!([140.0, 122.5, 80.0, 45.0]), "percent of the picture box");
+    let line = sh.iter().find(|s| s["name"] == "Overlay Line").unwrap();
+    assert_eq!(line["box"], json!([100.0, 100.0, 400.0, 225.0]));
+    // Undo removes them in one step.
+    m.ok("run_command", json!({"command": "edit.undo"}));
+    assert!(!shapes(&mut m, 0).iter().any(|s| s["name"].as_str().unwrap().starts_with("Overlay")));
+    let e = m.err("add_overlays", json!({"id": id, "overlays": []}));
+    assert_eq!(e["code"], "invalid_argument", "{e}");
+}

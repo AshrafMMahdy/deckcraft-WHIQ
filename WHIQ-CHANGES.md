@@ -73,3 +73,19 @@ Files: `crates/engine/src/cmd/build.rs` (new), `crates/engine/src/cmd/mod.rs` (r
 `crates/mcp/src/tools.rs`. Tests: `tests/mcp-contract/deck.rs`
 (`the_nine_layouts_each_with_speaker_notes`, `a_long_table_pages_over_slides_with_its_header`),
 unit tests in `build.rs`. `deck.build` is skipped by the one-document soak test, like `file.new`.
+
+## 3. The overlay vocabulary on pictures (`overlays` in build_deck, tool `add_overlays` / command `picture.overlay`)
+
+The platform's markup on a picture as native, editable shapes, positioned in percent of the
+picture box (`relativeTo: image` measures against the visible picture of a letterboxed one):
+`rect`, `ellipse` (filled at 35 % opacity, or an outline when `dashed`), `line` (w/h are the end
+point; right-to-left and upward legs are a positive box flipped, never a negative extent),
+`path` (freeform through `points` `"5,50 12,48"` or `[[x,y],…]`, open as a route or closed and
+filled with `filled`), `text` labels; `dashed`, `arrow: end|both` on lines and paths; labels centred
+in boxes and above paths, as on the platform. Objects or the platform's overlay table rows
+(`[shape, x, y, w, h, colour, label, points?, style?]`, with its `shape` header placing the
+columns) are both accepted. `add_overlays` works on a picture already on a slide (in place, one undo
+step). Tests: `overlay_regression_deck_renders_every_mark` (renders the regression deck to PNG —
+kept as `target/tmp/overlay-regression.png` and `.pptx` — and probes each mark's pixels and the
+DrawingML: `prstDash`, `headEnd`/`tailEnd`, `custGeom`, `close`, alpha),
+`overlays_go_on_an_existing_picture_from_the_platform_table`.
