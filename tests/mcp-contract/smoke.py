@@ -137,8 +137,10 @@ def main():
         assert not without_notes, without_notes
         step(f"build_deck: {r['slides']} slides, nine layouts, notes on every content slide")
 
-        z = zipfile.ZipFile(os.path.join(folder, "review.pptx"))
-        xml = "".join(z.read(n).decode("utf-8", "replace") for n in z.namelist() if n.startswith("ppt/slides/slide"))
+        # Every zip is closed after reading: Windows refuses to rename a file another process holds open (the in-place save below
+        # keeps the previous file as OLD_review.pptx).
+        with zipfile.ZipFile(os.path.join(folder, "review.pptx")) as z:
+            xml = "".join(z.read(n).decode("utf-8", "replace") for n in z.namelist() if n.startswith("ppt/slides/slide"))
         for needle in ['prstDash val="dash"', 'tailEnd type="triangle"', 'headEnd type="triangle"', "<a:custGeom>", "<c:chart", "<a:tbl>"]:
             assert needle in xml, needle
         step("overlays: dashed, arrowed, freeform and filled shapes in the pptx")
@@ -149,7 +151,8 @@ def main():
         step(f"overlay regression slide rendered to {out}")
 
         m.ok("save_presentation", {"path": "template.potx"})
-        ct = zipfile.ZipFile(os.path.join(folder, "template.potx")).read("[Content_Types].xml").decode()
+        with zipfile.ZipFile(os.path.join(folder, "template.potx")) as zt:
+            ct = zt.read("[Content_Types].xml").decode()
         assert "presentationml.template.main+xml" in ct, ct
         r = m.ok("build_deck", {"template": "template.potx", "title": "From the template", "slides": [{"layout": "bullets", "title": "Hello", "bullets": ["one"], "notes": "n"}], "path": "from-template.pptx"})
         assert r["template"] is True, r
@@ -173,8 +176,8 @@ def main():
         m.ok("set_text", {"id": title["id"], "text": "Summary (edited)"})
         r = m.ok("save_presentation", {})
         assert r.get("previous_files_renamed"), r
-        before = set(zipfile.ZipFile(os.path.join(folder, "OLD_review.pptx")).namelist())
-        after = set(zipfile.ZipFile(os.path.join(folder, "review.pptx")).namelist())
+        with zipfile.ZipFile(os.path.join(folder, "OLD_review.pptx")) as zb, zipfile.ZipFile(os.path.join(folder, "review.pptx")) as za:
+            before, after = set(zb.namelist()), set(za.namelist())
         assert before <= after, sorted(before - after)
         step("in-place edit kept every part; the previous file became OLD_review.pptx")
 
