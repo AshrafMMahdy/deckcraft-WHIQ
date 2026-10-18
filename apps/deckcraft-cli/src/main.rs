@@ -611,10 +611,17 @@ fn mcp(args: &[String]) -> Result<(), String> {
             "--sample" => sample = true,
             "--author" => config.author = value("a name")?,
             "--busy-after-ms" => config.busy_after_ms = number(value("milliseconds")?)?.max(1),
+            // WHIQ parity pass: a call running past this becomes a job (0: never).
+            "--job-after-ms" => config.job_after_ms = number(value("milliseconds (0: never)")?)?,
             "--idle-evict-secs" => config.idle_evict_secs = Some(number(value("seconds")?)?.max(1)),
-            "--max-memory-mb" => config.max_memory_mb = Some(number(value("megabytes")?)?.max(16)),
+            "--max-memory-mb" => config.max_memory_mb = Some(number(value("megabytes")?)?.max(1)),
             "--max-result-bytes" => config.max_result_bytes = (number(value("bytes")?)?.clamp(4096, 64 * 1024 * 1024)) as usize,
-            "--open-job-mb" => config.open_job_bytes = number(value("megabytes")?)?.saturating_mul(1024 * 1024),
+            "--open-job-mb" => {
+                let v = value("megabytes")?;
+                let mb: f64 =
+                    v.trim().parse().ok().filter(|m: &f64| m.is_finite() && *m >= 0.0).ok_or_else(|| format!("{flag}: `{v}` is not a number"))?;
+                config.open_job_bytes = (mb * 1024.0 * 1024.0) as u64;
+            }
             "--checkpoint-edits" => config.checkpoint_edits = number(value("an edit count (0: never)")?)?,
             "--checkpoint-secs" => config.checkpoint_secs = number(value("seconds (0: never)")?)?,
             "--export-job-slides" => config.export_job_slides = number(value("a slide count")?)?.max(1) as usize,

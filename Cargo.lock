@@ -1056,10 +1056,13 @@ dependencies = [
  "chrono",
  "ctrlc",
  "deckcraft-engine",
+ "deckcraft-fonts",
  "deckcraft-render",
  "log",
  "memory-stats",
+ "quick-xml",
  "serde_json",
+ "zip",
 ]
 
 [[package]]

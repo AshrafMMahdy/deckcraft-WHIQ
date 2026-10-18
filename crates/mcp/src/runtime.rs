@@ -8,6 +8,12 @@
 //!   the open presentations when the server is idle too long or uses too much memory.
 //! - SIGTERM / SIGINT / SIGHUP (Ctrl+C, Ctrl+Break, console close on Windows) and the end of input
 //!   auto-save unsaved work to recovered files before the process ends.
+//! - A call still running after `--job-after-ms` (or sent with `async: true`, or whose client
+//!   gave up on it with `notifications/cancelled`) carries on as a job: its caller gets a
+//!   `job_id` and the answer waits in `job_status`.
+//!
+//! The shapes (`job_status`, `server_status`, `cancel`, recovered files, error codes) are the
+//! same in WordCraft, GridCraft and DeckCraft: CONTRACT-PARITY.md.
 
 use std::collections::VecDeque;
 use std::io::{BufRead, Write};
@@ -122,22 +128,50 @@ fn fast_answer(msg: &Value, shared: &Arc<Shared>, server: &Arc<Mutex<Server>>, q
                 "server_status" => tool_result(status_value(shared)),
                 "cancel" => {
                     let job = args.get("job_id").or_else(|| args.get("jobId")).map(|v| v.as_str().map(String::from).unwrap_or_else(|| v.to_string()));
-                    let mut answer = json!({});
+                    let mut answer;
                     if let Some(id) = job {
+                        let before = shared.job_value(&id).map(|v| v["status"].clone());
                         match shared.cancel_job(&id) {
-                            Some(state) => answer = json!({"job_id": id, "state": state, "cancelled": state != "done" && state != "failed"}),
+                            Some(state) => {
+                                let v = shared.job_value(&id).unwrap_or(Value::Null);
+                                let was_running = before.as_ref().is_some_and(|s| s == "running");
+                                let ended = state != "running";
+                                answer = json!({
+                                    "cancelled": was_running,
+                                    "status": if ended { state } else { "cancelling" },
+                                    "job_id": v["job_id"],
+                                    "tool": v["tool"],
+                                    "next_step": if ended { format!("the job had ended; job_status {{job_id: \"{id}\"}} has its result") } else { format!("it stops at its next safe point; job_status {{job_id: \"{id}\"}} then says cancelled") },
+                                });
+                                if !ended {
+                                    answer["retry_after_ms"] = json!(500);
+                                }
+                                // A call that became a job: stop the call itself.
+                                if !ended
+                                    && lock(&shared.current_request)
+                                        .as_ref()
+                                        .and_then(|(_, j)| j.as_deref())
+                                        .is_some_and(|j| j.eq_ignore_ascii_case(v["job_id"].as_str().unwrap_or("")))
+                                {
+                                    shared.cancel_current();
+                                }
+                            }
                             None => {
-                                return Some(
-                                    json!({"jsonrpc": "2.0", "id": id_of(msg), "result": tool_error(&ToolError::new(code::NOT_FOUND, format!("no job `{id}`"), "list_jobs shows the jobs of this server"))}),
-                                );
+                                let ids = shared.job_ids();
+                                return Some(json!({"jsonrpc": "2.0", "id": id_of(msg), "result": tool_error(
+                                    &ToolError::new(code::NOT_FOUND, format!("no job `{id}`"), "list_jobs shows the jobs of this server")
+                                        .with("closest", json!(contract::closest(&id, ids.iter().map(String::as_str), 5))),
+                                )}));
                             }
                         }
                     } else {
+                        let job = lock(&shared.current_request).as_ref().and_then(|(_, j)| j.clone());
                         match shared.cancel_current() {
                             Some((tool, ms)) => {
-                                answer = json!({"cancelled": true, "running": tool, "elapsed_ms": ms, "note": "it stops at its next safe point; its answer says `cancelled`"})
+                                answer = json!({"cancelled": true, "status": "cancelling", "tool": tool, "job_id": job, "elapsed_ms": ms, "retry_after_ms": 500,
+                                    "next_step": "it stops at its next safe point; its answer (or job_status) then says `cancelled`"})
                             }
-                            None => answer = json!({"cancelled": false, "reason": "nothing is running"}),
+                            None => answer = json!({"cancelled": false, "status": "not_running", "next_step": "no call is running: nothing to stop"}),
                         }
                     }
                     if args.get("queued").and_then(Value::as_bool) == Some(true) {
@@ -164,7 +198,7 @@ fn fast_answer(msg: &Value, shared: &Arc<Shared>, server: &Arc<Mutex<Server>>, q
                 }
                 "list_jobs" => {
                     adopt_if_free(shared, server);
-                    tool_result(Value::Array(shared.jobs_value()))
+                    tool_result(json!({"jobs": shared.jobs_value()}))
                 }
                 "job_status" => {
                     adopt_if_free(shared, server);
@@ -172,17 +206,25 @@ fn fast_answer(msg: &Value, shared: &Arc<Shared>, server: &Arc<Mutex<Server>>, q
                         .get("job_id")
                         .or_else(|| args.get("jobId"))
                         .or_else(|| args.get("id"))
-                        .map(|v| v.as_str().map(String::from).unwrap_or_else(|| v.to_string()))
-                        .unwrap_or_default();
-                    match shared.job_value(&jid) {
-                        Some(v) => tool_result(v),
-                        None => {
-                            let ids = shared.job_ids();
-                            tool_error(
-                                &ToolError::new(code::NOT_FOUND, format!("no job `{jid}`"), "list_jobs shows the jobs of this server")
-                                    .with("candidates", json!(contract::closest(&jid, ids.iter().map(String::as_str), 5))),
-                            )
-                        }
+                        .map(|v| v.as_str().map(String::from).unwrap_or_else(|| v.to_string()));
+                    match jid {
+                        None => tool_result(json!({"jobs": shared.jobs_value()})),
+                        Some(jid) => match shared.job_value(&jid) {
+                            Some(v) => {
+                                let mut r = tool_result(v);
+                                if let Some(c) = r["content"].as_array_mut() {
+                                    c.extend(shared.job_pictures(&jid));
+                                }
+                                r
+                            }
+                            None => {
+                                let ids = shared.job_ids();
+                                tool_error(
+                                    &ToolError::new(code::NOT_FOUND, format!("no job `{jid}`"), "list_jobs shows the jobs of this server")
+                                        .with("closest", json!(contract::closest(&jid, ids.iter().map(String::as_str), 5))),
+                                )
+                            }
+                        },
                     }
                 }
                 _ => return None,
@@ -209,19 +251,46 @@ fn id_of(msg: &Value) -> Value {
 fn busy_reply(p: &Pending, shared: &Shared) -> Option<Value> {
     let id = p.id.clone()?;
     let (running, elapsed) = shared.current().unwrap_or_else(|| ("a previous call".into(), 0));
-    let retry = (elapsed / 2).clamp(250, 5_000);
+    let retry = (elapsed / 4).clamp(250, 5_000);
     shared.busy_replies.fetch_add(1, Ordering::Relaxed);
-    let e = ToolError::new(
+    let mut e = ToolError::new(
         code::BUSY,
         format!("the server is still working on `{running}` ({elapsed} ms so far); this call was not run"),
         format!("retry this call in {retry} ms; server_status answers at once and shows progress"),
     )
     .with("retry_after_ms", json!(retry))
     .with("running", json!(running));
+    if let Some(j) = lock(&shared.current_request).as_ref().and_then(|(_, j)| j.clone()) {
+        e = e.with("job_id", json!(j));
+    }
     if p.tool.is_some() {
         Some(json!({"jsonrpc": "2.0", "id": id, "result": tool_error(&e)}))
     } else {
         Some(json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32000, "message": e.reason, "data": e.to_value()}}))
+    }
+}
+
+/// The running call becomes a job (once): its caller is told the `job_id` at once (unless the
+/// client gave up on it: `quiet`), and the worker hands the answer to the job.
+fn hand_off(shared: &Arc<Shared>, out: &Out, quiet: Option<()>) {
+    let mut cur = lock(&shared.current_request);
+    let Some((id, job)) = cur.as_mut() else { return };
+    if job.is_some() {
+        return;
+    }
+    let tool = shared.current().map(|(t, _)| t).unwrap_or_default();
+    let task = shared.current_task().unwrap_or_default();
+    let jid = shared.new_job_for(&tool, "call", "", task);
+    *job = Some(jid.clone());
+    if quiet.is_none() {
+        let v = json!({
+            "job_id": jid,
+            "status": "running",
+            "tool": tool,
+            "retry_after_ms": 1000,
+            "next_step": format!("poll job_status {{job_id: \"{jid}\"}} until status is not \"running\"; the result is kept for you"),
+        });
+        write_line(out, &json!({"jsonrpc": "2.0", "id": id.clone(), "result": tool_result(v)}));
     }
 }
 
@@ -257,14 +326,29 @@ pub fn serve(server: Server, input: impl BufRead + Send + 'static, output: impl 
                     }
                 };
                 let Some(p) = next else { break };
-                shared.set_current(Some(p.tool.as_deref().unwrap_or_else(|| p.msg.get("method").and_then(Value::as_str).unwrap_or("request"))));
+                let tool_name = p
+                    .tool
+                    .as_deref()
+                    .map(|t| contract::resolve_tool(t, &crate::server::tool_names()).map(str::to_string).unwrap_or_else(|_| t.to_string()));
+                shared.set_current(Some(tool_name.as_deref().unwrap_or_else(|| p.msg.get("method").and_then(Value::as_str).unwrap_or("request"))));
+                *lock(&shared.current_request) = p.id.clone().filter(|_| p.tool.is_some()).map(|id| (id, None));
+                // `async: true` on a tool with no job of its own: a job from the start.
+                let wants_job = p.msg.pointer("/params/arguments/async").is_some_and(|a| a == true || a == "true")
+                    && !matches!(tool_name.as_deref(), Some("open_presentation" | "export"));
+                if wants_job {
+                    hand_off(&shared, &out, None);
+                }
                 let reply = {
                     let mut s = lock(&server);
                     s.handle(p.msg)
                 };
                 shared.set_current(None);
-                if let Some(r) = reply {
-                    write_line(&out, &r);
+                // The answer goes to its caller, or to the job the call became.
+                let job = lock(&shared.current_request).take().and_then(|(_, j)| j);
+                match (job, reply) {
+                    (Some(j), Some(r)) => shared.job_answered(&j, r.get("result").unwrap_or(&Value::Null)),
+                    (None, Some(r)) => write_line(&out, &r),
+                    _ => {}
                 }
             }
         })?
@@ -276,9 +360,17 @@ pub fn serve(server: Server, input: impl BufRead + Send + 'static, output: impl 
         let (queue, server, out, shared, stop) = (Arc::clone(&queue), Arc::clone(&server), Arc::clone(&out), Arc::clone(&shared), Arc::clone(&stop));
         std::thread::Builder::new().name("deckcraft-mcp-watchdog".into()).spawn(move || {
             let busy_after = Duration::from_millis(shared.config.busy_after_ms.max(1));
+            let job_after = shared.config.job_after_ms;
             let mut last_memory_evict: Option<Instant> = None;
             while !stop.load(Ordering::SeqCst) {
                 std::thread::sleep(Duration::from_millis(50));
+                // A call past its time carries on as a job.
+                if job_after > 0
+                    && let Some((_, ms)) = shared.current()
+                    && ms >= job_after
+                {
+                    hand_off(&shared, &out, None);
+                }
                 // Calls that waited too long: answer busy now.
                 let timed_out: Vec<Pending> = {
                     let mut items = lock(&queue.items);
@@ -360,6 +452,15 @@ pub fn serve(server: Server, input: impl BufRead + Send + 'static, output: impl 
         };
         if let Some(r) = fast_answer(&msg, &shared, &server, &queue, &out) {
             write_line(&out, &r);
+            continue;
+        }
+        // The client gave up on the running request (clients also send this on their own
+        // timeouts): it carries on as a job, its answer kept for job_status (`cancel` stops work).
+        if msg.get("method").and_then(Value::as_str) == Some("notifications/cancelled")
+            && let Some(rid) = msg.pointer("/params/requestId")
+            && lock(&shared.current_request).as_ref().is_some_and(|(id, _)| id == rid)
+        {
+            hand_off(&shared, &out, Some(()));
             continue;
         }
         let id = msg.get("id").cloned().filter(|i| i.is_string() || i.is_number());

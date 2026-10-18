@@ -10,6 +10,28 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+/// The error codes every craft app answers with (CONTRACT-PARITY.md): no other code may appear.
+pub const CODES: &[&str] = &[
+    "busy",
+    "cancelled",
+    "disk_full",
+    "evicted",
+    "failed",
+    "internal",
+    "invalid_argument",
+    "invalid_request",
+    "locked",
+    "no_document",
+    "not_available",
+    "not_found",
+    "out_of_range",
+    "outside_root",
+    "password_required",
+    "too_large",
+    "unsupported",
+    "wrong_password",
+];
+
 pub fn bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_deckcraft-cli"))
 }
@@ -71,6 +93,11 @@ impl Mcp {
 
     pub fn notify(&mut self, method: &str) {
         let line = json!({"jsonrpc": "2.0", "method": method}).to_string();
+        self.write(&line);
+    }
+
+    pub fn notify_with(&mut self, method: &str, params: Value) {
+        let line = json!({"jsonrpc": "2.0", "method": method, "params": params}).to_string();
         self.write(&line);
     }
 
@@ -142,7 +169,7 @@ impl Mcp {
     }
 
     /// The contract's invariants on every answer: a tool result has structuredContent (an
-    /// object) and, when it is an error, a code, a reason and a next step.
+    /// object) and, when it is an error, a code (one of [`CODES`]), a reason and a next step.
     fn check(&self, v: &Value) {
         let Some(r) = v.get("result") else { return };
         if r.get("content").is_none() {
@@ -155,6 +182,8 @@ impl Mcp {
             for k in ["code", "reason", "next_step"] {
                 assert!(e[k].as_str().is_some_and(|s| !s.is_empty()), "error without `{k}`: {v}");
             }
+            let c = e["code"].as_str().unwrap_or("");
+            assert!(CODES.contains(&c), "`{c}` is not a shared error code: {v}");
         }
     }
 

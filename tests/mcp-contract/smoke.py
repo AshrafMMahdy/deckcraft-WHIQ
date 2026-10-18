@@ -182,10 +182,10 @@ def main():
         jid = r["job_id"]
         for _ in range(600):
             j = m.ok("job_status", {"job_id": jid})
-            if j["state"] != "running":
+            if j["status"] != "running":
                 break
             time.sleep(0.1)
-        assert j["state"] == "done", j
+        assert j["status"] == "done", j
         assert j["progress"] == 1.0 and j["stages"] == ["rendering slides"], j
         step(f"job {jid}: {len(j['result']['files'])} PNGs, progress by stage ({j['steps']['done']}/{j['steps']['total']} slides)")
 
@@ -195,7 +195,14 @@ def main():
         st = m.ok("server_status")
         assert st["memory"]["measured"] and st["memory"]["rss_bytes"] > 0, st["memory"]
         assert "every_edits" in st["checkpoints"], st
-        step(f"structured error `{err['code']}`; server_status: {st['memory']['rss_mb']} MB measured ({st['memory']['source'].split(':')[0]}), "
+        assert st["fonts"]["faces"] > 0 and st["fonts"]["arabic"], st["fonts"]
+        assert m.ok("list_jobs")["jobs"], "list_jobs lists the export job"
+        rc = m.ok("roundtrip_check", {"path": "review.pptx"})
+        assert "lossless" in rc and "missingParts" in rc, rc
+        c = m.ok("cancel")
+        assert c["cancelled"] is False and c["status"] == "not_running", c
+        step(f"list_jobs, roundtrip_check (lossless: {rc['lossless']}), cancel with nothing running")
+        step(f"structured error `{err['code']}`; server_status: {st['memory']['rss_bytes'] // (1024 * 1024)} MB measured ({st['memory']['source'].split(':')[0]}), "
              f"{len(st['documents'])} documents, checkpoints every {st['checkpoints']['every_edits']} edits / {st['checkpoints']['every_secs']} s")
     finally:
         stderr = m.close()

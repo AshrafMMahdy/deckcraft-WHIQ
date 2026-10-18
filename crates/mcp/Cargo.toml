@@ -17,3 +17,8 @@ log = { workspace = true }
 chrono = { workspace = true }
 memory-stats = "1"
 ctrlc = { version = "3.4", features = ["termination"] }
+# WHIQ parity pass: server_status reports the embedded craft-fonts faces; roundtrip_check reads
+# both packages (OPC part list, relationships, XML).
+deckcraft-fonts = { workspace = true }
+zip = { workspace = true }
+quick-xml = { workspace = true }

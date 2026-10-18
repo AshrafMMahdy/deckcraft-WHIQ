@@ -35,10 +35,11 @@ the selected text or shapes; shape.fill, shape.line and the other shape commands
 those shapes, else on the selected ones. Save with save_presentation (.deckcraft or .pptx).";
 
 const CONTRACT: &str = "Contract: no call is a dead stop. Every error has `code`, `reason` and `next_step` \
-(structuredContent.error). `busy` comes with `retry_after_ms`; long work (a very large open, exporting many slides) \
-returns a `job_id`: poll job_status. Unsaved work is auto-saved to `<name>.recovered-<stamp>.<ext>` in the write root \
-when the server must close it (idle, memory, SIGTERM, a crash) and the next answer names the file (`recovered_files`). \
-Big answers come back `truncated` with `continue_from`: call again with `offset`. Saving never silently replaces a \
+(structuredContent.error). `busy` comes with `retry_after_ms`; long work (a very large open, exporting many slides, \
+any call past --job-after-ms, or async: true) returns a `job_id`: poll job_status (status, progress, stage; the result \
+is kept; cancel stops it). Unsaved work is auto-saved to `<name>.recovered-<stamp>.<ext>` in the write root \
+when the server must close it (idle, memory, SIGTERM, a crash, evict) and the next answer names the file (`recovered_files`). \
+Big answers come back `truncated` with `continue_from`: pass it back. Saving never silently replaces a \
 file: the old one becomes OLD_<name> unless `overwrite: true`. Unknown arguments are ignored with a `warnings` entry. \
 Every tool takes `caller` (your name, put on comments and the saved file). build_deck makes a whole deck in one call.";
 
@@ -58,7 +59,17 @@ fn response(id: Value, result: Value) -> Value {
 }
 
 fn error(id: Value, code: i64, message: impl Into<String>) -> Value {
-    json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message.into()}})
+    let message = message.into();
+    // WHIQ: protocol errors carry the contract's code / reason / next step too (as in every craft app).
+    let (kind, next) = match code {
+        PARSE_ERROR | INVALID_REQUEST => (code::INVALID_REQUEST, "send one JSON-RPC 2.0 object per line"),
+        METHOD_NOT_FOUND => (code::NOT_FOUND, "use initialize, tools/list, tools/call, resources/list, resources/read or ping"),
+        RESOURCE_NOT_FOUND => (code::NOT_FOUND, "resources/list names the resources"),
+        INVALID_PARAMS => (code::INVALID_ARGUMENT, "check the request's params"),
+        _ => (code::INTERNAL, "send the request again"),
+    };
+    let data = ToolError::new(kind, message.clone(), next).to_value();
+    json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message, "data": data}})
 }
 
 /// A successful tool answer before it is shaped into a `CallToolResult`.
@@ -93,7 +104,7 @@ fn tool_def(name: &str) -> Option<Value> {
 fn needs_document(name: &str, args: &Value) -> bool {
     match name {
         "list_commands" | "new_presentation" | "open_presentation" | "build_deck" | "server_status" | "job_status" | "list_jobs" | "evict"
-        | "cancel" | "select_tool" | "screenshot" | "call_app" => false,
+        | "cancel" | "select_tool" | "screenshot" | "call_app" | "roundtrip_check" => false,
         "run_command" => !args.get("command").and_then(Value::as_str).is_some_and(command_needs_no_document),
         "batch" => !args
             .get("commands")
@@ -139,8 +150,21 @@ pub fn status_value(shared: &Shared) -> Value {
         .docs()
         .iter()
         .enumerate()
-        .map(|(i, d)| json!({"index": i, "title": d.title, "path": d.path, "slides": d.slides, "dirty": d.dirty, "active": d.active}))
+        .map(
+            |(i, d)| json!({"index": i, "name": d.title, "title": d.title, "path": d.path, "slides": d.slides, "dirty": d.dirty, "active": d.active}),
+        )
         .collect();
+    let current = shared.current().map(|(t, ms)| {
+        let job = crate::state::lock(&shared.current_request).as_ref().and_then(|(_, j)| j.clone());
+        let mut v = json!({"tool": t, "job_id": job, "elapsed_ms": ms});
+        let p = shared
+            .current_progress()
+            .unwrap_or_else(|| json!({"progress": 0.0, "stage": t, "steps": {"done": 0, "total": 0}, "stages": [t], "cancelling": false}));
+        if let (Some(o), Value::Object(p)) = (v.as_object_mut(), p) {
+            o.extend(p);
+        }
+        v
+    });
     json!({
         "server": "deckcraft",
         "version": env!("CARGO_PKG_VERSION"),
@@ -150,11 +174,12 @@ pub fn status_value(shared: &Shared) -> Value {
         "uptime_ms": shared.started.elapsed().as_millis() as u64,
         "author": c.author,
         "memory": crate::state::memory_value(c.max_memory_mb),
+        "fonts": fonts_value(),
         "checkpoints": crate::checkpoint::status(shared),
         "roots": {"read": c.read_root.as_ref().map(|p| p.display().to_string()), "write": c.write_root.as_ref().map(|p| p.display().to_string())},
         "documents": docs,
-        "jobs": {"running": shared.running_jobs(), "list": shared.jobs_value()},
-        "current_call": shared.current().map(|(t, ms)| json!({"tool": t, "elapsed_ms": ms, "progress": shared.current_progress()})),
+        "jobs": shared.jobs_value(),
+        "current_call": current,
         "idle_ms": shared.idle_for().as_millis() as u64,
         "calls": shared.calls.load(std::sync::atomic::Ordering::Relaxed),
         "busy_replies": shared.busy_replies.load(std::sync::atomic::Ordering::Relaxed),
@@ -163,12 +188,28 @@ pub fn status_value(shared: &Shared) -> Value {
         "limits": {
             "max_result_bytes": c.max_result_bytes,
             "max_image_bytes": c.max_image_bytes,
+            "max_memory_mb": c.max_memory_mb,
             "busy_after_ms": c.busy_after_ms,
+            "job_after_ms": c.job_after_ms,
             "open_job_bytes": c.open_job_bytes,
             "export_job_slides": c.export_job_slides,
             "idle_evict_secs": c.idle_evict_secs,
         },
     })
+}
+
+/// The fonts this build embeds (craft-fonts), in the shape every craft app reports.
+fn fonts_value() -> Value {
+    let all = deckcraft_fonts::CRAFT_FONTS;
+    let mut families: Vec<&str> = Vec::new();
+    for f in all {
+        if !families.contains(&f.family) {
+            families.push(f.family);
+        }
+    }
+    let arabic = all.iter().find(|f| f.scripts.contains(&"Arab")).map(|f| f.family);
+    let default = families.iter().find(|f| **f == "Inter").copied().or_else(|| all.iter().find(|f| f.scripts == ["Latn"]).map(|f| f.family));
+    json!({"source": "craft-fonts", "faces": all.len(), "families": families, "default": default, "arabic": arabic})
 }
 
 impl Server {
@@ -346,7 +387,7 @@ impl Server {
                     format!("unknown tool `{raw_name}`"),
                     format!("call tools/list for the tool names; closest: {}", close.join(", ")),
                 )
-                .with("candidates", json!(close));
+                .with("closest", json!(close));
                 return self.finish(raw_name, &json!({}), Err(e), vec![], vec![]);
             }
         };
@@ -381,11 +422,13 @@ impl Server {
                 let e = ToolError::new(
                     code::EVICTED,
                     format!("the presentation `{}` was closed by the server ({}) to free resources", ev.title, ev.reason),
-                    format!("your work is auto-saved at {reopen}; call open_presentation {{path: \"{reopen}\"}} again on it"),
+                    match &ev.recovered {
+                        Some(_) => format!("your work is auto-saved at {reopen}; call open_presentation {{path: \"{reopen}\"}} again on it"),
+                        None => format!("it had no unsaved changes; call open_presentation {{path: \"{reopen}\"}} to carry on"),
+                    },
                 )
-                .with("recovered", json!(ev.recovered))
-                .with("reopen", json!(reopen))
-                .with("evicted", json!(self.shared.evicted().iter().map(Evicted::to_value).collect::<Vec<_>>()));
+                .with("recovered_path", json!(ev.recovered))
+                .with("original_path", json!(ev.original));
                 return self.finish(name, &args, Err(e), warnings, vec![]);
             }
             if let Some((job, progress, elapsed)) = self.shared.running_open() {
@@ -456,7 +499,7 @@ impl Server {
                         None => "retry the call; server_status shows the server's state".into(),
                     },
                 )
-                .with("recovered", json!(at));
+                .with("recovered_path", json!(at));
                 (Err(e), vec![])
             }
         };
@@ -485,23 +528,66 @@ impl Server {
     fn dispatch(&mut self, name: &'static str, args: &Value, author: Option<&str>, overwrite: bool) -> Result<Outcome, ToolError> {
         match name {
             "server_status" => Ok(Outcome::new(status_value(&self.shared))),
-            "list_jobs" => Ok(Outcome::new(Value::Array(self.shared.jobs_value()))),
+            "list_jobs" => Ok(Outcome::new(json!({"jobs": self.shared.jobs_value()}))),
             "job_status" => {
-                let id = args.get("job_id").map(|v| v.as_str().map(String::from).unwrap_or_else(|| v.to_string())).unwrap_or_default();
+                let Some(id) = args.get("job_id").map(|v| v.as_str().map(String::from).unwrap_or_else(|| v.to_string())) else {
+                    return Ok(Outcome::new(json!({"jobs": self.shared.jobs_value()})));
+                };
                 self.shared.job_value(&id).map(Outcome::new).ok_or_else(|| {
                     let ids = self.shared.job_ids();
                     ToolError::new(code::NOT_FOUND, format!("no job `{id}`"), "list_jobs shows the jobs of this server")
-                        .with("candidates", json!(contract::closest(&id, ids.iter().map(String::as_str), 5)))
+                        .with("closest", json!(contract::closest(&id, ids.iter().map(String::as_str), 5)))
                 })
             }
             "cancel" => {
                 // In-process (the reader answers this while a call runs): only jobs can be running.
                 match args.get("job_id").map(|v| v.as_str().map(String::from).unwrap_or_else(|| v.to_string())) {
-                    Some(id) => match self.shared.cancel_job(&id) {
-                        Some(state) => Ok(Outcome::new(json!({"job_id": id, "state": state, "cancelled": state != "done" && state != "failed"}))),
-                        None => Err(ToolError::new(code::NOT_FOUND, format!("no job `{id}`"), "list_jobs shows the jobs of this server")),
-                    },
-                    None => Ok(Outcome::new(json!({"cancelled": false, "reason": "nothing else is running"}))),
+                    Some(id) => {
+                        let before = self.shared.job_value(&id).map(|v| v["status"].clone());
+                        match self.shared.cancel_job(&id) {
+                            Some(state) => Ok(Outcome::new(json!({
+                                "cancelled": before.is_some_and(|s| s == "running"),
+                                "status": if state == "running" { "cancelling" } else { state },
+                                "job_id": id,
+                                "next_step": "job_status gives the job's result",
+                            }))),
+                            None => Err(ToolError::new(code::NOT_FOUND, format!("no job `{id}`"), "list_jobs shows the jobs of this server")),
+                        }
+                    }
+                    None => {
+                        Ok(Outcome::new(json!({"cancelled": false, "status": "not_running", "next_step": "no call is running: nothing to stop"})))
+                    }
+                }
+            }
+            "roundtrip_check" => {
+                let path = args.get("path").and_then(Value::as_str).unwrap_or_default().to_string();
+                let roots = self.backend.automation_roots();
+                let cx = self.error_context("roundtrip_check");
+                let r = deckcraft_engine::file_access::confine(roots.as_ref(), || -> Result<Value, String> {
+                    deckcraft_engine::task::phase("round trip: reading", 0.0, 0.3);
+                    let bytes = deckcraft_engine::io::read_file_reporting(&path)?;
+                    deckcraft_engine::task::phase("round trip: saving and comparing", 0.3, 1.0);
+                    let loaded = deckcraft_engine::cmd::file::read_presentation_file(&path).map_err(|e| e.to_string())?;
+                    let fmt = deckcraft_engine::cmd::file::format_for_path(&path);
+                    let fmt = if matches!(fmt, "pptx" | "potx" | "ppsx") { fmt } else { "pptx" };
+                    let saved = deckcraft_engine::cmd::file::save_bytes(&loaded.doc, fmt).map_err(|e| e.to_string())?;
+                    crate::roundtrip::compare(&bytes, &saved).map_err(|e| format!("{path}: {e}"))
+                });
+                match r {
+                    Ok(mut v) => {
+                        v["path"] = json!(absolute(&path));
+                        if v["lossless"] != true {
+                            v["next_step"] = json!(
+                                "the parts listed under problems would change on save: tell the owner before editing, or keep the original file"
+                            );
+                        }
+                        Ok(Outcome::new(v))
+                    }
+                    Err(e) => {
+                        let mut err = contract::classify(&e, &cx);
+                        self.add_candidates(&mut err, &e);
+                        Err(err)
+                    }
                 }
             }
             "evict" => {
@@ -578,7 +664,7 @@ impl Server {
                 format!("unknown command `{id}`"),
                 format!("call list_commands with a filter; closest: {}", close.join(", ")),
             )
-            .with("candidates", json!(close))
+            .with("closest", json!(close))
         })
     }
 
@@ -628,7 +714,7 @@ impl Server {
 
     /// `not_found` answers list what is there.
     fn add_candidates(&mut self, e: &mut ToolError, msg: &str) {
-        if e.code != code::NOT_FOUND || e.extra.contains_key("candidates") {
+        if e.code != code::NOT_FOUND || e.extra.contains_key("closest") {
             return;
         }
         let l = msg.to_ascii_lowercase();
@@ -639,7 +725,7 @@ impl Server {
                     .and_then(Value::as_array)
                     .map(|a| a.iter().take(30).map(|s| json!({"id": s.get("id"), "name": s.get("name"), "kind": s.get("kind")})).collect())
                     .unwrap_or_default();
-                e.extra.insert("candidates".into(), Value::Array(list));
+                e.extra.insert("closest".into(), Value::Array(list));
             }
             return;
         }
@@ -658,7 +744,7 @@ impl Server {
                 let names: Vec<String> = rd.flatten().take(2000).map(|e| e.file_name().to_string_lossy().to_string()).collect();
                 let near = contract::closest(&want, names.iter().map(String::as_str), 5);
                 let full: Vec<String> = near.iter().map(|n| dir.join(n).to_string_lossy().to_string()).collect();
-                e.extra.insert("candidates".into(), json!(full));
+                e.extra.insert("closest".into(), json!(full));
             }
         }
     }
@@ -691,10 +777,11 @@ impl Server {
                 self.shared.clear_evicted();
                 return Ok(Outcome::new(json!({
                     "job_id": id,
-                    "state": "running",
+                    "status": "running",
+                    "tool": "open_presentation",
                     "bytes": size,
                     "retry_after_ms": 500,
-                    "next_step": format!("the file opens in the background; poll job_status {{job_id: \"{id}\"}} until state is done"),
+                    "next_step": format!("the file opens in the background; poll job_status {{job_id: \"{id}\"}} until status is not \"running\""),
                 })));
             }
         }
@@ -727,10 +814,11 @@ impl Server {
                 let id = crate::jobs::spawn_export(&self.shared, roots, doc, current, args.clone(), overwrite);
                 return Ok(Outcome::new(json!({
                     "job_id": id,
-                    "state": "running",
+                    "status": "running",
+                    "tool": "export",
                     "slides": n,
                     "retry_after_ms": 500,
-                    "next_step": format!("the export runs in the background; poll job_status {{job_id: \"{id}\"}} until state is done"),
+                    "next_step": format!("the export runs in the background; poll job_status {{job_id: \"{id}\"}} until status is not \"running\""),
                 })));
             }
         }
@@ -775,7 +863,7 @@ impl Server {
         if let Some(i) = s.active_index() {
             s.close_document(i);
         }
-        Ok(Outcome::new(json!({"closed": title, "recovered": saved.first().map(|r| r.path.clone())})))
+        Ok(Outcome::new(json!({"closed": true, "name": title, "recovered_path": saved.first().map(|r| r.path.clone())})))
     }
 
     /// Auto-save every open presentation with unsaved work, then close them all.
@@ -880,19 +968,21 @@ impl Server {
     /// The `CallToolResult`: content blocks, `structuredContent`, `isError`.
     fn finish(&mut self, name: &str, args: &Value, outcome: Result<Outcome, ToolError>, mut warnings: Vec<String>, renamed: Vec<Value>) -> Value {
         let recovered: Vec<Value> = self.shared.take_unannounced().iter().map(crate::state::Recovered::to_value).collect();
-        let cap = self.shared.config.max_result_bytes;
+        let cap = args.get("max_bytes").and_then(Value::as_u64).map_or(self.shared.config.max_result_bytes, |m| (m as usize).clamp(1024, 64 << 20));
         match outcome {
             Ok(o) => {
                 warnings.extend(o.warnings);
                 let mut v = o.value;
-                // Paging.
-                let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
+                // Paging: `offset` / `limit` on the list tools; `continue_from` (the shared
+                // continuation) on any tool, at its largest list.
+                let from = args.get("continue_from").and_then(Value::as_u64).unwrap_or(0) as usize;
+                let offset = args.get("offset").and_then(Value::as_u64).map_or(from, |o| o as usize);
                 let limit = args.get("limit").and_then(Value::as_u64).map(|l| l as usize);
                 let mut total = None;
-                if let Some(ptr) = page_pointer(name)
+                if let Some(ptr) = page_pointer(name).map(str::to_string).or_else(|| (offset > 0).then(|| contract::bulk_pointer(&v)).flatten())
                     && (offset > 0 || limit.is_some())
                 {
-                    total = contract::page(&mut v, ptr, offset, limit);
+                    total = contract::page(&mut v, &ptr, offset, limit);
                 }
                 let trimmed = contract::trim(&mut v, cap.saturating_sub(4096).max(1024));
                 let mut sc = if v.is_object() { v.clone() } else { json!({"result": v.clone()}) };
@@ -902,10 +992,10 @@ impl Server {
                     sc["continue_from"] = json!(from);
                     sc["total"] = json!(total.unwrap_or(offset + t.total));
                     sc["truncated_path"] = json!(t.path);
-                    sc["next_step"] = json!(if page_pointer(name).is_some() {
-                        format!("the answer was cut at {} items; call {name} again with offset: {from} for the rest", t.kept)
-                    } else {
+                    sc["next_step"] = json!(if t.path.is_empty() {
                         "the answer was cut to stay small; ask for less (one slide, a smaller range)".to_string()
+                    } else {
+                        format!("the answer was cut at {} items; call {name} again with continue_from: {from} for the rest", t.kept)
                     });
                 } else if let Some(t) = total {
                     sc["total"] = json!(t);

@@ -5,21 +5,52 @@
 
 use serde_json::{Map, Value, json};
 
-/// Error codes an agent can branch on.
+/// The error codes an agent can branch on: the same set in WordCraft, GridCraft and DeckCraft
+/// (CONTRACT-PARITY.md). Every error a tool answers carries one of these.
 pub mod code {
     pub const BUSY: &str = "busy";
     pub const CANCELLED: &str = "cancelled";
+    pub const DISK_FULL: &str = "disk_full";
     pub const EVICTED: &str = "evicted";
-    pub const TOO_LARGE: &str = "too_large";
-    pub const NOT_FOUND: &str = "not_found";
-    pub const INVALID_ARGUMENT: &str = "invalid_argument";
-    pub const OUT_OF_RANGE: &str = "out_of_range";
-    pub const FORBIDDEN: &str = "forbidden";
-    pub const NO_DOCUMENT: &str = "no_document";
-    pub const UNSUPPORTED: &str = "unsupported";
-    pub const INTERNAL: &str = "internal";
     pub const FAILED: &str = "failed";
+    pub const INTERNAL: &str = "internal";
+    pub const INVALID_ARGUMENT: &str = "invalid_argument";
+    pub const INVALID_REQUEST: &str = "invalid_request";
+    pub const LOCKED: &str = "locked";
+    pub const NO_DOCUMENT: &str = "no_document";
+    pub const NOT_AVAILABLE: &str = "not_available";
+    pub const NOT_FOUND: &str = "not_found";
+    pub const OUT_OF_RANGE: &str = "out_of_range";
+    pub const OUTSIDE_ROOT: &str = "outside_root";
+    pub const PASSWORD_REQUIRED: &str = "password_required";
+    pub const TOO_LARGE: &str = "too_large";
+    pub const UNSUPPORTED: &str = "unsupported";
+    pub const WRONG_PASSWORD: &str = "wrong_password";
+    /// Every code, sorted.
+    pub const ALL: &[&str] = &[
+        BUSY,
+        CANCELLED,
+        DISK_FULL,
+        EVICTED,
+        FAILED,
+        INTERNAL,
+        INVALID_ARGUMENT,
+        INVALID_REQUEST,
+        LOCKED,
+        NO_DOCUMENT,
+        NOT_AVAILABLE,
+        NOT_FOUND,
+        OUT_OF_RANGE,
+        OUTSIDE_ROOT,
+        PASSWORD_REQUIRED,
+        TOO_LARGE,
+        UNSUPPORTED,
+        WRONG_PASSWORD,
+    ];
 }
+
+/// Arguments every tool takes besides its own: the same in every craft app (CONTRACT-PARITY.md).
+pub const COMMON_ARGS: &[&str] = &["caller", "async", "overwrite", "continue_from", "max_bytes"];
 
 /// A structured tool error.
 #[derive(Clone, Debug, PartialEq)]
@@ -27,7 +58,7 @@ pub struct ToolError {
     pub code: String,
     pub reason: String,
     pub next_step: String,
-    /// Extra fields (`retry_after_ms`, `candidates`, `job_id`, `recovered`…).
+    /// Extra fields (`retry_after_ms`, `closest`, `job_id`, `recovered_path`…).
     pub extra: Map<String, Value>,
 }
 
@@ -79,16 +110,48 @@ pub fn classify(msg: &str, cx: &ErrorContext<'_>) -> ToolError {
     if l.contains("outside the read root") || l.contains("read authority is absent") {
         let root = cx.read_root.clone().unwrap_or_else(|| "(none: reading files is not granted)".into());
         return ToolError::new(
-            code::FORBIDDEN,
+            code::OUTSIDE_ROOT,
             msg,
             format!("use a path inside the read root {root}; relative paths are resolved inside the write root"),
         )
-        .with("read_root", json!(cx.read_root));
+        .with("read_root", json!(cx.read_root))
+        .with("write_root", json!(cx.write_root));
     }
     if l.contains("outside the write root") || l.contains("write authority is absent") || l.contains("automation path rejected") {
         let root = cx.write_root.clone().unwrap_or_else(|| "(none: writing files is not granted)".into());
-        return ToolError::new(code::FORBIDDEN, msg, format!("save inside the write root {root}; a bare file name such as `deck.pptx` lands there"))
-            .with("write_root", json!(cx.write_root));
+        return ToolError::new(
+            code::OUTSIDE_ROOT,
+            msg,
+            format!("save inside the write root {root}; a bare file name such as `deck.pptx` lands there"),
+        )
+        .with("read_root", json!(cx.read_root))
+        .with("write_root", json!(cx.write_root));
+    }
+    if l.contains("os error 32")
+        || l.contains("os error 33")
+        || l.contains("being used by another process")
+        || l.contains("permission denied")
+        || l.contains("access is denied")
+    {
+        return ToolError::new(
+            code::LOCKED,
+            msg,
+            "the file is open in another program or read-only: close it there and retry, or save under another name",
+        )
+        .with("retry_after_ms", json!(5000));
+    }
+    if l.contains("no space left") || l.contains("os error 28") || l.contains("os error 112") || l.contains("disk full") {
+        return ToolError::new(code::DISK_FULL, msg, "free space on the disk and save again; the presentation is still open");
+    }
+    if l.contains("password") && (l.contains("wrong") || l.contains("incorrect")) {
+        return ToolError::new(code::WRONG_PASSWORD, msg, "call open_presentation again with the right `password`");
+    }
+    if l.contains("password-protected") || l.contains("password protected") || l.contains("encrypted") {
+        return ToolError::new(
+            code::PASSWORD_REQUIRED,
+            msg,
+            "the file is password-protected: open it with its password, or ask the owner for an unprotected copy",
+        );
     }
     if l.contains("cancelled") {
         return ToolError::new(code::CANCELLED, msg, "the call stopped at a safe point and changed nothing past it; call it again to do the work");
@@ -99,11 +162,18 @@ pub fn classify(msg: &str, cx: &ErrorContext<'_>) -> ToolError {
     if l.contains("unknown command") {
         return ToolError::new(code::NOT_FOUND, msg, "call list_commands with a filter to find the command id");
     }
-    if l.contains("needs the desktop app") || l.contains("is a ui command") || l.contains("password-protected") || l.contains("unsupported") {
+    if l.contains("not available") || l.contains("is disabled") {
+        return ToolError::new(
+            code::NOT_AVAILABLE,
+            msg,
+            "the command can't run in the current state (selection, slide): change that first, or use another command",
+        );
+    }
+    if l.contains("needs the desktop app") || l.contains("is a ui command") || l.contains("unsupported") {
         return ToolError::new(code::UNSUPPORTED, msg, "this cannot be done headless; use render_slide / export / run_command instead");
     }
     if l.contains("no such file") || l.contains("os error 2") || l.contains("cannot find") || l.contains("not found") {
-        return ToolError::new(code::NOT_FOUND, msg, "check the path; the closest matches are listed in `candidates` when there are any");
+        return ToolError::new(code::NOT_FOUND, msg, "check the path; the closest matches are listed in `closest` when there are any");
     }
     if let Some(n) = slide_number_in(&l) {
         let range = cx
@@ -117,7 +187,7 @@ pub fn classify(msg: &str, cx: &ErrorContext<'_>) -> ToolError {
         .with("index", json!(n));
     }
     if l.contains("no shape") || l.contains("no such shape") || l.contains("unknown shape") || l.contains("is not a shape id") {
-        return ToolError::new(code::NOT_FOUND, msg, "call inspect_slide to list the shape ids on the current slide (see `candidates`)");
+        return ToolError::new(code::NOT_FOUND, msg, "call inspect_slide to list the shape ids on the current slide (see `closest`)");
     }
     if l.contains("too large") || l.contains("exceeds") || l.contains("too many") || l.contains("too big") {
         return ToolError::new(code::TOO_LARGE, msg, "ask for less at once: a slide range (slides: \"1-10\"), a smaller scale, or offset/limit");
@@ -283,6 +353,9 @@ const ARG_ALIASES: &[(&str, &str)] = &[
     ("id_list", "ids"),
     ("jobid", "job_id"),
     ("job", "job_id"),
+    ("background", "async"),
+    ("continuefrom", "offset"),
+    ("offset", "continue_from"),
 ];
 
 /// Normalised arguments plus warnings about what was renamed, coerced or dropped.
@@ -304,7 +377,7 @@ pub fn normalize_args(tool: &str, schema: &Value, args: &Value) -> Normalized {
     let props = schema.get("properties").and_then(Value::as_object).cloned().unwrap_or_default();
     let mut out = Map::new();
     for (k, v) in obj {
-        let canonical = if props.contains_key(k) {
+        let canonical = if props.contains_key(k) || (COMMON_ARGS.contains(&k.as_str()) && !props.contains_key("offset")) {
             Some(k.clone())
         } else {
             let sq = squash(k);
@@ -346,6 +419,14 @@ fn short(v: &Value) -> String {
 
 /// Coerce a value to the schema type where that is safe.
 fn coerce(key: &str, v: &Value, schema: Option<&Value>, tool: &str, warnings: &mut Vec<String>) -> Value {
+    // Enumerated values in any case or spelling.
+    if let (Some(allowed), Some(given)) = (schema.and_then(|s| s.get("enum")).and_then(Value::as_array), v.as_str())
+        && !allowed.iter().any(|a| a.as_str() == Some(given))
+        && let Some(hit) = allowed.iter().filter_map(Value::as_str).find(|a| squash(a) == squash(given))
+    {
+        warnings.push(format!("{tool}: `{key}`: `{given}` read as `{hit}`"));
+        return json!(hit);
+    }
     let Some(ty) = schema.and_then(|s| s.get("type")).and_then(Value::as_str) else { return v.clone() };
     match (ty, v) {
         ("integer", Value::String(s)) => match s.trim().parse::<i64>() {
@@ -375,6 +456,9 @@ fn coerce(key: &str, v: &Value, schema: Option<&Value>, tool: &str, warnings: &m
         ("array", Value::String(s)) if schema.and_then(|s| s.pointer("/items/type")).and_then(Value::as_str) == Some("integer") => {
             let parsed: Vec<i64> = s.split([',', ' ']).filter(|p| !p.trim().is_empty()).filter_map(|p| p.trim().parse().ok()).collect();
             if parsed.is_empty() { v.clone() } else { json!(parsed) }
+        }
+        ("array", Value::String(s)) if schema.and_then(|s| s.pointer("/items/type")).and_then(Value::as_str).is_none_or(|t| t == "string") => {
+            json!(s.split(',').map(str::trim).filter(|p| !p.is_empty()).collect::<Vec<_>>())
         }
         ("array", Value::Number(_)) => json!([v]),
         _ => v.clone(),
@@ -481,6 +565,11 @@ fn shorten_strings(v: &mut Value, max: usize, depth: usize) {
     }
 }
 
+/// The largest array of `v` (where [`trim`] would cut): its JSON pointer.
+pub fn bulk_pointer(v: &Value) -> Option<String> {
+    largest_array(v, "", 0).map(|(p, _)| p)
+}
+
 /// `offset` / `limit` applied to the array at `pointer` of `v`; returns the total length.
 pub fn page(v: &mut Value, pointer: &str, offset: usize, limit: Option<usize>) -> Option<usize> {
     let arr = v.pointer_mut(pointer)?.as_array_mut()?;
@@ -536,11 +625,14 @@ mod tests {
     fn errors_are_classified() {
         let cx = ErrorContext { tool: "save_presentation", write_root: Some("/w".into()), ..Default::default() };
         let e = classify("automation path rejected: outside the write root /w: /etc/x", &cx);
-        assert_eq!(e.code, code::FORBIDDEN);
+        assert_eq!(e.code, code::OUTSIDE_ROOT);
         assert!(e.next_step.contains("/w"));
         let cx = ErrorContext { tool: "go_to_slide", slide_count: Some(3), ..Default::default() };
         let e = classify("slide.go: no slide 7", &cx);
         assert_eq!(e.code, code::OUT_OF_RANGE);
         assert!(e.next_step.contains("0..2"), "{}", e.next_step);
+        let e = classify("deck.pptx: No space left on device (os error 28)", &cx);
+        assert_eq!(e.code, code::DISK_FULL);
+        assert!(code::ALL.contains(&e.code.as_str()));
     }
 }

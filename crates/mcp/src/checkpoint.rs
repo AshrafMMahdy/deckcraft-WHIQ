@@ -1,6 +1,7 @@
 //! WHIQ: periodic checkpoints, so a hard kill (Windows `TerminateProcess`, the OOM killer, a
 //! power cut) loses little. Every presentation with unsaved work is written to its checkpoint —
-//! `<name>.recovered-checkpoint-<id>.<ext>` beside the other recovered files — once it has
+//! its recovered file, `<name>.recovered-<stamp>.<ext>` in the write root (the name every craft
+//! app uses; a later auto-save of the same stretch of work writes the same file) — once it has
 //! `checkpoint_edits` edits that are not in the checkpoint yet, or once the oldest of them is
 //! `checkpoint_secs` old. A background thread does it from the worker's last snapshot (the
 //! presentations as the last finished call left them), so a long call never delays it and the
@@ -15,6 +16,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use deckcraft_engine::file_access::{self, AutomationRoots};
@@ -40,10 +42,20 @@ pub struct Checkpoint {
 /// Fresh documents start at revision 1 (`DocState::new`).
 const FIRST_REVISION: u64 = 1;
 
-/// The checkpoint file name for a presentation.
-fn file_name(d: &DocSnapshot, fmt: &str) -> String {
+/// Checkpoints written in this process (server_status).
+static WRITES: AtomicU64 = AtomicU64::new(0);
+
+/// A new recovered file name for a presentation's checkpoint (kept for the whole stretch of
+/// unsaved work).
+fn file_name(d: &DocSnapshot, fmt: &str, dir: &Path) -> String {
     let stem = d.path.as_deref().and_then(|p| Path::new(p).file_stem()).map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| d.title.clone());
-    format!("{}.recovered-checkpoint-{:x}.{fmt}", crate::autosave::safe_stem(&stem), d.uid)
+    crate::autosave::free_name(dir, &crate::autosave::safe_stem(&stem), fmt)
+}
+
+/// The checkpoint file of document `uid`, handed over to an auto-save that writes the same
+/// stretch of work there (the file stays; it is no longer a checkpoint).
+pub fn take_path(shared: &Shared, uid: u64) -> Option<String> {
+    lock(&shared.checkpoints).get_mut(&uid).and_then(|c| c.path.take())
 }
 
 fn remove(path: &str) {
@@ -114,7 +126,8 @@ pub fn tick(shared: &Shared, roots: Option<&Arc<AutomationRoots>>, now: Instant)
             continue;
         }
         let fmt = crate::autosave::recovered_format(d.path.as_deref());
-        let path = crate::autosave::recovery_dir(shared, d.path.as_deref()).join(file_name(d, fmt)).to_string_lossy().to_string();
+        let dir = crate::autosave::recovery_dir(shared, d.path.as_deref());
+        let path = c.path.clone().unwrap_or_else(|| dir.join(file_name(d, fmt, &dir)).to_string_lossy().to_string());
         let result = deckcraft_engine::cmd::file::save_bytes(&d.doc, fmt)
             .map_err(|e| e.to_string())
             .and_then(|bytes| file_access::confine(roots, || deckcraft_engine::io::write_file(&path, &bytes)));
@@ -124,6 +137,7 @@ pub fn tick(shared: &Shared, roots: Option<&Arc<AutomationRoots>>, now: Instant)
                 c.revision = d.revision;
                 c.pending_since = None;
                 c.retry_at = None;
+                WRITES.fetch_add(1, Ordering::Relaxed);
                 written.push(path);
             }
             Err(e) => {
@@ -135,12 +149,20 @@ pub fn tick(shared: &Shared, roots: Option<&Arc<AutomationRoots>>, now: Instant)
     written
 }
 
-/// The checkpoints written so far (for server_status).
+/// The checkpoints (for server_status), in the shape every craft app reports.
 pub fn status(shared: &Shared) -> serde_json::Value {
     let map = lock(&shared.checkpoints);
+    let docs = shared.docs();
+    let pending: u64 = docs
+        .iter()
+        .filter(|d| d.dirty || d.path.is_none())
+        .map(|d| d.revision.saturating_sub(map.get(&d.uid).map_or(FIRST_REVISION, |c| c.revision)))
+        .sum();
     serde_json::json!({
         "every_edits": shared.config.checkpoint_edits,
         "every_secs": shared.config.checkpoint_secs,
-        "files": map.values().filter_map(|c| c.path.as_ref().map(|p| serde_json::json!({"title": c.title, "path": p, "revision": c.revision}))).collect::<Vec<_>>(),
+        "pending_edits": pending,
+        "writes": WRITES.load(Ordering::Relaxed),
+        "files": map.iter().filter_map(|(uid, c)| c.path.as_ref().map(|p| serde_json::json!({"path": p, "document": uid, "title": c.title, "revision": c.revision}))).collect::<Vec<_>>(),
     })
 }

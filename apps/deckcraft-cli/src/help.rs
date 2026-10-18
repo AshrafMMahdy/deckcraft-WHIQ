@@ -126,7 +126,7 @@ and prints its answer as JSON. COMMAND [PARAMS] runs a command, as run --cmd doe
     },
     Subcommand {
         name: "mcp",
-        usage: "mcp [--connect PORT] [--sample] [--automation-read-root DIR] [--automation-write-root DIR] [--author NAME] [--busy-after-ms MS] [--idle-evict-secs S] [--max-memory-mb MB] [--max-result-bytes N] [--open-job-mb MB] [--export-job-slides N] [--checkpoint-edits N] [--checkpoint-secs S]",
+        usage: "mcp [--connect PORT] [--sample] [--automation-read-root DIR] [--automation-write-root DIR] [--author NAME] [--busy-after-ms MS] [--job-after-ms MS] [--idle-evict-secs S] [--max-memory-mb MB] [--max-result-bytes N] [--open-job-mb MB] [--export-job-slides N] [--checkpoint-edits N] [--checkpoint-secs S]",
         summary: "serve the commands to an agent over MCP on stdio",
         details: "Runs a Model Context Protocol server on stdin and stdout. It works on its own presentation without a
 window, or with --connect PORT (or host:port) on the DeckCraft app started with --control PORT.
@@ -137,15 +137,17 @@ window, or with --connect PORT (or host:port) on the DeckCraft app started with 
 out grants none of its access. They run the in-process server, so they conflict with --connect (a running
 app is not confined by them). Relative paths are resolved inside the write root.
 
-No call is a dead stop: errors carry code, reason and next_step; a call that waited --busy-after-ms (8000)
-behind another is answered busy with retry_after_ms; opening a file of --open-job-mb (24) or more and
-exporting every slide of a deck of --export-job-slides (24) or more run as jobs (job_status); answers over
+No call is a dead stop: errors carry code, reason and next_step; a call that waited --busy-after-ms (300)
+behind another is answered busy with retry_after_ms; a call still running after --job-after-ms (15000),
+opening a file of --open-job-mb (20) or more and exporting every slide of a deck of --export-job-slides
+(24) or more run as jobs (job_status); answers over
 --max-result-bytes (262144) are trimmed with continue_from. Unsaved work is written to
 <name>.recovered-<stamp>.<ext> in the write root on SIGTERM, at the end of input, after --idle-evict-secs
 without a call, above --max-memory-mb, or after an internal error, and the next answer names the file.
-Against a hard kill, unsaved work is also checkpointed to <name>.recovered-checkpoint-<id>.<ext> after
---checkpoint-edits (10) edits or once the oldest unsaved edit is --checkpoint-secs (30) old (0 turns
-either off); the next run lists the checkpoints it finds with the recovered files.
+Against a hard kill, unsaved work is also checkpointed to its recovered file after --checkpoint-edits
+(20) edits or once the oldest unsaved edit is --checkpoint-secs (60) old (0 turns either off); the next
+run lists the checkpoints it finds with the recovered files. (The same flags, names and shapes as
+WordCraft's and GridCraft's servers: CONTRACT-PARITY.md.)
 Saving never replaces a file silently: the old one is renamed OLD_<name> unless the call passes
 overwrite: true. --author NAME (or a call's `caller`) is put on comments and on the saved file.",
     },

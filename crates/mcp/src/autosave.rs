@@ -41,6 +41,18 @@ pub(crate) fn recovered_format(original: Option<&str>) -> &'static str {
     }
 }
 
+/// `<stem>.recovered-<stamp>.<fmt>` in `dir`, with `-2`, `-3`… when that is taken.
+pub(crate) fn free_name(dir: &Path, stem: &str, fmt: &str) -> String {
+    let base = format!("{stem}.recovered-{}", stamp());
+    let mut name = format!("{base}.{fmt}");
+    let mut n = 2;
+    while dir.join(&name).exists() && n < 1000 {
+        name = format!("{base}-{n}.{fmt}");
+        n += 1;
+    }
+    name
+}
+
 /// Write one presentation to a recovered file. `Err` is a reason (logged; the server keeps going).
 pub fn write_recovered(
     shared: &Shared,
@@ -53,10 +65,20 @@ pub fn write_recovered(
 ) -> Result<Recovered, String> {
     let fmt = recovered_format(original);
     let stem = original.and_then(|p| Path::new(p).file_stem()).map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| title.to_string());
-    let name = format!("{}.recovered-{}.{fmt}", safe_stem(&stem), stamp());
-    let path = recovery_dir(shared, original).join(name).to_string_lossy().to_string();
+    let dir = recovery_dir(shared, original);
     let bytes = deckcraft_engine::cmd::file::save_bytes(doc, fmt).map_err(|e| e.to_string())?;
-    let (written, _) = file_access::confine(roots, || deckcraft_engine::io::keep_previous(|| deckcraft_engine::io::write_file(&path, &bytes)));
+    // The same stretch of work already has a checkpoint: it becomes the recovered file (one file,
+    // brought up to date, as in every craft app).
+    let reuse = id.and_then(|(uid, _)| crate::checkpoint::take_path(shared, uid));
+    let path = match &reuse {
+        Some(p) => p.clone(),
+        None => dir.join(free_name(&dir, &safe_stem(&stem), fmt)).to_string_lossy().to_string(),
+    };
+    let written = if reuse.is_some() {
+        file_access::confine(roots, || deckcraft_engine::io::write_file(&path, &bytes))
+    } else {
+        file_access::confine(roots, || deckcraft_engine::io::keep_previous(|| deckcraft_engine::io::write_file(&path, &bytes))).0
+    };
     written?;
     let r = Recovered { path, title: title.to_string(), original: original.map(String::from), reason: reason.to_string(), at: now_rfc3339() };
     eprintln!("deckcraft-cli: work auto-saved ({reason}) to {}", r.path);

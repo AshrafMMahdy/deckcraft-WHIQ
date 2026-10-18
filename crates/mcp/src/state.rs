@@ -27,6 +27,8 @@ pub struct Config {
     pub export_job_slides: usize,
     /// A queued call that waited this long is answered `busy` instead.
     pub busy_after_ms: u64,
+    /// A call still running after this long answers with a `job_id` and carries on as a job.
+    pub job_after_ms: u64,
     /// Evict (auto-save and close) open documents after this long without a call.
     pub idle_evict_secs: Option<u64>,
     /// Evict open documents when the process uses more memory than this.
@@ -48,13 +50,14 @@ impl Default for Config {
             write_root: None,
             max_result_bytes: 256 * 1024,
             max_image_bytes: 6 * 1024 * 1024,
-            open_job_bytes: 24 * 1024 * 1024,
+            open_job_bytes: 20 * 1024 * 1024,
             export_job_slides: 24,
-            busy_after_ms: 8_000,
+            busy_after_ms: 300,
+            job_after_ms: 15_000,
             idle_evict_secs: None,
             max_memory_mb: None,
-            checkpoint_edits: 10,
-            checkpoint_secs: 30,
+            checkpoint_edits: 20,
+            checkpoint_secs: 60,
             test_hooks: std::env::var("DECKCRAFT_MCP_TEST_HOOKS").is_ok_and(|v| v == "1"),
         }
     }
@@ -73,8 +76,9 @@ pub struct Recovered {
 }
 
 impl Recovered {
+    /// The shape every craft app reports: `{path, reason, original, at}`.
     pub fn to_value(&self) -> Value {
-        json!({"path": self.path, "title": self.title, "original": self.original, "reason": self.reason, "at": self.at})
+        json!({"path": self.path, "reason": self.reason, "original": self.original, "at": if self.at.is_empty() { Value::Null } else { json!(self.at) }})
     }
 }
 
@@ -92,8 +96,9 @@ impl Evicted {
     pub fn reopen_path(&self) -> Option<&str> {
         self.recovered.as_deref().or(self.original.as_deref())
     }
+    /// The shape every craft app reports: `{name, reason, recovered_path, original_path}`.
     pub fn to_value(&self) -> Value {
-        json!({"title": self.title, "original": self.original, "recovered": self.recovered, "reason": self.reason, "reopen": self.reopen_path()})
+        json!({"name": self.title, "reason": self.reason, "recovered_path": self.recovered, "original_path": self.original})
     }
 }
 
@@ -133,6 +138,8 @@ impl JobState {
 /// Long work running off the protocol loop.
 pub struct Job {
     pub id: String,
+    /// The tool the job runs (`open_presentation`, `export`, or any tool a call ran as a job).
+    pub tool: String,
     pub kind: String,
     pub detail: String,
     pub state: JobState,
@@ -141,6 +148,8 @@ pub struct Job {
     pub finished: Option<Instant>,
     pub result: Option<Value>,
     pub error: Option<Value>,
+    /// A call job's content blocks other than text (pictures), returned by job_status.
+    pub pictures: Vec<Value>,
     /// An `open` job's parsed file, waiting for the worker to add it to the session.
     pub pending_open: Option<deckcraft_engine::cmd::file::LoadedFile>,
     /// Progress and cancellation shared with the job's thread.
@@ -158,24 +167,39 @@ impl Job {
         }
     }
 
+    /// The job in the shape every craft app reports (`job_status`, `list_jobs`, `server_status`):
+    /// `{job_id, tool, status, elapsed_ms, progress, stage, steps, stages}`, `retry_after_ms`
+    /// while it runs, then `result` or `error`.
     pub fn to_value(&self) -> Value {
         let elapsed = self.finished.unwrap_or_else(Instant::now).duration_since(self.started).as_millis() as u64;
         let progress = self.effective_progress();
         let (done, total) = self.task.progress();
+        let stage = self.task.stage();
+        let mut stages = self.task.stages();
+        let stage = if stage.is_empty() { self.tool.clone() } else { stage };
+        if stages.is_empty() {
+            stages.push(stage.clone());
+        }
         let mut v = json!({
             "job_id": self.id,
-            "kind": self.kind,
-            "detail": self.detail,
-            "state": self.state.name(),
-            "progress": (progress * 1000.0).round() / 1000.0,
-            "stage": self.task.stage(),
-            "steps": {"done": done, "total": total},
-            "stages": self.task.stages(),
+            "tool": self.tool,
+            "status": self.state.name(),
             "elapsed_ms": elapsed,
+            "progress": (progress * 1000.0).round() / 1000.0,
+            "stage": stage,
+            "steps": {"done": done, "total": total},
+            "stages": stages,
+            "detail": self.detail,
         });
         match self.state {
             JobState::Cancelled => {
-                v["result"] = self.result.clone().unwrap_or(Value::Null);
+                if let Some(r) = &self.result {
+                    v["result"] = r.clone();
+                }
+                v["error"] = self
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| json!({"code": "cancelled", "reason": "the job was cancelled", "next_step": "run it again when you need it"}));
                 v["next_step"] = json!("the job was cancelled at a safe point; nothing past it was changed");
             }
             JobState::Running => {
@@ -185,7 +209,7 @@ impl Job {
             }
             JobState::Done => {
                 v["result"] = self.result.clone().unwrap_or(Value::Null);
-                v["next_step"] = json!("the job is finished; its result is above");
+                v["next_step"] = json!("the job is finished; its result is in `result`");
             }
             JobState::Failed => {
                 v["error"] = self.error.clone().unwrap_or(Value::Null);
@@ -221,6 +245,9 @@ pub struct Shared {
     pub backend_description: Mutex<String>,
     /// The task of the call the worker is running (`cancel` stops it at its next safe point).
     current_task: Mutex<Option<std::sync::Arc<deckcraft_engine::task::Task>>>,
+    /// The running call's request id, and the job it became (past `job_after_ms`, `async`, or a
+    /// client that gave up on it): its answer then goes to the job.
+    pub current_request: Mutex<Option<(Value, Option<String>)>>,
     /// Checkpoints of the open presentations, by document id (see `checkpoint.rs`).
     pub checkpoints: Mutex<BTreeMap<u64, crate::checkpoint::Checkpoint>>,
 }
@@ -247,16 +274,28 @@ impl Shared {
             busy_replies: AtomicU64::new(0),
             backend_description: Mutex::new(String::new()),
             current_task: Mutex::new(None),
+            current_request: Mutex::new(None),
             checkpoints: Mutex::new(BTreeMap::new()),
         })
     }
 
     // Jobs.
     pub fn new_job(&self, kind: &str, detail: &str) -> String {
+        let tool = match kind {
+            "open" => "open_presentation",
+            "export" => "export",
+            other => other,
+        };
+        self.new_job_for(tool, kind, detail, deckcraft_engine::task::Task::new())
+    }
+    /// A job for `tool` whose progress is `task` (a call that became a job shares its task).
+    pub fn new_job_for(&self, tool: &str, kind: &str, detail: &str, task: std::sync::Arc<deckcraft_engine::task::Task>) -> String {
         let n = self.next_job.fetch_add(1, Ordering::Relaxed);
         let id = format!("job-{n}");
         let job = Job {
             id: id.clone(),
+            tool: tool.into(),
+            pictures: vec![],
             kind: kind.into(),
             detail: detail.into(),
             state: JobState::Running,
@@ -266,7 +305,7 @@ impl Shared {
             result: None,
             error: None,
             pending_open: None,
-            task: deckcraft_engine::task::Task::new(),
+            task,
         };
         let mut jobs = lock(&self.jobs);
         // Keep the table bounded: drop the oldest finished jobs past 200.
@@ -295,6 +334,31 @@ impl Shared {
             j.result = Some(partial);
             j.pending_open = None;
         });
+    }
+    /// A call that ran as a job ended with this tool result.
+    pub fn job_answered(&self, id: &str, result: &Value) {
+        let sc = result.get("structuredContent").cloned().unwrap_or(Value::Null);
+        let pictures: Vec<Value> =
+            result.get("content").and_then(Value::as_array).map(|c| c.iter().filter(|b| b["type"] != "text").cloned().collect()).unwrap_or_default();
+        self.with_job(id, |j| {
+            j.finished = Some(Instant::now());
+            j.pictures = pictures;
+            if result["isError"] == true {
+                let e = sc.get("error").cloned().unwrap_or(Value::Null);
+                j.state = if e["code"] == "cancelled" { JobState::Cancelled } else { JobState::Failed };
+                j.error = Some(e);
+            } else {
+                j.state = JobState::Done;
+                j.progress = 1.0;
+                j.result = Some(sc);
+            }
+        });
+    }
+    /// A finished call job's pictures (job_status returns them as content).
+    pub fn job_pictures(&self, id: &str) -> Vec<Value> {
+        let want = id.trim().to_ascii_lowercase();
+        let want = if want.chars().all(|c| c.is_ascii_digit()) { format!("job-{want}") } else { want };
+        lock(&self.jobs).get(&want).map(|j| j.pictures.clone()).unwrap_or_default()
     }
     /// The task of job `id` (its thread runs inside it).
     pub fn job_task(&self, id: &str) -> Option<std::sync::Arc<deckcraft_engine::task::Task>> {
@@ -422,8 +486,17 @@ impl Shared {
     pub fn current_progress(&self) -> Option<Value> {
         lock(&self.current_task).as_ref().map(|t| {
             let (d, n) = t.progress();
-            json!({"progress": (t.overall() * 1000.0).round() / 1000.0, "done": d, "total": n, "stage": t.stage(), "cancelling": t.is_cancelled()})
+            let mut stages = t.stages();
+            let stage = t.stage();
+            if stages.is_empty() && !stage.is_empty() {
+                stages.push(stage.clone());
+            }
+            json!({"progress": (t.overall().min(0.99) * 1000.0).round() / 1000.0, "steps": {"done": d, "total": n}, "stage": stage, "stages": stages, "cancelling": t.is_cancelled()})
         })
+    }
+    /// The running call's task (a call that becomes a job reports through it).
+    pub fn current_task(&self) -> Option<std::sync::Arc<deckcraft_engine::task::Task>> {
+        lock(&self.current_task).clone()
     }
     pub fn current(&self) -> Option<(String, u64)> {
         lock(&self.current).as_ref().map(|(t, at)| (t.clone(), at.elapsed().as_millis() as u64))
@@ -437,7 +510,8 @@ pub fn rss_bytes() -> Option<u64> {
     memory_stats::memory_stats().map(|m| m.physical_mem as u64)
 }
 
-/// The process's memory as the OS reports it, for `server_status`.
+/// The process's memory as the OS reports it, for `server_status` (the shape and words every
+/// craft app uses).
 pub fn memory_value(limit_mb: Option<u64>) -> Value {
     let m = memory_stats::memory_stats();
     let rss = m.map(|m| m.physical_mem as u64);
@@ -447,21 +521,21 @@ pub fn memory_value(limit_mb: Option<u64>) -> Value {
     } else if cfg!(target_os = "macos") {
         "task_info(MACH_TASK_BASIC_INFO): resident_size (rss), virtual_size (committed)"
     } else if cfg!(target_os = "linux") {
-        "/proc/self/smaps: Rss (rss), Size (committed)"
+        "/proc/self: resident set size (rss), virtual size (committed)"
     } else {
         "memory-stats"
     };
     json!({
         "rss_bytes": rss,
-        "rss_mb": rss.map(|b| b / (1024 * 1024)),
         "committed_bytes": committed,
-        "limit_mb": limit_mb,
+        "limit_bytes": limit_mb.map(|mb| mb * 1024 * 1024),
         "measured": rss.is_some(),
         "source": source,
     })
 }
 
-/// `20261017-142530` (UTC) for recovered file names.
+/// `20261017-142530` (UTC) for recovered file names: `<name>.recovered-<stamp>.<ext>`, the same
+/// form in every craft app.
 pub fn stamp() -> String {
     chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string()
 }

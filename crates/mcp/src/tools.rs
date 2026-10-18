@@ -59,9 +59,23 @@ fn obj(props: Value, required: &[&str]) -> Value {
 fn tool(name: &str, title: &str, desc: &str, schema: Value, read_only: bool) -> Value {
     let (destructive, idempotent) = hints(name, read_only);
     let mut schema = schema;
-    // WHIQ: every tool takes the caller's name (comments and document properties carry it).
+    // WHIQ: every tool takes the caller's name (comments and document properties carry it), and
+    // the arguments every craft app's tools take (CONTRACT-PARITY.md).
     if let Some(props) = schema.get_mut("properties").and_then(Value::as_object_mut) {
         props.insert("caller".into(), json!({"type": "string", "description": "Who is making this call (author of comments and of the saved file); default: the server's --author"}));
+        if !matches!(name, "server_status" | "job_status" | "list_jobs" | "cancel") {
+            props
+                .entry("async")
+                .or_insert(json!({"type": "boolean", "description": "Run as a job: answer at once with a job_id and poll job_status"}));
+            if !props.contains_key("offset") {
+                props
+                    .entry("continue_from")
+                    .or_insert(json!({"type": "integer", "minimum": 0, "description": "Where to resume a trimmed result (its continue_from)"}));
+            }
+            props.entry("max_bytes").or_insert(
+                json!({"type": "integer", "minimum": 0, "description": "Largest result to return before trimming (default --max-result-bytes)"}),
+            );
+        }
     }
     json!({"name": name, "title": title, "description": desc, "inputSchema": schema, "annotations": {
         "title": title,
@@ -84,7 +98,7 @@ fn hints(name: &str, read_only: bool) -> (bool, bool) {
         "save_presentation" | "export" | "build_deck" => (true, false),
         "set_text" | "adopt_template" => (true, true),
         "close_presentation" => (true, false),
-        "go_to_slide" | "select" | "select_tool" | "cancel" => (false, true),
+        "go_to_slide" | "select" | "select_tool" | "cancel" | "evict" => (false, true),
         _ => (false, false),
     }
 }
@@ -382,8 +396,8 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "job_status",
             "Job status",
-            "Progress and result of a job (a large open or an export of many slides) by job_id. Results stay available after the client timed out.",
-            obj(json!({"job_id": string("The job_id a call returned")}), &["job_id"]),
+            "Progress and result of a job (a large open, an export of many slides, any call past --job-after-ms or with async: true): status (running, done, failed, cancelled), progress 0..1, stage, steps and the stages passed, then its result or error. Results stay available after the client timed out. Without job_id: every job, like list_jobs.",
+            obj(json!({"job_id": string("The job_id a call returned")}), &[]),
             true,
         ),
         tool(
@@ -396,7 +410,20 @@ pub fn tool_definitions() -> Vec<Value> {
             ),
             false,
         ),
-        tool("list_jobs", "List jobs", "Every job of this server: id, kind, state, progress, result.", obj(json!({}), &[]), true),
+        tool(
+            "list_jobs",
+            "List jobs",
+            "Every job of this server (newest 200): job_id, tool, status, progress, stage, elapsed time, result.",
+            obj(json!({}), &[]),
+            true,
+        ),
+        tool(
+            "roundtrip_check",
+            "Round-trip check",
+            "Open and save a .pptx/.potx/.ppsx in memory (without touching the open presentations or the file) and report whether anything would be dropped: parts, relationships, content types, binary parts, and the elements of every XML part. Use it on a customer's deck before editing it.",
+            obj(json!({"path": string("The .pptx, .potx or .ppsx file")}), &["path"]),
+            true,
+        ),
         tool(
             "evict",
             "Evict documents",
@@ -457,11 +484,24 @@ pub fn call_tool(b: &mut dyn Backend, name: &str, a: &Value) -> ToolResult {
             let commands = a.get("commands").and_then(Value::as_array).cloned().unwrap_or_default();
             let n = commands.len();
             deckcraft_engine::task::phase("running commands", 0.0, 1.0);
+            // WHIQ parity pass: a cancelled batch is undone as a whole (the presentation as it was
+            // before the call), as in every craft app.
+            let before = b.session().and_then(|s| s.active_index().zip(s.active().cloned()));
             for (k, c) in commands.into_iter().enumerate() {
                 let id = c.get("command").and_then(Value::as_str).unwrap_or("");
                 // WHIQ: a safe point between commands, with the progress of the batch.
                 if let Err(e) = deckcraft_engine::task::step(k, n) {
-                    out.push(json!({"command": id, "ok": false, "error": e.to_string()}));
+                    let mut rolled = false;
+                    if let (Some((i, st)), Some(s)) = (before, b.session())
+                        && s.active_index() == Some(i)
+                        && let Some(a) = s.active_mut()
+                        && a.uid == st.uid
+                    {
+                        *a = st;
+                        rolled = true;
+                    }
+                    let note = if rolled { "; the batch was undone (the presentation is as it was before it)" } else { "" };
+                    out.push(json!({"command": id, "ok": false, "error": format!("{e}{note}")}));
                     return ToolResult { content: vec![json!({"type": "text", "text": Value::Array(out).to_string()})], is_error: true };
                 }
                 match exec(b, id, c.get("params").cloned().unwrap_or(json!({}))) {
