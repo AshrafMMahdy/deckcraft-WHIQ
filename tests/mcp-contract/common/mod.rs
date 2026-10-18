@@ -251,8 +251,14 @@ impl Drop for Mcp {
 
 /// Files in `dir` whose name contains `needle`.
 pub fn files_with(dir: &Path, needle: &str) -> Vec<PathBuf> {
-    let mut v: Vec<PathBuf> =
-        std::fs::read_dir(dir).unwrap().flatten().map(|e| e.path()).filter(|p| p.file_name().unwrap().to_string_lossy().contains(needle)).collect();
+    let mut v: Vec<PathBuf> = std::fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.file_name().unwrap().to_string_lossy().contains(needle))
+        // Not an atomic write's temporary file (`<name>.<pid>.<n>.saving`).
+        .filter(|p| needle.contains(".saving") || !p.to_string_lossy().ends_with(".saving"))
+        .collect();
     v.sort();
     v
 }

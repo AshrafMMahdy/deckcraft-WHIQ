@@ -248,6 +248,9 @@ pub struct Shared {
     /// The running call's request id, and the job it became (past `job_after_ms`, `async`, or a
     /// client that gave up on it): its answer then goes to the job.
     pub current_request: Mutex<Option<(Value, Option<String>)>>,
+    /// The running call's `_meta.progressToken`, with the progress last notified and when
+    /// (`notifications/progress`, as WordCraft and GridCraft send).
+    pub current_token: Mutex<Option<(Value, f64, Option<Instant>)>>,
     /// Checkpoints of the open presentations, by document id (see `checkpoint.rs`).
     pub checkpoints: Mutex<BTreeMap<u64, crate::checkpoint::Checkpoint>>,
 }
@@ -275,6 +278,7 @@ impl Shared {
             backend_description: Mutex::new(String::new()),
             current_task: Mutex::new(None),
             current_request: Mutex::new(None),
+            current_token: Mutex::new(None),
             checkpoints: Mutex::new(BTreeMap::new()),
         })
     }

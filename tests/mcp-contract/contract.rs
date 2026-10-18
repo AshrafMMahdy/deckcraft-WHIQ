@@ -560,7 +560,8 @@ fn a_running_call_stops_at_a_safe_point_when_cancelled() {
 fn wait_for_file(dir: &std::path::Path, needle: &str) -> Vec<std::path::PathBuf> {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let f = files_with(dir, needle);
+        // Whole files only (an atomic write's temporary file shares the name's start).
+        let f: Vec<_> = files_with(dir, needle).into_iter().filter(|p| p.extension().is_some_and(|e| e == "pptx")).collect();
         if !f.is_empty() || Instant::now() > deadline {
             return f;
         }
@@ -696,4 +697,21 @@ fn server_status_has_the_shared_shape() {
     }
     assert_eq!(st["documents"][0]["active"], true, "{st}");
     assert!(st["fonts"]["faces"].is_number(), "{st}");
+}
+
+// Progress notifications for a call that asks for them (`_meta.progressToken`), as in every craft
+// app: the value only grows; the message names the stage.
+#[test]
+fn a_call_with_a_progress_token_gets_progress_notifications() {
+    let dir = scratch("progress");
+    let mut m = start(&dir, &[], HOOKS);
+    m.ok("new_presentation", json!({}));
+    let id = m.send("tools/call", json!({"name": "inspect_document", "arguments": {"_delay_ms": 2500}, "_meta": {"progressToken": "tok-1"}}));
+    let r = m.recv(id, Duration::from_secs(10));
+    assert_eq!(r["result"]["isError"], false, "{r}");
+    let notes: Vec<&Value> = m.seen.iter().filter(|n| n["method"] == "notifications/progress" && n["params"]["progressToken"] == "tok-1").collect();
+    assert!(notes.len() >= 2, "{:?}", m.seen);
+    let values: Vec<f64> = notes.iter().map(|n| n["params"]["progress"].as_f64().unwrap()).collect();
+    assert!(values.windows(2).all(|w| w[1] > w[0]), "progress only grows: {values:?}");
+    assert!(notes[0]["params"]["message"].as_str().unwrap().contains(" s)"), "{:?}", notes[0]);
 }

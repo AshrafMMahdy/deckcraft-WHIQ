@@ -139,7 +139,8 @@ pub fn scan(dir: &Path) -> Vec<Recovered> {
         .flatten()
         .filter_map(|e| {
             let name = e.file_name().to_string_lossy().to_string();
-            if !name.contains(".recovered-") || name.starts_with("OLD_") {
+            // Not an atomic write's temporary file a crash left (`<name>.<pid>.<n>.saving`).
+            if !name.contains(".recovered-") || name.starts_with("OLD_") || name.ends_with(".saving") {
                 return None;
             }
             let meta = e.metadata().ok().filter(|m| m.is_file())?;

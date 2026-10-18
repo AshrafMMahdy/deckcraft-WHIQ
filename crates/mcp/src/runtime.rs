@@ -270,6 +270,38 @@ fn busy_reply(p: &Pending, shared: &Shared) -> Option<Value> {
     }
 }
 
+/// A `notifications/progress` for the running call when its request carries a progress token and
+/// there is news (a step done, or a second gone by): the progress value only ever grows, `total`
+/// when the steps are counted, a message with the stage and the time (as in every craft app).
+fn progress_notification(shared: &Shared) -> Option<Value> {
+    let mut slot = lock(&shared.current_token);
+    let (token, sent, sent_at) = slot.as_mut()?;
+    let task = shared.current_task()?;
+    let (done, total) = task.progress();
+    let now = Instant::now();
+    let counted = total > 0 && (done as f64) > *sent;
+    let beat = sent_at.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(1));
+    if !counted && !beat {
+        return None;
+    }
+    let value = if counted { done as f64 } else { *sent + 0.001 };
+    *sent = value;
+    *sent_at = Some(now);
+    let (tool, ms) = shared.current().unwrap_or_default();
+    let stage = task.stage();
+    let stage = if stage.is_empty() { tool } else { stage };
+    let secs = ms / 1000;
+    let mut params = json!({"progressToken": token.clone(), "progress": value, "message": if total > 0 {
+        format!("{stage}: {done} of {total} ({secs} s)")
+    } else {
+        format!("{stage} ({secs} s)")
+    }});
+    if total > 0 {
+        params["total"] = json!(total);
+    }
+    Some(json!({"jsonrpc": "2.0", "method": "notifications/progress", "params": params}))
+}
+
 /// The running call becomes a job (once): its caller is told the `job_id` at once (unless the
 /// client gave up on it: `quiet`), and the worker hands the answer to the job.
 fn hand_off(shared: &Arc<Shared>, out: &Out, quiet: Option<()>) {
@@ -332,6 +364,8 @@ pub fn serve(server: Server, input: impl BufRead + Send + 'static, output: impl 
                     .map(|t| contract::resolve_tool(t, &crate::server::tool_names()).map(str::to_string).unwrap_or_else(|_| t.to_string()));
                 shared.set_current(Some(tool_name.as_deref().unwrap_or_else(|| p.msg.get("method").and_then(Value::as_str).unwrap_or("request"))));
                 *lock(&shared.current_request) = p.id.clone().filter(|_| p.tool.is_some()).map(|id| (id, None));
+                *lock(&shared.current_token) =
+                    p.msg.pointer("/params/_meta/progressToken").filter(|t| t.is_string() || t.is_number()).map(|t| (t.clone(), 0.0, None));
                 // `async: true` on a tool with no job of its own: a job from the start.
                 let wants_job = p.msg.pointer("/params/arguments/async").is_some_and(|a| a == true || a == "true")
                     && !matches!(tool_name.as_deref(), Some("open_presentation" | "export"));
@@ -343,6 +377,7 @@ pub fn serve(server: Server, input: impl BufRead + Send + 'static, output: impl 
                     s.handle(p.msg)
                 };
                 shared.set_current(None);
+                *lock(&shared.current_token) = None;
                 // The answer goes to its caller, or to the job the call became.
                 let job = lock(&shared.current_request).take().and_then(|(_, j)| j);
                 match (job, reply) {
@@ -364,6 +399,10 @@ pub fn serve(server: Server, input: impl BufRead + Send + 'static, output: impl 
             let mut last_memory_evict: Option<Instant> = None;
             while !stop.load(Ordering::SeqCst) {
                 std::thread::sleep(Duration::from_millis(50));
+                // The running call's progress, to a client that asked for it.
+                if let Some(n) = progress_notification(&shared) {
+                    write_line(&out, &n);
+                }
                 // A call past its time carries on as a job.
                 if job_after > 0
                     && let Some((_, ms)) = shared.current()

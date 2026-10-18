@@ -395,6 +395,15 @@ impl Server {
         if name != raw_name {
             warnings.push(format!("tool `{raw_name}` read as `{name}`"));
         }
+        // Arguments that are not an object can't be understood (as in every craft app).
+        if !raw_args.is_object() && !raw_args.is_null() {
+            let e = ToolError::new(
+                code::INVALID_ARGUMENT,
+                format!("arguments must be a JSON object, got {}", if raw_args.is_array() { "an array" } else { "a single value" }),
+                format!("send the arguments of `{name}` as an object, e.g. {{\"path\": \"deck.pptx\"}} (tools/list has its schema)"),
+            );
+            return self.finish(name, &json!({}), Err(e), warnings, vec![]);
+        }
         let schema = tool_def(name).and_then(|d| d.get("inputSchema").cloned()).unwrap_or(json!({}));
         let norm = contract::normalize_args(name, &schema, raw_args);
         warnings.extend(norm.warnings);
@@ -1007,6 +1016,15 @@ impl Server {
                     sc["warnings"] = Value::Array(all);
                 }
                 if !renamed.is_empty() {
+                    let mut all: Vec<Value> = sc.get("warnings").and_then(Value::as_array).cloned().unwrap_or_default();
+                    for r in &renamed {
+                        all.push(json!(format!(
+                            "{} existed: it was kept as {} (pass overwrite: true to replace a file)",
+                            r["path"].as_str().unwrap_or(""),
+                            r["previous"].as_str().unwrap_or("")
+                        )));
+                    }
+                    sc["warnings"] = Value::Array(all);
                     sc["previous_files_renamed"] = Value::Array(renamed.clone());
                     sc["notice"] = json!(format!(
                         "an existing file was kept: {} (pass overwrite: true to replace instead)",
