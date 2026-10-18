@@ -32,8 +32,10 @@ pub const CODES: &[&str] = &[
     "wrong_password",
 ];
 
+/// The binary under test: `$DECKCRAFT_CLI` (e.g. a release build), else the one cargo built for
+/// this test (the same override WordCraft's and GridCraft's suites take).
 pub fn bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_deckcraft-cli"))
+    std::env::var_os("DECKCRAFT_CLI").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_deckcraft-cli")))
 }
 
 /// A fresh scratch folder for one test.

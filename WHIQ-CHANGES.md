@@ -210,7 +210,7 @@ Release recipe:
 
 ```sh
 git clone https://github.com/storytold/craft-fonts ../craft-fonts
-git -C ../craft-fonts checkout 43913056ce82a3fdad0ef69f6b88d1dc922a8104   # the pin in .github/workflows/release.yml
+git -C ../craft-fonts checkout 43913056ce82a3fdad0ef69f6b88d1dc922a8104   # the pin the three craft forks share (whiq-release.yml)
 CRAFT_FONTS_DIR="$PWD/../craft-fonts" CRAFT_FONTS_REQUIRED=1 cargo build --release -p deckcraft-cli
 ```
 
@@ -279,6 +279,67 @@ written whole or not at all). Code: `crates/engine/src/task.rs` (`phase`, `Task:
 opening `.pptx` and `.deckcraft`), `task::tests::phases_map_their_steps_into_the_whole_and_never_go_back`,
 and `long_work_runs_as_a_job` (contract: PDF, PNG, `.pptx` export jobs and an open job report
 their stages; the open job is seen in "reading the file" while it runs).
+
+## Parity pass (2026-10-18): one contract surface for the three craft forks
+
+WordCraft, GridCraft and DeckCraft were built independently against the same contract; this pass
+read the three MCP servers side by side and gave them one shared surface. **`CONTRACT-PARITY.md`**
+(the same file in the three repositories) is the table: every contract item, what each app did
+before, and the one shape all three answer with now. Where an earlier section of this file says
+otherwise (an error code, a field name, a flag, a default), the parity pass and
+`CONTRACT-PARITY.md` are what holds. Domain tools keep their names.
+
+| Change | Ported from | Where | Tested by (`tests/mcp-contract/contract.rs` unless noted) |
+|---|---|---|---|
+| Error codes from the shared set of 18 (`contract::code::ALL`): `forbidden` → `outside_root` (with both roots), and `locked`, `disk_full`, `password_required`, `wrong_password`, `not_available`, `invalid_request` classified; `candidates` → `closest`; JSON-RPC errors carry `{code, reason, next_step}` in `data`; arguments that are not an object answer `invalid_argument` (were ignored) | WC, GC | `crates/mcp/src/contract.rs`, `server.rs`, `runtime.rs` | every answer: `common::Mcp::check` checks the code is in the shared list; `errors_have_a_code_a_reason_and_a_next_step` |
+| A call still running after `--job-after-ms` (15000), or sent with `async: true` (any tool), or one the client gave up on (`notifications/cancelled`), carries on as a job: its caller gets `{job_id, status: "running"}` and the answer (pictures included) waits in `job_status` — a client timeout no longer loses a long `build_deck` or `batch` | WC, GC | `runtime.rs` (`hand_off`, worker, watchdog), `state.rs` (`current_request`, `new_job_for`, `job_answered`) | `a_long_call_becomes_a_job_whose_result_survives` |
+| `job_status` in the shared shape: `status` (was `state`), `tool` (with the old `kind`'s meaning), `progress`, `stage`, `steps`, `stages`, `result` or `error` (a cancelled job's error too); `list_jobs` and `job_status {}` answer `{jobs}` (was a bare array) | WC, GC | `state.rs` (`Job::to_value`), `runtime.rs` | `long_work_runs_as_a_job` |
+| `cancel` answers `{cancelled, status: cancelling\|not_running\|…, job_id, tool, next_step}`; a cancelled `batch` puts the presentation back as it was before the call (the commands before the stop no longer stay) | WC, GC (rollback) | `runtime.rs`, `tools.rs` (`batch`) | `a_running_call_stops_at_a_safe_point_when_cancelled` (a 30 000-command batch cancelled: one slide left) |
+| Progress notifications: a request with `_meta.progressToken` gets `notifications/progress` while it runs | WC | `runtime.rs` (`progress_notification`) | `a_call_with_a_progress_token_gets_progress_notifications` |
+| Checkpoints write the recovered file itself, `<name>.recovered-<YYYYMMDD-HHMMSS>.<ext>` (was a separate `<name>.recovered-checkpoint-<id>.<ext>`); an auto-save of the same stretch of work (close, eviction, SIGTERM, end of input) brings that file up to date instead of writing a second one; `server_status.checkpoints` gains `pending_edits` and `writes`; the start-up scan skips a crash's `.saving` file | WC, GC | `checkpoint.rs` (`file_name`, `take_path`, `status`), `autosave.rs` (`write_recovered`, `free_name`, `scan`) | `a_hard_kill_loses_little_thanks_to_checkpoints`, `checkpoints_follow_time_and_go_once_the_work_is_saved` |
+| `server_status` in the shared shape: `documents` with `name`, `current_call` with `job_id` and the progress fields, `memory {rss_bytes, committed_bytes, limit_bytes, measured, source}` (was `rss_mb`, `limit_mb`), `fonts {source, faces, families, default, arabic}`, `evicted [{name, reason, recovered_path, original_path}]`, `recovered_files [{path, reason, original, at}]`, `limits.job_after_ms`; errors and answers use `recovered_path` / `original_path` (were `recovered`, `reopen`) | WC, GC | `server.rs` (`status_value`, `fonts_value`), `state.rs` | `server_status_has_the_shared_shape`, `eviction_auto_saves_and_the_next_call_names_the_file` |
+| Defaults: `--busy-after-ms` 300 (was 8000: a waiting call answered `busy` only after 8 s), `--open-job-mb` 20 (was 24; decimals accepted), checkpoints every 20 edits / 60 s (were 10 / 30); `--max-memory-mb` no longer floors at 16 | WC, GC | `state.rs` (`Config`), `apps/deckcraft-cli/src/main.rs`, `help.rs` | the suite passes the flags it needs |
+| Every tool takes `async`, `continue_from` (on list tools read as `offset`) and `max_bytes`; enum values in any case; a list given as `"a, b"` | WC, GC | `tools.rs` (`tool`), `contract.rs` (`coerce`, `COMMON_ARGS`), `server.rs` (`finish`) | `oversized_results_are_trimmed_and_continue`, `contract::tests` |
+| OLD_ renames also say so in `warnings` | WC, GC | `server.rs` (`finish`) | `saves_keep_the_previous_file_as_old` |
+| `roundtrip_check`: open + save a deck in memory and report what a save would drop — parts, relationships, content types, binary parts, each XML part's element inventory — with WordCraft's report keys | WC | `crates/mcp/src/roundtrip.rs` (new, the same as GridCraft's), `server.rs`, `tools.rs` | `roundtrip_check_reports_what_a_save_would_keep`, `roundtrip::tests`, `smoke.py` |
+| Annotations: `evict` idempotent; `roundtrip_check` read-only | — | `tools.rs` (`hints`) | `annotations_tell_reads_from_writes` |
+| The contract suite takes `DECKCRAFT_CLI` (another binary to test), as WordCraft's and GridCraft's take theirs | WC, GC | `tests/mcp-contract/common/mod.rs` | the release workflow |
+| `whiq-release.yml` and `engines.lock.example` (below) | — | `.github/workflows/whiq-release.yml`, `engines.lock.example` | the workflow runs the contract suite and `smoke.py` on the built binary |
+
+### Fonts: one craft-fonts pin for the three forks
+
+DeckCraft already pinned craft-fonts **`43913056ce82a3fdad0ef69f6b88d1dc922a8104`** (§9); WordCraft
+and GridCraft pin it now too, and `whiq-release.yml` checks it out.
+
+### Release workflow
+
+`.github/workflows/whiq-release.yml` (new; the upstream `release.yml` is untouched): on a tag
+`whiq-v*` (or Run workflow, with an optional tag to publish) it builds only `deckcraft-cli`, for
+`x86_64-unknown-linux-musl` (static: the host's glibc does not matter) on ubuntu-22.04 and
+`x86_64-pc-windows-msvc` (static C runtime) on windows-2022, with craft-fonts checked out at the
+pin and `CRAFT_FONTS_REQUIRED=1`; runs the contract suite (`mcp_contract`, `mcp_deck`) against the built binary on both (`DECKCRAFT_CLI`), and
+`smoke.py` (on Windows too) plus a "statically linked" check on Linux; and publishes a GitHub release with
+`deckcraft-cli-<tag>-linux-x86_64.tar.gz`, `deckcraft-cli-<tag>-windows-x86_64.zip` (binary, licences,
+the embedded fonts' licences, `CONTRACT-PARITY.md`, `WHIQ-CHANGES.md`, `BUILD.txt`), `SHA256SUMS`
+and `engines.lock`. Actions are pinned by commit (checkout, rust-toolchain, rust-cache, as in
+upstream CI) or by major (upload/download-artifact); no signing; no secrets (the job's own
+`GITHUB_TOKEN` publishes). `engines.lock.example` at the root shows the JSON the platform's build
+script reads: a list of `{app, tag, file, sha256}`, one per archive; the release's `engines.lock`
+is that file with the real hashes.
+
+
+### Test status after the parity pass (Linux x86_64, 2026-10-18, craft-fonts 43913056, `CRAFT_FONTS_REQUIRED=1`)
+
+- `cargo build --release -p deckcraft-cli` succeeds; against the release binary
+  (`DECKCRAFT_CLI=target/release/deckcraft-cli cargo test --release -p deckcraft-cli`): `mcp_contract`
+  21/21 (17 before, plus the call-job, `roundtrip_check`, `server_status` shape and progress
+  notification tests), `mcp_deck` 7/7, and the CLI's other tests; `smoke.py` passes on it.
+- `deckcraft-mcp` and `deckcraft-engine`: 358 tests pass, 0 fail, 1 ignored; with the CLI, 410 pass.
+  `cargo clippy --no-deps -D warnings` on `deckcraft-mcp` / `deckcraft-cli` passes. (A plain
+  `cargo clippy` stops at an upstream lint in `crates/model/src/trendline.rs:468`, "manual
+  `!Range::contains`", which Rust 1.97's clippy reports and the parity pass did not touch.)
+- musl: `cargo build --release --locked -p deckcraft-cli --target x86_64-unknown-linux-musl` gives a
+  `static-pie linked` binary; `mcp_contract` (21/21), `mcp_deck` (7/7) and `smoke.py` pass on it.
 
 ## Not done / known limits
 
