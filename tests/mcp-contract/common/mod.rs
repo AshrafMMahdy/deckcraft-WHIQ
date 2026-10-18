@@ -44,7 +44,7 @@ pub fn scratch(tag: &str) -> PathBuf {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     // Canonical, so it compares equal to the roots the server reports.
-    dir.canonicalize().unwrap()
+    plain_path(dir.canonicalize().unwrap())
 }
 
 pub struct Mcp {
@@ -295,4 +295,15 @@ pub fn png_size(bytes: &[u8]) -> (u32, u32) {
     assert!(bytes.starts_with(b"\x89PNG"), "not a PNG");
     let be = |i: usize| u32::from_be_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
     (be(16), be(20))
+}
+
+/// The canonical path in the form the server reports it: on Windows, canonicalize gives the verbatim `\\?\C:\...` form, while
+/// the server (and the person reading its answers) uses the plain `C:\...` path to the same folder. A UNC path keeps its prefix.
+pub fn plain_path(p: PathBuf) -> PathBuf {
+    if let Some(rest) = p.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
+        if !rest.starts_with(r"UNC\") {
+            return PathBuf::from(rest);
+        }
+    }
+    p
 }
