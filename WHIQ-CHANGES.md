@@ -341,6 +341,26 @@ is that file with the real hashes.
 - musl: `cargo build --release --locked -p deckcraft-cli --target x86_64-unknown-linux-musl` gives a
   `static-pie linked` binary; `mcp_contract` (21/21), `mcp_deck` (7/7) and `smoke.py` pass on it.
 
+## Platform pass (2026-10-20): OLD_ off, structured errors everywhere, file arguments
+
+| Change | Where | Tested by (`tests/mcp-contract/contract.rs`) |
+|---|---|---|
+| `--automation-no-old-copies`: saves, exports and `build_deck` replace files, with no `OLD_` copy and no `previous_files_renamed` (the platform keeps the backups, and no longer needs to pass `overwrite: true` on every call); `server_status.limits.old_copies` says which. Without the flag nothing changes. | `apps/deckcraft-cli/src/main.rs`, `help.rs`, `crates/mcp/src/state.rs` (`Config::keep_old`), `server.rs` | `old_copies_can_be_turned_off_for_a_supervisor` |
+| A line that is not JSON was answered with a bare `parse error` message; it now carries `{code, reason, next_step}` in `error.data` like every protocol error. A batch's failed steps (`results[].error`, stopped or with `keepGoing`) were the engine's message as a string; they are now the error object. | `crates/mcp/src/runtime.rs`, `server.rs` (`structured_steps`) | `errors_have_a_code_a_reason_and_a_next_step` |
+| `tools/list` names the files a tool reads: `_meta: {"whiq/files": {"read": [argument names], "opens": bool}}` on `open_presentation` (`path`, opens), `new_presentation` (opens), `build_deck` (`template`, opens; its `path` is the output), `adopt_template`, `roundtrip_check` and `insert_picture` (`path`). The same key in every craft app (CONTRACT-PARITY.md). | `crates/mcp/src/tools.rs` (`files_meta`) | `annotations_tell_reads_from_writes` |
+
+Also: a `collapsible_if` that Rust 1.97's clippy reports in the contract client (`plain_path`) is collapsed.
+
+Test status (Linux x86_64, craft-fonts 43913056): `cargo test --workspace --exclude deckcraft
+--no-fail-fast` (the desktop app needs ALSA headers this container lacks): every test passes but the
+same 12 `deckcraft-ui-egui` ones that need a GPU ("No adapter found"); `long_work_runs_as_a_job` is
+timing-sensitive under a loaded machine (failed once, passed on the next runs). `cargo clippy
+--no-deps -p deckcraft-mcp -p deckcraft-cli --all-targets -- -D warnings`, `cargo fmt --check`,
+`cargo xtask layers`, `assets` and `wasm` pass (a workspace clippy still stops at the upstream lint in
+`crates/model/src/trendline.rs:468`, below). `cargo build --release --locked -p deckcraft-cli`
+(`CRAFT_FONTS_REQUIRED=1`) succeeds; against that binary `mcp_contract` passes 22/22, `mcp_deck`
+7/7, and `smoke.py` passes.
+
 ## Not done / known limits
 
 - By design, not a gap: busy is per process — one worker serves calls in order (one process per

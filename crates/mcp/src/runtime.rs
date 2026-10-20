@@ -485,7 +485,9 @@ pub fn serve(server: Server, input: impl BufRead + Send + 'static, output: impl 
         let msg = match serde_json::from_str::<Value>(t) {
             Ok(m) => m,
             Err(e) => {
-                write_line(&out, &json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32700, "message": format!("parse error: {e}")}}));
+                // WHIQ: with the contract's code / reason / next step in `data`, as every protocol error.
+                let err = ToolError::new(code::INVALID_REQUEST, format!("parse error: {e}"), "send one JSON-RPC 2.0 object per line");
+                write_line(&out, &json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32700, "message": err.reason, "data": err.to_value()}}));
                 continue;
             }
         };

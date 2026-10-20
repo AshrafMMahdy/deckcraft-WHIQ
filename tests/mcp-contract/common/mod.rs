@@ -118,6 +118,19 @@ impl Mcp {
         id
     }
 
+    /// Send `line` as it is (not necessarily JSON) and wait for the answer without an id.
+    pub fn raw(&mut self, line: &str) -> Value {
+        self.write(line);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            match self.rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(v) if v["id"].is_null() && v.get("method").is_none() => return v,
+                Ok(v) => self.stash.push(v),
+                Err(e) => panic!("no answer to a raw line: {e:?}; stderr: {}", self.stderr()),
+            }
+        }
+    }
+
     pub fn send_call(&mut self, tool: &str, args: Value) -> u64 {
         self.send("tools/call", json!({"name": tool, "arguments": args}))
     }
@@ -300,10 +313,10 @@ pub fn png_size(bytes: &[u8]) -> (u32, u32) {
 /// The canonical path in the form the server reports it: on Windows, canonicalize gives the verbatim `\\?\C:\...` form, while
 /// the server (and the person reading its answers) uses the plain `C:\...` path to the same folder. A UNC path keeps its prefix.
 pub fn plain_path(p: PathBuf) -> PathBuf {
-    if let Some(rest) = p.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
-        if !rest.starts_with(r"UNC\") {
-            return PathBuf::from(rest);
-        }
+    if let Some(rest) = p.to_str().and_then(|s| s.strip_prefix(r"\\?\"))
+        && !rest.starts_with(r"UNC\")
+    {
+        return PathBuf::from(rest);
     }
     p
 }

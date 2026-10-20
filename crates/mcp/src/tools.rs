@@ -77,13 +77,33 @@ fn tool(name: &str, title: &str, desc: &str, schema: Value, read_only: bool) -> 
             );
         }
     }
-    json!({"name": name, "title": title, "description": desc, "inputSchema": schema, "annotations": {
+    let mut def = json!({"name": name, "title": title, "description": desc, "inputSchema": schema, "annotations": {
         "title": title,
         "readOnlyHint": read_only,
         "destructiveHint": destructive,
         "idempotentHint": idempotent,
         "openWorldHint": false
-    }})
+    }});
+    if let Some(files) = files_meta(name) {
+        def["_meta"] = json!({"whiq/files": files});
+    }
+    def
+}
+
+/// WHIQ: the files a tool reads, for a supervisor that stages them (`_meta["whiq/files"]`, the
+/// same in every craft app): `read` lists the arguments that name existing files the call reads;
+/// `opens` says the call opens or starts a presentation (it becomes the active one), which is the
+/// file of the first `read` argument when one is given. Tools that read no file have no entry.
+fn files_meta(name: &str) -> Option<Value> {
+    let (read, opens): (&[&str], bool) = match name {
+        "open_presentation" => (&["path"], true),
+        "new_presentation" => (&[], true),
+        // `path` is where the deck is saved, not read.
+        "build_deck" => (&["template"], true),
+        "adopt_template" | "roundtrip_check" | "insert_picture" => (&["path"], false),
+        _ => return None,
+    };
+    Some(json!({"read": read, "opens": opens}))
 }
 
 /// WHIQ contract §8: `(destructiveHint, idempotentHint)` per tool. Destructive: may delete or

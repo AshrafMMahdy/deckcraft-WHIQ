@@ -38,6 +38,9 @@ pub struct Config {
     pub checkpoint_edits: u64,
     /// … or once its oldest unsaved edit is this many seconds old; 0: never by time.
     pub checkpoint_secs: u64,
+    /// A save over an existing file renames it `OLD_<name>` unless the call passes `overwrite:
+    /// true`. Off (`--automation-no-old-copies`): saves replace files, a supervisor keeps backups.
+    pub keep_old: bool,
     /// `DECKCRAFT_MCP_TEST_HOOKS=1`: honour `_delay_ms` on calls and jobs (contract tests only).
     pub test_hooks: bool,
 }
@@ -58,6 +61,7 @@ impl Default for Config {
             max_memory_mb: None,
             checkpoint_edits: 20,
             checkpoint_secs: 60,
+            keep_old: true,
             test_hooks: std::env::var("DECKCRAFT_MCP_TEST_HOOKS").is_ok_and(|v| v == "1"),
         }
     }

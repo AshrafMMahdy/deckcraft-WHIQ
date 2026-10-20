@@ -625,6 +625,8 @@ fn mcp(args: &[String]) -> Result<(), String> {
             "--checkpoint-edits" => config.checkpoint_edits = number(value("an edit count (0: never)")?)?,
             "--checkpoint-secs" => config.checkpoint_secs = number(value("seconds (0: never)")?)?,
             "--export-job-slides" => config.export_job_slides = number(value("a slide count")?)?.max(1) as usize,
+            // WHIQ: the supervisor keeps the backups; saves replace files without OLD_ copies.
+            "--automation-no-old-copies" => config.keep_old = false,
             "--help" | "-h" => {
                 outln!("{}", help_page("mcp"));
                 return Ok(());

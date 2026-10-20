@@ -72,6 +72,17 @@ fn error(id: Value, code: i64, message: impl Into<String>) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message, "data": data}})
 }
 
+/// WHIQ: a batch's failed steps carry the contract's error object (`{code, reason, next_step}`), not
+/// only the engine's message.
+fn structured_steps(steps: &mut [Value], cx: &ErrorContext<'_>) {
+    for step in steps.iter_mut() {
+        if let Some(msg) = step.get("error").and_then(Value::as_str) {
+            let cmd = step.get("command").and_then(Value::as_str).unwrap_or_default();
+            step["error"] = contract::classify(&format!("{cmd}: {msg}"), cx).to_value();
+        }
+    }
+}
+
 /// A successful tool answer before it is shaped into a `CallToolResult`.
 struct Outcome {
     value: Value,
@@ -194,6 +205,7 @@ pub fn status_value(shared: &Shared) -> Value {
             "open_job_bytes": c.open_job_bytes,
             "export_job_slides": c.export_job_slides,
             "idle_evict_secs": c.idle_evict_secs,
+            "old_copies": c.keep_old,
         },
     })
 }
@@ -410,7 +422,7 @@ impl Server {
         let mut args = norm.args;
         let caller =
             args.as_object_mut().and_then(|o| o.remove("caller")).and_then(|v| v.as_str().map(str::to_string)).filter(|c| !c.trim().is_empty());
-        let overwrite = args.get("overwrite").and_then(Value::as_bool).unwrap_or(false);
+        let overwrite = !self.shared.config.keep_old || args.get("overwrite").and_then(Value::as_bool).unwrap_or(false);
         let delay_ms = if self.shared.config.test_hooks && !matches!(name, "open_presentation" | "export") {
             raw_args.get("_delay_ms").and_then(Value::as_u64).unwrap_or(0).min(60_000)
         } else {
@@ -695,12 +707,13 @@ impl Server {
         if r.is_error {
             // A batch reports every step; classify the one that failed.
             if name == "batch"
-                && let Ok(Value::Array(steps)) = serde_json::from_str::<Value>(&text)
+                && let Ok(Value::Array(mut steps)) = serde_json::from_str::<Value>(&text)
             {
                 let failed = steps.iter().rev().find(|s| s.get("ok") == Some(&json!(false))).cloned().unwrap_or(Value::Null);
                 let msg = failed.get("error").and_then(Value::as_str).unwrap_or("a command failed").to_string();
                 let cmd = failed.get("command").and_then(Value::as_str).unwrap_or_default().to_string();
                 let cx = self.error_context(name);
+                structured_steps(&mut steps, &cx);
                 let mut e = contract::classify(&format!("{cmd}: {msg}"), &cx);
                 e.next_step = format!("{} (the steps before it ran; pass keepGoing: true to run the rest anyway)", e.next_step);
                 return Err(e.with("results", Value::Array(steps)).with("failed_command", json!(cmd)));
@@ -717,7 +730,14 @@ impl Server {
             .and_then(|c| c.get("data"))
             .and_then(Value::as_str)
             .map(String::from);
-        let value = serde_json::from_str::<Value>(&text).unwrap_or(Value::String(text));
+        let mut value = serde_json::from_str::<Value>(&text).unwrap_or(Value::String(text));
+        // A batch run with keepGoing: its failed steps too.
+        if name == "batch"
+            && let Some(steps) = value.as_array_mut()
+        {
+            let cx = self.error_context(name);
+            structured_steps(steps, &cx);
+        }
         Ok(Outcome { value, image, warnings: vec![] })
     }
 

@@ -7,7 +7,7 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use common::{Mcp, files_with, scratch, zip_text};
+use common::{CODES, Mcp, files_with, scratch, zip_text};
 use serde_json::{Value, json};
 
 fn roots(dir: &std::path::Path) -> Vec<String> {
@@ -38,6 +38,10 @@ fn errors_have_a_code_a_reason_and_a_next_step() {
     // A protocol error carries the same shape in `data`.
     let v = m.request("nope/nope", json!({}));
     assert!(v["error"]["data"]["next_step"].is_string(), "{v}");
+    // A line that is not JSON too.
+    let v = m.raw("{not json");
+    assert_eq!((v["error"]["code"].as_i64(), v["error"]["data"]["code"].as_str()), (Some(-32700), Some("invalid_request")), "{v}");
+    assert!(v["error"]["data"]["next_step"].is_string(), "{v}");
     assert!(e["closest"].as_array().unwrap().iter().any(|c| c == "render_slide"), "{e}");
 
     m.ok("new_presentation", json!({}));
@@ -56,6 +60,16 @@ fn errors_have_a_code_a_reason_and_a_next_step() {
     let e = m.err("run_command", json!({"command": "slide.nwe"}));
     assert_eq!(e["code"], "not_found");
     assert!(e["closest"].to_string().contains("slide.new"), "{e}");
+    // A batch's failed steps carry the error object too, stopped or kept going.
+    let cmds = json!([{"command": "slide.new"}, {"command": "slide.go", "params": {"index": 99}}]);
+    let e = m.err("batch", json!({"commands": cmds}));
+    let step = &e["results"][1]["error"];
+    assert!(step["code"].as_str().is_some_and(|c| CODES.contains(&c)) && step["next_step"].is_string(), "{e}");
+    let r = m.ok("batch", json!({"commands": cmds, "keepGoing": true}));
+    let steps = r["result"].as_array().unwrap();
+    assert_eq!((steps[0]["ok"].as_bool(), steps[1]["ok"].as_bool()), (Some(true), Some(false)), "{r}");
+    assert_eq!(steps[1]["error"]["code"], step["code"], "{r}");
+    assert!(steps[1]["error"]["reason"].is_string() && steps[1]["error"]["next_step"].is_string(), "{r}");
 
     std::fs::write(dir.join("report-2026.pptx"), b"x").unwrap();
     let e = m.err("open_presentation", json!({"path": "report-2025.pptx"}));
@@ -340,6 +354,30 @@ fn saves_keep_the_previous_file_as_old() {
     assert!(files_with(&dir, ".saving").is_empty());
 }
 
+// §6 ─ for a supervisor that keeps the backups itself: --automation-no-old-copies, no OLD_ files.
+#[test]
+fn old_copies_can_be_turned_off_for_a_supervisor() {
+    let dir = scratch("no-old");
+    let mut m = start(&dir, &["--automation-no-old-copies"], &[]);
+    assert_eq!(m.ok("server_status", json!({}))["limits"]["old_copies"], false);
+    m.ok("new_presentation", json!({}));
+    m.ok("save_presentation", json!({"path": "deck.pptx"}));
+    m.ok("export", json!({"path": "s.png", "scale": 0.2}));
+    m.ok("add_slide", json!({"title": "v2"}));
+    for (tool, args) in [("save_presentation", json!({"path": "deck.pptx"})), ("export", json!({"path": "s.png", "scale": 0.2}))] {
+        let r = m.ok(tool, args);
+        assert!(r.get("previous_files_renamed").is_none() && r.get("notice").is_none(), "{r}");
+    }
+    assert!(files_with(&dir, "OLD_").is_empty(), "replaced in place, no OLD_ copies");
+    let r = m.ok("build_deck", json!({"slides": [{"layout": "bullets", "title": "T", "bullets": ["a"]}], "path": "deck.pptx"}));
+    assert!(r.get("previous_files_renamed").is_none(), "{r}");
+    assert!(files_with(&dir, "OLD_").is_empty());
+    let mut m2 = start(&dir, &[], &[]);
+    assert_eq!(m2.ok("server_status", json!({}))["limits"]["old_copies"], true, "on by default");
+    m2.ok("open_presentation", json!({"path": "deck.pptx"}));
+    assert!(m2.ok("inspect_document", json!({})).to_string().contains("\"T\""), "the last save is the file");
+}
+
 // §6 ─ paths are confined; relative paths land in the write root; links cannot escape.
 #[test]
 fn paths_are_confined_to_the_roots() {
@@ -408,6 +446,20 @@ fn annotations_tell_reads_from_writes() {
             assert_eq!(a["idempotentHint"], true, "{name}");
         }
         assert!(t["inputSchema"]["properties"]["caller"].is_object(), "{name} takes caller");
+    }
+    // `_meta["whiq/files"]`: the arguments naming files a call reads, and whether it opens a presentation.
+    let files = |n: &str| tools.iter().find(|t| t["name"] == n).unwrap()["_meta"]["whiq/files"].clone();
+    assert_eq!(files("open_presentation"), json!({"read": ["path"], "opens": true}));
+    assert_eq!(files("new_presentation"), json!({"read": [], "opens": true}));
+    assert_eq!(files("build_deck"), json!({"read": ["template"], "opens": true}), "build_deck's `path` is written, not read");
+    for n in ["adopt_template", "roundtrip_check", "insert_picture"] {
+        assert_eq!(files(n), json!({"read": ["path"], "opens": false}), "{n}");
+    }
+    assert!(files("save_presentation").is_null() && files("export").is_null(), "a save's path is written, not read");
+    for t in &tools {
+        for k in t["_meta"]["whiq/files"]["read"].as_array().into_iter().flatten() {
+            assert!(t["inputSchema"]["properties"][k.as_str().unwrap()].is_object(), "{}: `{k}` is in its schema", t["name"]);
+        }
     }
     // Every answer so far had structuredContent (Mcp::check); one of each kind.
     m.ok("new_presentation", json!({}));

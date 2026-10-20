@@ -126,7 +126,7 @@ and prints its answer as JSON. COMMAND [PARAMS] runs a command, as run --cmd doe
     },
     Subcommand {
         name: "mcp",
-        usage: "mcp [--connect PORT] [--sample] [--automation-read-root DIR] [--automation-write-root DIR] [--author NAME] [--busy-after-ms MS] [--job-after-ms MS] [--idle-evict-secs S] [--max-memory-mb MB] [--max-result-bytes N] [--open-job-mb MB] [--export-job-slides N] [--checkpoint-edits N] [--checkpoint-secs S]",
+        usage: "mcp [--connect PORT] [--sample] [--automation-read-root DIR] [--automation-write-root DIR] [--author NAME] [--busy-after-ms MS] [--job-after-ms MS] [--idle-evict-secs S] [--max-memory-mb MB] [--max-result-bytes N] [--open-job-mb MB] [--export-job-slides N] [--checkpoint-edits N] [--checkpoint-secs S] [--automation-no-old-copies]",
         summary: "serve the commands to an agent over MCP on stdio",
         details: "Runs a Model Context Protocol server on stdin and stdout. It works on its own presentation without a
 window, or with --connect PORT (or host:port) on the DeckCraft app started with --control PORT.
@@ -149,7 +149,8 @@ Against a hard kill, unsaved work is also checkpointed to its recovered file aft
 run lists the checkpoints it finds with the recovered files. (The same flags, names and shapes as
 WordCraft's and GridCraft's servers: CONTRACT-PARITY.md.)
 Saving never replaces a file silently: the old one is renamed OLD_<name> unless the call passes
-overwrite: true. --author NAME (or a call's `caller`) is put on comments and on the saved file.",
+overwrite: true; --automation-no-old-copies turns OLD_ copies off (saves replace files: the supervisor
+keeps the backups). --author NAME (or a call's `caller`) is put on comments and on the saved file.",
     },
     Subcommand {
         name: "bench",
