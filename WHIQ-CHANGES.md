@@ -369,6 +369,14 @@ timing-sensitive under a loaded machine (failed once, passed on the next runs). 
 (`CRAFT_FONTS_REQUIRED=1`) succeeds; against that binary `mcp_contract` passes 22/22, `mcp_deck`
 7/7, and `smoke.py` passes.
 
+## Stable document handles, `logo` read, a release that publishes whole (2026-10-20, whiq-v0.7.2)
+
+| Change | Where | Tested by (`tests/mcp-contract/contract.rs`) |
+|---|---|---|
+| A presentation is named by `document: "doc-<uid>"`, which stays the same while it is open (the window index shifted when another one closed). `open_presentation`, `new_presentation`, `build_deck` and an `open` job's result answer with it; the window index stays as `index`. Every presentation tool takes `document` (the handle, or the uid) and acts on that presentation; the presentation active before comes back after the call. `server_status.documents[].document`. `close_presentation {document?, discard?}` refuses unsaved changes (`failed`) unless `discard: true`, instead of auto-saving them, and the other presentations stay as they are. An unknown handle is `not_found` with `open_documents` and `closest`; with `--connect` a handle is `not_available`. Every dirty presentation was already recovered on SIGTERM, end of input and eviction. | `crates/mcp/src/server.rs` (`handle_of`, `select_handle`, `OPENS_DOCUMENT`, `close_active`, `adopt_pending`), `tools.rs` | `document_handles_keep_an_export_apart_from_the_open_presentation` |
+| `build_deck` reads `logo` (an image) as well as `template`: `_meta["whiq/files"].read` is `["template", "logo"]`. The read lists were checked against every tool's schema; images named inside `slides[]` (`image`, `images`) are not listed (they are not top-level arguments). | `tools.rs` (`files_meta`) | `annotations_tell_reads_from_writes` |
+| `whiq-release.yml` publish: draft first, each file uploaded on its own and checked after any failed upload, published once all are there (see WordCraft's WHIQ-CHANGES.md: its whiq-v0.7.1 run hit gh's retry of an upload that had arrived). | `.github/workflows/whiq-release.yml` | the upload function run against a stubbed `gh` |
+
 ## Not done / known limits
 
 - By design, not a gap: busy is per process — one worker serves calls in order (one process per

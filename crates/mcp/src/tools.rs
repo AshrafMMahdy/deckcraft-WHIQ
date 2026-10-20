@@ -77,6 +77,16 @@ fn tool(name: &str, title: &str, desc: &str, schema: Value, read_only: bool) -> 
             );
         }
     }
+    // WHIQ: every tool that acts on a presentation takes `document` (its handle); opening tools answer with it.
+    if !NO_DOCUMENT.contains(&name)
+        && !crate::server::OPENS_DOCUMENT.contains(&name)
+        && let Some(props) = schema.get_mut("properties").and_then(Value::as_object_mut)
+    {
+        props.insert(
+            "document".into(),
+            json!({"type": "string", "description": "The presentation to act on: the `document` handle open_presentation / new_presentation / build_deck returned (default: the active one)"}),
+        );
+    }
     let mut def = json!({"name": name, "title": title, "description": desc, "inputSchema": schema, "annotations": {
         "title": title,
         "readOnlyHint": read_only,
@@ -90,6 +100,22 @@ fn tool(name: &str, title: &str, desc: &str, schema: Value, read_only: bool) -> 
     def
 }
 
+/// WHIQ: tools that act on no presentation (no `document` argument).
+const NO_DOCUMENT: &[&str] = &[
+    "server_status",
+    "job_status",
+    "list_jobs",
+    "cancel",
+    "evict",
+    "list_commands",
+    "roundtrip_check",
+    "screenshot",
+    "call_app",
+    "key",
+    "pointer",
+    "select_tool",
+];
+
 /// WHIQ: the files a tool reads, for a supervisor that stages them (`_meta["whiq/files"]`, the
 /// same in every craft app): `read` lists the arguments that name existing files the call reads;
 /// `opens` says the call opens or starts a presentation (it becomes the active one), which is the
@@ -99,7 +125,7 @@ fn files_meta(name: &str) -> Option<Value> {
         "open_presentation" => (&["path"], true),
         "new_presentation" => (&[], true),
         // `path` is where the deck is saved, not read.
-        "build_deck" => (&["template"], true),
+        "build_deck" => (&["template", "logo"], true),
         "adopt_template" | "roundtrip_check" | "insert_picture" => (&["path"], false),
         _ => return None,
     };
@@ -402,8 +428,8 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "close_presentation",
             "Close presentation",
-            "Close the active presentation. Unsaved work is never discarded: it is auto-saved to a recovered file first and the answer names it.",
-            obj(json!({}), &[]),
+            "Close an open presentation (by its `document` handle, default the active one) to free its memory; the other open presentations are untouched. A presentation with unsaved changes stays open unless discard: true.",
+            obj(json!({"discard": boolean("Close even with unsaved changes (they are lost). Default false")}), &[]),
             false,
         ),
         tool(

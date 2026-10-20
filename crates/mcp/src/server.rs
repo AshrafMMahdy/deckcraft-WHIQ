@@ -83,6 +83,15 @@ fn structured_steps(steps: &mut [Value], cx: &ErrorContext<'_>) {
     }
 }
 
+/// WHIQ: the handle a presentation is named by (`document: "doc-<uid>"`), the same while it is open.
+pub fn handle_of(uid: u64) -> String {
+    format!("doc-{uid}")
+}
+
+/// WHIQ: tools that open or start a presentation (it becomes the active one; the answer names its
+/// `document` handle).
+pub const OPENS_DOCUMENT: &[&str] = &["open_presentation", "new_presentation", "build_deck"];
+
 /// A successful tool answer before it is shaped into a `CallToolResult`.
 struct Outcome {
     value: Value,
@@ -162,7 +171,7 @@ pub fn status_value(shared: &Shared) -> Value {
         .iter()
         .enumerate()
         .map(
-            |(i, d)| json!({"index": i, "name": d.title, "title": d.title, "path": d.path, "slides": d.slides, "dirty": d.dirty, "active": d.active}),
+            |(i, d)| json!({"document": handle_of(d.uid), "index": i, "name": d.title, "title": d.title, "path": d.path, "slides": d.slides, "dirty": d.dirty, "active": d.active}),
         )
         .collect();
     let current = shared.current().map(|(t, ms)| {
@@ -465,6 +474,34 @@ impl Server {
             }
         }
 
+        // WHIQ: `document` names the presentation a call acts on; the active one comes back after it.
+        let target = args.get("document").and_then(|v| v.as_str().map(str::to_string).or_else(|| v.as_u64().map(handle_of)));
+        let mut restore = None;
+        if let Some(h) = target.filter(|_| !OPENS_DOCUMENT.contains(&name)) {
+            let before = self.active_handle();
+            match self.select_handle(&h) {
+                Ok(()) => restore = before,
+                Err(_) if self.backend.session().is_none() => {
+                    let e = ToolError::new(
+                        code::NOT_AVAILABLE,
+                        "document handles exist in the in-process server only",
+                        "leave out `document`: the call acts on the app's active presentation",
+                    );
+                    return self.finish(name, &args, Err(e), warnings, vec![]);
+                }
+                Err(open) => {
+                    let e = ToolError::new(
+                        code::NOT_FOUND,
+                        format!("no open presentation has the handle `{h}` (closed, evicted or never opened)"),
+                        "use a handle from server_status `documents`, or open the file again with open_presentation",
+                    )
+                    .with("closest", json!(contract::closest(&h, open.iter().map(String::as_str), 3)))
+                    .with("open_documents", json!(open));
+                    return self.finish(name, &args, Err(e), warnings, vec![]);
+                }
+            }
+        }
+
         // Who is calling: comments and the saved file carry the name.
         let author = caller.clone().or_else(|| Some(self.shared.config.author.clone()).filter(|a| !a.is_empty()));
         if let (Some(a), Some(s)) = (&author, self.backend.session()) {
@@ -532,6 +569,16 @@ impl Server {
             {
                 o.value["path"] = json!(p);
             }
+            // WHIQ: a presentation opened or started is named by its handle (the window index stays as `index`).
+            if OPENS_DOCUMENT.contains(&name)
+                && o.value.get("job_id").is_none()
+                && let (Some(h), Some(v)) = (self.active_handle(), o.value.as_object_mut())
+            {
+                if let Some(i) = v.remove("document") {
+                    v.insert("index".into(), i);
+                }
+                v.insert("document".into(), json!(h));
+            }
             if let Some(files) = o.value.get_mut("files").and_then(Value::as_array_mut) {
                 for f in files.iter_mut() {
                     if let Some(p) = f.as_str().map(absolute) {
@@ -541,9 +588,33 @@ impl Server {
             }
             o
         });
+        if let Some(prev) = restore.filter(|_| name != "close_presentation") {
+            // The presentation active before comes back (when it is still open).
+            let _ = self.select_handle(&prev);
+        }
         let out = self.finish(name, &args, outcome, warnings, renamed);
         self.update_status();
         out
+    }
+
+    /// WHIQ: the active presentation's handle.
+    fn active_handle(&mut self) -> Option<String> {
+        self.backend.session().and_then(|s| s.active().map(|d| handle_of(d.uid)))
+    }
+
+    /// WHIQ: make the presentation with this handle (`doc-<uid>`, or the uid) the active one; `Err`
+    /// lists the open handles.
+    fn select_handle(&mut self, handle: &str) -> Result<(), Vec<String>> {
+        let Some(s) = self.backend.session() else { return Err(vec![]) };
+        let want = handle.trim().to_ascii_lowercase();
+        let uid = want.trim_start_matches("doc").trim_start_matches(['-', '_', ' ']).to_string();
+        match s.documents().iter().position(|d| d.uid.to_string() == uid) {
+            Some(i) => {
+                s.set_active(i);
+                Ok(())
+            }
+            None => Err(s.documents().iter().map(|d| handle_of(d.uid)).collect()),
+        }
     }
 
     fn dispatch(&mut self, name: &'static str, args: &Value, author: Option<&str>, overwrite: bool) -> Result<Outcome, ToolError> {
@@ -615,7 +686,7 @@ impl Server {
                 let ev = self.evict_all("evict");
                 Ok(Outcome::new(json!({"evicted": ev.iter().map(Evicted::to_value).collect::<Vec<_>>()})))
             }
-            "close_presentation" => self.close_active(),
+            "close_presentation" => self.close_active(args.get("discard").and_then(Value::as_bool).unwrap_or(false)),
             "open_presentation" => self.open(args),
             "export" => self.export(args, author, overwrite),
             "save_presentation" => {
@@ -878,21 +949,28 @@ impl Server {
         Ok(o)
     }
 
-    fn close_active(&mut self) -> Result<Outcome, ToolError> {
-        let roots = self.backend.automation_roots();
-        let shared = Arc::clone(&self.shared);
+    /// Close the active presentation (the one `document` named): refused with unsaved changes
+    /// unless `discard`; the other open presentations are untouched.
+    fn close_active(&mut self, discard: bool) -> Result<Outcome, ToolError> {
         let Some(s) = self.backend.session() else {
             return self.tool("run_command", &json!({"command": "file.close"})).map(|_| Outcome::new(json!({"closed": true})));
         };
         let Some(st) = s.active() else {
             return Err(ToolError::new(code::NO_DOCUMENT, "no presentation is open", "nothing to close"));
         };
-        let title = st.title();
-        let saved = crate::autosave::save_session(s, &shared, roots.as_ref(), "close", true, false);
+        let (title, handle) = (st.title(), handle_of(st.uid));
+        if st.is_dirty() && !discard {
+            return Err(ToolError::new(
+                code::FAILED,
+                format!("`{title}` has unsaved changes"),
+                "save_presentation it first (or pass discard: true to lose the changes); server_status lists the open presentations",
+            ));
+        }
         if let Some(i) = s.active_index() {
             s.close_document(i);
         }
-        Ok(Outcome::new(json!({"closed": true, "name": title, "recovered_path": saved.first().map(|r| r.path.clone())})))
+        let active = s.active().map(|d| handle_of(d.uid));
+        Ok(Outcome::new(json!({"closed": true, "name": title, "document": handle, "active_document": active})))
     }
 
     /// Auto-save every open presentation with unsaved work, then close them all.
@@ -959,7 +1037,16 @@ impl Server {
             let r = deckcraft_engine::file_access::confine(roots.as_ref(), || s.execute("file.adopt", &json!({"path": path, "token": token})));
             s.ui_requests.clear();
             match r {
-                Ok(v) => self.shared.job_done(&jid, v),
+                Ok(mut v) => {
+                    // WHIQ: the job's result names the presentation by its handle.
+                    if let (Some(d), Some(o)) = (s.active(), v.as_object_mut()) {
+                        if let Some(i) = o.remove("document") {
+                            o.insert("index".into(), i);
+                        }
+                        o.insert("document".into(), json!(handle_of(d.uid)));
+                    }
+                    self.shared.job_done(&jid, v)
+                }
                 Err(e) => {
                     let cx = self.error_context("open_presentation");
                     self.shared.job_failed(&jid, contract::classify(&e.to_string(), &cx).to_value());

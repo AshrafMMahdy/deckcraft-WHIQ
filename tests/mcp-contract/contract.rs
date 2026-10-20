@@ -354,6 +354,35 @@ fn saves_keep_the_previous_file_as_old() {
     assert!(files_with(&dir, ".saving").is_empty());
 }
 
+// Document handles: an export built beside the user's presentation never touches it.
+#[test]
+fn document_handles_keep_an_export_apart_from_the_open_presentation() {
+    let dir = scratch("handles");
+    let mut m = start(&dir, &[], &[]);
+    let user = m.ok("new_presentation", json!({}))["document"].as_str().unwrap().to_string();
+    m.ok("add_slide", json!({"title": "User slide"}));
+    let r = m.ok("build_deck", json!({"slides": [{"layout": "bullets", "title": "Export slide", "bullets": ["a"]}]}));
+    let export = r["document"].as_str().unwrap().to_string();
+    assert!(user.starts_with("doc-") && export.starts_with("doc-") && user != export, "{r}");
+    m.ok("save_presentation", json!({"path": "export.pptx", "document": export}));
+    // A call naming the user's presentation acts on it; the active one comes back after.
+    assert!(m.ok("inspect_document", json!({"document": user})).to_string().contains("User slide"));
+    assert!(m.ok("inspect_document", json!({})).to_string().contains("Export slide"));
+    let st = m.ok("server_status", json!({}));
+    let docs = st["documents"].as_array().unwrap();
+    assert!(docs.iter().any(|d| d["document"] == user.as_str() && d["dirty"] == true && d["active"] == false), "{st}");
+    assert!(docs.iter().any(|d| d["document"] == export.as_str() && d["dirty"] == false && d["active"] == true), "{st}");
+    // close_presentation: refused with unsaved changes; the saved export closes, the handle of the other stays.
+    assert_eq!(m.err("close_presentation", json!({"document": user}))["code"], "failed");
+    let r = m.ok("close_presentation", json!({"document": export}));
+    assert_eq!(r["active_document"], user.as_str(), "{r}");
+    assert!(m.ok("inspect_document", json!({})).to_string().contains("User slide"));
+    let e = m.err("inspect_document", json!({"document": export}));
+    assert_eq!((e["code"].as_str(), e["open_documents"].clone()), (Some("not_found"), json!([user])), "{e}");
+    m.ok("close_presentation", json!({"document": user, "discard": true}));
+    assert!(m.ok("server_status", json!({}))["documents"].as_array().unwrap().is_empty());
+}
+
 // §6 ─ for a supervisor that keeps the backups itself: --automation-no-old-copies, no OLD_ files.
 #[test]
 fn old_copies_can_be_turned_off_for_a_supervisor() {
@@ -451,7 +480,7 @@ fn annotations_tell_reads_from_writes() {
     let files = |n: &str| tools.iter().find(|t| t["name"] == n).unwrap()["_meta"]["whiq/files"].clone();
     assert_eq!(files("open_presentation"), json!({"read": ["path"], "opens": true}));
     assert_eq!(files("new_presentation"), json!({"read": [], "opens": true}));
-    assert_eq!(files("build_deck"), json!({"read": ["template"], "opens": true}), "build_deck's `path` is written, not read");
+    assert_eq!(files("build_deck"), json!({"read": ["template", "logo"], "opens": true}), "build_deck's `path` is written, not read");
     for n in ["adopt_template", "roundtrip_check", "insert_picture"] {
         assert_eq!(files(n), json!({"read": ["path"], "opens": false}), "{n}");
     }
