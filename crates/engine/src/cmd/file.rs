@@ -544,7 +544,7 @@ pub fn save_to_path(doc: &Presentation, format: &str, path: &str) -> Result<u64>
             let mut on = |stage: &'static str, done: usize, total: usize| {
                 if stage != last {
                     last = stage;
-                    let (lo, hi) = if stage == "writing slides" { (0.0, 0.5) } else { (0.5, 1.0) };
+                    let (lo, hi) = if stage == "writing slides" { (0.0, 0.5) } else { (0.5, 0.95) };
                     crate::task::phase(stage, lo, hi);
                 }
                 crate::task::step(done, total).is_ok()
@@ -553,18 +553,21 @@ pub fn save_to_path(doc: &Presentation, format: &str, path: &str) -> Result<u64>
             crate::io::write_file_streamed(path, &mut |file| {
                 let mut w = std::io::BufWriter::with_capacity(1 << 20, &mut *file);
                 n = deckcraft_pptx::export_into(doc, f, &mut w, &mut on).map_err(|e| e.to_string())?;
+                // The package is compressed into the file as it goes; what is left is its end.
+                crate::task::phase("writing the file", 0.95, 1.0);
                 std::io::Write::flush(&mut w).map_err(|e| e.to_string())
             })
             .map_err(|e| if crate::task::check().is_err() { crate::task::cancelled() } else { EngineError::Other(e) })?;
             Ok(n)
         }
         "deckcraft" => {
-            crate::task::phase("writing the presentation", 0.0, 1.0);
+            crate::task::phase("writing the presentation", 0.0, 0.95);
             let mut n = 0;
             crate::io::write_file_streamed(path, &mut |file| {
                 {
                     let mut w = std::io::BufWriter::with_capacity(1 << 20, &mut *file);
                     deckcraft_format::save_into(doc, &mut w).map_err(|e| e.to_string())?;
+                    crate::task::phase("writing the file", 0.95, 1.0);
                     std::io::Write::flush(&mut w).map_err(|e| e.to_string())?;
                 }
                 n = file.metadata().map(|m| m.len()).unwrap_or(0);
