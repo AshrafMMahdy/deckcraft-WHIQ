@@ -36,6 +36,14 @@ pub fn read_file_reporting(path: &str) -> Result<Vec<u8>, String> {
     std::fs::read(path).map_err(|e| format!("{path}: {e}"))
 }
 
+/// WHIQ: the file at `path` opened for reading (inside the read root): readers that stream it
+/// (a package's zip) instead of holding it in memory.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn open_file(path: &str) -> Result<std::fs::File, String> {
+    crate::file_access::check_read(path)?;
+    std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))
+}
+
 #[cfg(target_arch = "wasm32")]
 pub fn read_file(path: &str) -> Result<Vec<u8>, String> {
     Err(format!("{path}: files are opened through the browser on the web"))
@@ -65,6 +73,32 @@ pub fn write_file_reporting(path: &str, bytes: &[u8]) -> Result<(), String> {
 #[cfg(not(target_arch = "wasm32"))]
 fn write_file_with(path: &str, bytes: &[u8], report: bool) -> Result<(), String> {
     use std::io::Write;
+    write_file_by(path, &mut |file: &mut std::fs::File| {
+        // WHIQ: reporting under a task (a job), write in chunks with progress by bytes.
+        match crate::task::current().filter(|_| report) {
+            Some(t) => {
+                for (k, chunk) in bytes.chunks(4 << 20).enumerate() {
+                    t.set((k * (4 << 20)) as u64, bytes.len() as u64);
+                    file.write_all(chunk).map_err(|e| format!("{path}: {e}"))?;
+                }
+                t.set(bytes.len() as u64, bytes.len() as u64);
+                Ok(())
+            }
+            None => file.write_all(bytes).map_err(|e| format!("{path}: {e}")),
+        }
+    })
+}
+
+/// WHIQ: [`write_file`] with the bytes written by `fill` straight into the temporary sibling (a
+/// package streamed from the model and from spill files: nothing of it is held in memory). The
+/// same atomic rename, `OLD_` handling and folder sync apply.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn write_file_streamed(path: &str, fill: &mut dyn FnMut(&mut std::fs::File) -> Result<(), String>) -> Result<(), String> {
+    write_file_by(path, fill)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn write_file_by(path: &str, fill: &mut dyn FnMut(&mut std::fs::File) -> Result<(), String>) -> Result<(), String> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     crate::file_access::check_write(path)?;
@@ -81,22 +115,7 @@ fn write_file_with(path: &str, bytes: &[u8], report: bool) -> Result<(), String>
             Err(e) => return Err(err(e)),
         }
     };
-    // WHIQ: reporting under a task (a job), write in chunks with progress by bytes.
-    let written = match crate::task::current().filter(|_| report) {
-        Some(t) => {
-            let mut r = Ok(());
-            for (k, chunk) in bytes.chunks(4 << 20).enumerate() {
-                t.set((k * (4 << 20)) as u64, bytes.len() as u64);
-                r = file.write_all(chunk);
-                if r.is_err() {
-                    break;
-                }
-            }
-            t.set(bytes.len() as u64, bytes.len() as u64);
-            r.and_then(|()| file.sync_all())
-        }
-        None => file.write_all(bytes).and_then(|()| file.sync_all()),
-    };
+    let written = fill(&mut file).and_then(|()| file.sync_all().map_err(|e| format!("{path}: {e}")));
     drop(file);
     // WHIQ: under `keep_previous`, an existing file is renamed `OLD_<name>` first, never replaced.
     let kept = match written.as_ref() {
@@ -110,14 +129,14 @@ fn write_file_with(path: &str, bytes: &[u8], report: bool) -> Result<(), String>
             return Err(e);
         }
     };
-    let result = written.and_then(|()| std::fs::rename(&tmp, path));
+    let result = written.and_then(|()| std::fs::rename(&tmp, path).map_err(err));
     if let Err(e) = result {
         let _ = std::fs::remove_file(&tmp);
         // Put the previous file back where it was.
         if let Some(old) = &kept {
             let _ = std::fs::rename(old, path);
         }
-        return Err(err(e));
+        return Err(e);
     }
     if let Some(old) = kept {
         KEEP.with(|k| {

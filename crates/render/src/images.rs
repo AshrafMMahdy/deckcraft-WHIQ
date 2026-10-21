@@ -80,6 +80,18 @@ fn with<R>(f: impl FnOnce(&mut Cache) -> R) -> R {
     f(g.get_or_insert_with(Cache::default))
 }
 
+/// WHIQ: drop every decoded picture and animation the cache holds (a host under memory pressure
+/// sheds them before it closes a document). Returns the decoded bytes released.
+pub fn release_caches() -> usize {
+    with(|c| {
+        let n = c.bytes + c.anims.values().filter_map(|(_, a)| a.as_ref().map(|a| a.bytes())).sum::<usize>();
+        c.map.clear();
+        c.bytes = 0;
+        c.anims.clear();
+        n
+    })
+}
+
 fn adjust_key(a: &PictureAdjust) -> u64 {
     use std::hash::Hasher;
     // A real hash: an FNV-style xor-multiply mix let (b, c) and (-b, -c) collide (the sign bits

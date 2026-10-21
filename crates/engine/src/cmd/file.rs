@@ -182,32 +182,86 @@ pub struct LoadedFile {
     pub doc: Presentation,
     /// A native or PPTX file (saving goes back to it); an outline import has no file to save to.
     pub native: bool,
-    /// Pictures and media a `.deckcraft` file had lost or damaged.
+    /// Pictures and media a `.deckcraft` file had lost or damaged; WHIQ: and every part of a
+    /// `.pptx` the reader could not keep, with the reason. Either way the file opens as a
+    /// repaired copy, so a save never overwrites the original without them.
     pub damaged: Vec<String>,
+    /// WHIQ: parts of a `.pptx` nothing in the file refers to (`part`, bytes): PowerPoint drops
+    /// them on save and so does DeckCraft; the open answer and the save answer name them.
+    pub unreferenced: Vec<(String, u64)>,
 }
 
-/// Read and parse the presentation at `path`.
+/// Read and parse the presentation at `path`. WHIQ: a `.pptx` or `.deckcraft` is read from the
+/// open file, never whole into memory, and its large media goes to spill files on disk.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn read_presentation_file(path: &str) -> Result<LoadedFile> {
     crate::task::phase("reading the file", 0.0, 0.15);
+    let mut file = crate::io::open_file(path).map_err(EngineError::Other)?;
+    if deckcraft_format::sniff_reader(&mut file) {
+        crate::task::phase("reading the presentation", 0.15, 0.9);
+        let (doc, damaged) = deckcraft_format::load_reader(std::io::BufReader::new(file)).map_err(|e| EngineError::Other(e.to_string()))?;
+        crate::task::phase("adding it to the session", 0.9, 1.0);
+        return Ok(LoadedFile { path: path.to_string(), doc, native: true, damaged, unreferenced: vec![] });
+    }
+    let is_pptx = match file.try_clone() {
+        Ok(f) => deckcraft_pptx::sniff_reader(Box::new(std::io::BufReader::new(f))),
+        Err(_) => false,
+    };
+    if is_pptx {
+        crate::task::phase("reading slides", 0.15, 0.9);
+        let reader = Box::new(std::io::BufReader::with_capacity(1 << 16, file));
+        let (mut doc, report) = deckcraft_pptx::import_reader(reader, &mut |done, total| crate::task::step(done, total).is_ok())
+            .map_err(|e| if crate::task::check().is_err() { crate::task::cancelled() } else { EngineError::Other(e.to_string()) })?;
+        deckcraft_format::repair(&mut doc);
+        crate::task::phase("adding it to the session", 0.9, 1.0);
+        let unreferenced = report.unused.iter().filter(|(_, _, referenced)| !referenced).map(|(n, b, _)| (n.clone(), *b)).collect();
+        let mut damaged = report.not_kept;
+        damaged.extend(
+            report
+                .unused
+                .iter()
+                .filter(|(n, _, referenced)| *referenced && !rebuilt_on_save(n))
+                .map(|(n, b, _)| format!("part {n} ({b} bytes) is not a part DeckCraft keeps")),
+        );
+        return Ok(LoadedFile { path: path.to_string(), doc, native: true, damaged, unreferenced });
+    }
+    drop(file);
     let bytes = crate::io::read_file_reporting(path).map_err(EngineError::Other)?;
     crate::task::phase("reading the presentation", 0.15, 0.9);
     let (doc, damaged) = open_checked(path, &bytes)?;
     crate::task::phase("adding it to the session", 0.9, 1.0);
     let native = deckcraft_format::sniff(&bytes) || deckcraft_pptx::sniff(&bytes);
-    Ok(LoadedFile { path: path.to_string(), doc, native, damaged })
+    Ok(LoadedFile { path: path.to_string(), doc, native, damaged, unreferenced: vec![] })
+}
+
+/// WHIQ: package parts every save writes afresh from the model (properties, thumbnail), so not
+/// reading them loses nothing.
+fn rebuilt_on_save(part: &str) -> bool {
+    let p = part.to_ascii_lowercase();
+    p.starts_with("docprops/thumbnail") || p == "docprops/app.xml" || p == "docprops/core.xml"
 }
 
 /// Add a loaded presentation as the active document: the shared end of `file.open` and
 /// `file.adopt`. A damaged file opens as an untitled repaired copy, so Save can't overwrite the
 /// original with the empty media.
 fn adopt_loaded(s: &mut Session, f: LoadedFile) -> Result<Value> {
-    let LoadedFile { path, doc, native, damaged } = f;
+    let LoadedFile { path, doc, native, damaged, unreferenced } = f;
     let keep_path = native && damaged.is_empty();
     let i = add_opened(s, &path, keep_path.then(|| path.clone()), doc);
     report_damage(s, &damaged)?;
+    let st = s.doc_mut()?;
+    st.unreferenced_parts = unreferenced.clone();
     let st = s.doc()?;
-    Ok(json!({"document": i, "slides": st.doc.slides.len(), "missingFonts": st.missing_fonts, "damagedMedia": damaged}))
+    let mut out = json!({"document": i, "slides": st.doc.slides.len(), "missingFonts": st.missing_fonts, "damagedMedia": damaged});
+    if !unreferenced.is_empty() {
+        out["unreferencedParts"] = unreferenced_json(&unreferenced);
+    }
+    Ok(out)
+}
+
+/// WHIQ: parts nothing in the file refers to, as answers list them.
+pub fn unreferenced_json(parts: &[(String, u64)]) -> Value {
+    json!(parts.iter().map(|(p, b)| json!({"part": p, "bytes": b})).collect::<Vec<_>>())
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -383,6 +437,34 @@ pub fn writable_format_for_path(path: &str) -> Option<&'static str> {
 }
 
 /// Animated GIF bytes for `doc` with the options in `p` (see [`crate::gif_export::GifOptions::from_params`]).
+/// WHIQ: the GIF streamed into the file at `path` (one frame in memory): the output and the bytes.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn gif_to_path(doc: &Presentation, opts: &crate::gif_export::GifOptions, path: &str) -> Result<(crate::gif_export::GifOutput, u64)> {
+    crate::task::phase("rendering GIF frames", 0.0, 1.0);
+    let mut out = None;
+    let mut n = 0;
+    crate::io::write_file_streamed(path, &mut |file| {
+        {
+            let mut w = std::io::BufWriter::with_capacity(1 << 20, &mut *file);
+            out = Some(crate::gif_export::encode_into(doc, opts, &mut w).map_err(|e| e.to_string())?);
+            std::io::Write::flush(&mut w).map_err(|e| e.to_string())?;
+        }
+        n = file.metadata().map(|m| m.len()).unwrap_or(0);
+        Ok(())
+    })
+    .map_err(|e| if crate::task::check().is_err() { crate::task::cancelled() } else { EngineError::Other(e) })?;
+    let out = out.ok_or_else(|| EngineError::Other("the GIF was not written".into()))?;
+    Ok((out, n))
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn gif_to_path(doc: &Presentation, opts: &crate::gif_export::GifOptions, path: &str) -> Result<(crate::gif_export::GifOutput, u64)> {
+    let out = crate::gif_export::encode(doc, opts)?;
+    write_whole(path, &out.bytes)?;
+    let n = out.bytes.len() as u64;
+    Ok((out, n))
+}
+
 pub fn gif_bytes(doc: &Presentation, p: &Value) -> Result<Vec<u8>> {
     Ok(crate::gif_export::encode(doc, &crate::gif_export::GifOptions::from_params(p)?)?.bytes)
 }
@@ -441,10 +523,69 @@ fn save(s: &mut Session, p: &Value) -> Result<Value> {
         return Ok(json!({"needsPath": true}));
     };
     let format = str_param(p, "format").unwrap_or(format_for_path(&path));
-    let bytes = save_bytes(&s.doc()?.doc, format)?;
-    write_whole(&path, &bytes)?;
+    let bytes = save_to_path(&s.doc()?.doc, format, &path)?;
+    let dropped = std::mem::take(&mut s.doc_mut()?.unreferenced_parts);
     mark_saved(s, Some(path.clone()))?;
-    Ok(json!({"path": path, "bytes": bytes.len()}))
+    let mut out = json!({"path": path, "bytes": bytes});
+    if !dropped.is_empty() && matches!(format, "pptx" | "potx" | "ppsx") {
+        out["unreferencedPartsDropped"] = unreferenced_json(&dropped);
+    }
+    Ok(out)
+}
+
+/// WHIQ: write `doc` as `format` to `path`. A package (`pptx`, `potx`, `ppsx`, `deckcraft`) is
+/// streamed into the file: it is never held whole in memory, and media kept on disk is copied
+/// from its spill file. Other formats are encoded in memory first. Returns the file's bytes.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn save_to_path(doc: &Presentation, format: &str, path: &str) -> Result<u64> {
+    match format {
+        f @ ("pptx" | "potx" | "ppsx") => {
+            let mut last = "";
+            let mut on = |stage: &'static str, done: usize, total: usize| {
+                if stage != last {
+                    last = stage;
+                    let (lo, hi) = if stage == "writing slides" { (0.0, 0.5) } else { (0.5, 1.0) };
+                    crate::task::phase(stage, lo, hi);
+                }
+                crate::task::step(done, total).is_ok()
+            };
+            let mut n = 0;
+            crate::io::write_file_streamed(path, &mut |file| {
+                let mut w = std::io::BufWriter::with_capacity(1 << 20, &mut *file);
+                n = deckcraft_pptx::export_into(doc, f, &mut w, &mut on).map_err(|e| e.to_string())?;
+                std::io::Write::flush(&mut w).map_err(|e| e.to_string())
+            })
+            .map_err(|e| if crate::task::check().is_err() { crate::task::cancelled() } else { EngineError::Other(e) })?;
+            Ok(n)
+        }
+        "deckcraft" => {
+            crate::task::phase("writing the presentation", 0.0, 1.0);
+            let mut n = 0;
+            crate::io::write_file_streamed(path, &mut |file| {
+                {
+                    let mut w = std::io::BufWriter::with_capacity(1 << 20, &mut *file);
+                    deckcraft_format::save_into(doc, &mut w).map_err(|e| e.to_string())?;
+                    std::io::Write::flush(&mut w).map_err(|e| e.to_string())?;
+                }
+                n = file.metadata().map(|m| m.len()).unwrap_or(0);
+                Ok(())
+            })
+            .map_err(EngineError::Other)?;
+            Ok(n)
+        }
+        _ => {
+            let bytes = save_bytes(doc, format)?;
+            write_whole(path, &bytes)?;
+            Ok(bytes.len() as u64)
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn save_to_path(doc: &Presentation, format: &str, path: &str) -> Result<u64> {
+    let bytes = save_bytes(doc, format)?;
+    write_whole(path, &bytes)?;
+    Ok(bytes.len() as u64)
 }
 
 fn save_as(s: &mut Session, p: &Value) -> Result<Value> {
@@ -573,11 +714,12 @@ fn export(s: &mut Session, p: &Value) -> Result<Value> {
             if let Some(text) = p.get("slides").and_then(Value::as_str) {
                 gp["slides"] = json!(parse_slide_range(text, st.doc.slides.len())?);
             }
-            let out = crate::gif_export::encode(&st.doc, &crate::gif_export::GifOptions::from_params(&gp)?)?;
-            write_whole(&path, &out.bytes)?;
+            // WHIQ: streamed into the file a frame at a time; no cap on frames or size.
+            let opts = crate::gif_export::GifOptions::from_params(&gp)?;
+            let (out, n) = gif_to_path(&st.doc, &opts, &path)?;
             Ok(json!({
                 "path": path,
-                "bytes": out.bytes.len(),
+                "bytes": n,
                 "frames": out.frames,
                 "width": out.width,
                 "height": out.height,
@@ -585,9 +727,8 @@ fn export(s: &mut Session, p: &Value) -> Result<Value> {
             }))
         }
         "pptx" | "potx" | "ppsx" | "deckcraft" | "outline" | "txt" => {
-            let bytes = save_bytes(&st.doc, &format)?;
-            write_whole(&path, &bytes)?;
-            Ok(json!({"path": path, "bytes": bytes.len()}))
+            let bytes = save_to_path(&st.doc, &format, &path)?;
+            Ok(json!({"path": path, "bytes": bytes}))
         }
         other => Err(bad("file.export", format!("unknown format `{other}`"))),
     }

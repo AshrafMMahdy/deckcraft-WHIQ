@@ -66,7 +66,8 @@ pub fn write_recovered(
     let fmt = recovered_format(original);
     let stem = original.and_then(|p| Path::new(p).file_stem()).map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| title.to_string());
     let dir = recovery_dir(shared, original);
-    let bytes = deckcraft_engine::cmd::file::save_bytes(doc, fmt).map_err(|e| e.to_string())?;
+    // WHIQ: streamed into the file (spilled media from disk), never whole in memory.
+    let write = |path: &str| deckcraft_engine::cmd::file::save_to_path(doc, fmt, path).map(|_| ()).map_err(|e| e.to_string());
     // The same stretch of work already has a checkpoint: it becomes the recovered file (one file,
     // brought up to date, as in every craft app).
     let reuse = id.and_then(|(uid, _)| crate::checkpoint::take_path(shared, uid));
@@ -75,9 +76,9 @@ pub fn write_recovered(
         None => dir.join(free_name(&dir, &safe_stem(&stem), fmt)).to_string_lossy().to_string(),
     };
     let written = if reuse.is_some() {
-        file_access::confine(roots, || deckcraft_engine::io::write_file(&path, &bytes))
+        file_access::confine(roots, || write(&path))
     } else {
-        file_access::confine(roots, || deckcraft_engine::io::keep_previous(|| deckcraft_engine::io::write_file(&path, &bytes))).0
+        file_access::confine(roots, || deckcraft_engine::io::keep_previous(|| write(&path))).0
     };
     written?;
     let r = Recovered { path, title: title.to_string(), original: original.map(String::from), reason: reason.to_string(), at: now_rfc3339() };

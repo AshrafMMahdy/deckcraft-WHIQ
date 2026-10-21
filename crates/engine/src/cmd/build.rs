@@ -1800,7 +1800,7 @@ fn adopt_template(s: &mut Session, p: &Value) -> Result<Value> {
         let used = crate::media_refs::presentation_media(&tpl);
         let mut media_map: Vec<(deckcraft_model::MediaId, deckcraft_model::MediaId)> = vec![];
         for m in tpl.media.iter().filter(|m| used.contains(&m.id)) {
-            if let Some(id) = doc.add_media(&m.name, &m.content_type, m.data.as_ref().clone()) {
+            if let Some(id) = doc.adopt_media(m) {
                 media_map.push((m.id, id));
             }
         }

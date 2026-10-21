@@ -9,6 +9,23 @@
 /// ones (wasm32 has a 4 GiB address space in all).
 pub const DECODE_MEMORY_BUDGET: u64 = if cfg!(target_pointer_width = "64") { 4 << 30 } else { 1 << 30 };
 
+static LIMIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// WHIQ: the decoders' budget in this process: the host's memory budget once it is set
+/// ([`set_decode_memory_budget`], from `--max-memory-mb`), never more than
+/// [`DECODE_MEMORY_BUDGET`]. A stream past it fails with the decoder's error, which is reported.
+pub fn decode_memory_budget() -> u64 {
+    match LIMIT.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => DECODE_MEMORY_BUDGET,
+        b => b.min(DECODE_MEMORY_BUDGET),
+    }
+}
+
+/// Tie the decoders' budget to the host's memory budget (bytes; 0: the default).
+pub fn set_decode_memory_budget(bytes: u64) {
+    LIMIT.store(bytes, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// The shape of one decoded picture as a decoder allocates it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PictureShape {

@@ -205,8 +205,10 @@ pub fn picture(ctx: &mut dyn Canvas, pres: &Presentation, pf: &PictureFill, boun
     // Decode for the whole image's size on screen, not the box's: a cropped picture shows only part
     // of it, magnified (#762).
     let want = (dest.width().abs().max(dest.height().abs()) * px_scale).max(1.0);
-    let frame = gif_time.and_then(|t| images::gif_pixmap(&item.data, &pf.adjust, t));
-    let Some(pm) = frame.or_else(|| images::decode_for(&item.data, want, &pf.adjust)) else {
+    // WHIQ: a picture kept on disk (very large) is read in only while it is drawn.
+    let bytes = item.shared_bytes();
+    let frame = gif_time.and_then(|t| images::gif_pixmap(&bytes, &pf.adjust, t));
+    let Some(pm) = frame.or_else(|| images::decode_for(&bytes, want, &pf.adjust)) else {
         missing(ctx, bounds);
         return;
     };
@@ -225,7 +227,7 @@ pub fn picture(ctx: &mut dyn Canvas, pres: &Presentation, pf: &PictureFill, boun
         if !(*sx > 0.0 && *sy > 0.0 && sx.is_finite() && sy.is_finite()) {
             return;
         }
-        let (nw, nh) = images::natural_size(&item.data).unwrap_or((iw, ih));
+        let (nw, nh) = images::natural_size(&bytes).unwrap_or((iw, ih));
         // PowerPoint draws the tile at a whole number of output pixels.
         let k = px_scale.max(1e-9);
         let snap = |v: f64| (v * k).round().max(1.0) / k;

@@ -666,6 +666,16 @@ so drop --connect (or use --connect without the roots)"
             Box::new(h)
         }
     };
+    // WHIQ: the readers' in-memory limits are shares of the memory budget the host gave; spill
+    // files a killed process left behind go.
+    if let Some(mb) = config.max_memory_mb {
+        deckcraft_engine::model::spill::set_memory_budget(mb.saturating_mul(1 << 20));
+        deckcraft_engine::media::set_decode_memory_budget(mb.saturating_mul(1 << 20));
+    }
+    let swept = deckcraft_engine::model::spill::sweep_stale(std::time::Duration::from_secs(24 * 3600));
+    if swept > 0 {
+        eprintln!("deckcraft-cli: removed {swept} stale spill file(s) from {}", deckcraft_engine::model::spill::spill_dir().display());
+    }
     let found = config.write_root.as_deref().map(deckcraft_mcp::scan_recovered).unwrap_or_default();
     let server = Server::with_config(backend, config);
     for r in found {

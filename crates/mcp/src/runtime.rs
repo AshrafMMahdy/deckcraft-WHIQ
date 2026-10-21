@@ -100,6 +100,8 @@ fn install_signal_handler() {
                 crate::autosave::save_snapshots(&shared, roots.as_ref(), &shared.docs(), "signal");
             }
             let _ = lock(&out).flush();
+            // WHIQ: exit skips destructors: this process's spill files go now.
+            deckcraft_engine::model::spill::remove_own();
             std::process::exit(0);
         });
         if let Err(e) = r {
@@ -440,15 +442,33 @@ pub fn serve(server: Server, input: impl BufRead + Send + 'static, output: impl 
                         eprintln!("deckcraft-cli: evicted {} idle presentation(s)", ev.len());
                     }
                 }
+                // WHIQ: memory pressure never interrupts a write. Nothing is closed while a call or a
+                // job (an export, a save, an open) runs; caches are shed first; a presentation
+                // closed with unsaved work is auto-saved, and its next save is written from that
+                // copy (`Server::save_evicted`).
                 if let (Some(limit), Some(rss)) = (shared.config.max_memory_mb, crate::state::rss_bytes())
                     && rss / (1024 * 1024) > limit
                     && has_docs
+                    && quiet
+                    && shared.running_jobs() == 0
                     && last_memory_evict.is_none_or(|t| t.elapsed() > Duration::from_secs(10))
                     && let Ok(mut s) = server.try_lock()
                 {
                     last_memory_evict = Some(Instant::now());
-                    let ev = s.evict_all("memory");
-                    eprintln!("deckcraft-cli: memory {} MB over {limit} MB: evicted {} presentation(s)", rss / (1024 * 1024), ev.len());
+                    let shed = deckcraft_render::release_caches();
+                    let after = crate::state::rss_bytes().unwrap_or(rss);
+                    if after / (1024 * 1024) > limit {
+                        let ev = s
+                            .evict_all(&format!("memory: the server used {} MB, over its {limit} MB limit (--max-memory-mb)", after / (1024 * 1024)));
+                        eprintln!(
+                            "deckcraft-cli: memory {} MB over {limit} MB (after releasing {} MB of caches): evicted {} presentation(s)",
+                            after / (1024 * 1024),
+                            shed >> 20,
+                            ev.len()
+                        );
+                    } else {
+                        eprintln!("deckcraft-cli: memory back under {limit} MB after releasing {} MB of caches", shed >> 20);
+                    }
                 }
             }
         })?

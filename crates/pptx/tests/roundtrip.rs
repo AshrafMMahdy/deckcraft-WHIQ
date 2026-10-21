@@ -1070,6 +1070,7 @@ fn linked_pictures_are_written_with_r_link() {
         content_type: "image/png".into(),
         data: Arc::new(Vec::new()),
         link: Some("file:///tmp/linked.png".into()),
+        spill: None,
     });
     let mut pic = shape(&mut p, "Linked", 100.0, 100.0, 200.0, 150.0);
     pic.kind = ShapeKind::Picture { fill: PictureFill { media, ..Default::default() } };

@@ -189,7 +189,8 @@ impl MediaHost {
     pub fn play(&mut self, doc_uid: u64, doc: &Presentation, id: ShapeId, clip: &MediaClip, from: Option<f64>, owner: Owner) {
         self.ensure_doc(doc_uid);
         let Some(item) = doc.media(clip.media) else { return };
-        let bytes = item.data.clone();
+        // WHIQ: a clip kept on disk is read in to play.
+        let bytes = item.shared_bytes();
         let media_key = Arc::as_ptr(&bytes) as usize;
         let duration = if clip.duration_ms > 0 { clip.duration_ms as f64 / 1000.0 } else { self.duration_of(&bytes) };
         let spec = VoiceSpec {

@@ -1,22 +1,33 @@
 //! Open Packaging Conventions: the zip container, part names, relationships and content types.
+//!
+//! WHIQ: the package is read from its zip lazily. A part is inflated when the importer asks for
+//! it, so the file itself is never held in memory and no part is inflated that is not used.
+//! Large media (video, sound, other binary parts, very large pictures) is inflated straight into a
+//! spill file on disk ([`deckcraft_model::spill`]) and streamed from there into every save. The
+//! in-memory limits are shares of the process's memory budget, and every part the reader cannot
+//! keep is reported ([`Package::not_kept`]), never skipped in silence.
 
+use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::HashMap;
-use std::io::{Cursor, Read, Write};
+use std::io::{Cursor, Read, Seek, Write};
+use std::sync::Arc;
+
+use deckcraft_model::spill::{self, SpillFile};
 
 use crate::PptxError;
 use crate::xml::{self, A, W};
 
-/// Largest single part we decompress (media included).
-pub const MAX_PART: u64 = 512 * 1024 * 1024;
-/// Largest XML part we parse.
-pub const MAX_XML_PART: usize = 96 * 1024 * 1024;
-/// Total decompressed bytes accepted for one package.
+/// Largest single part inflated into memory at the smallest budget (XML, small media); the
+/// working limit is a quarter of the memory budget when that is more ([`Limits::from_budget`]).
+pub const MAX_PART: u64 = 96 * 1024 * 1024;
+/// Total bytes inflated into memory for one package at the smallest budget; twice the memory
+/// budget when that is more.
 pub const MAX_TOTAL: u64 = 2 * 1024 * 1024 * 1024;
-/// Total bytes we are willing to decompress for one package, counting parts we then discard
-/// (too large, or failing part-way): bounds inflate work, not just what is kept.
-pub const MAX_INFLATE_WORK: u64 = 2 * MAX_TOTAL;
-/// Maximum number of zip entries.
+/// Zip entries at the smallest budget (one entry costs about a kilobyte of index).
 pub const MAX_ENTRIES: usize = 50_000;
+/// A part inflated to disk that expands more than this many times over its compressed size, and
+/// past 256 MiB, is a zip bomb: refused (and reported), not written to disk.
+pub const MAX_SPILL_RATIO: u64 = 1_000;
 
 pub const NS_A: &str = "http://schemas.openxmlformats.org/drawingml/2006/main";
 pub const NS_R: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
@@ -36,33 +47,88 @@ pub const RT_MEDIA: &str = "http://schemas.microsoft.com/office/2007/relationshi
 pub const RT_MODEL3D: &str = "http://schemas.microsoft.com/office/2017/06/relationships/model3d";
 pub const RT_CORE: &str = "http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties";
 
+/// Anything a zip can be read from: the file on disk, or bytes in memory.
+pub trait ReadSeek: Read + Seek {}
+impl<T: Read + Seek> ReadSeek for T {}
+
+/// The reader's in-memory limits for one package.
+#[derive(Clone, Copy, Debug)]
+pub struct Limits {
+    /// One part inflated into memory.
+    pub part: u64,
+    /// Every part inflated into memory, together.
+    pub total: u64,
+    /// Inflate work into memory, counting parts then discarded.
+    pub work: u64,
+    pub entries: usize,
+}
+
+impl Limits {
+    /// Limits for a memory budget in bytes: a part a quarter of it, all parts twice it, never
+    /// below the fixed minimums above.
+    pub fn from_budget(budget: u64) -> Limits {
+        let total = budget.saturating_mul(2).max(MAX_TOTAL);
+        Limits {
+            part: (budget / 4).max(MAX_PART),
+            total,
+            work: total.saturating_mul(2),
+            entries: usize::try_from(budget / 1024).unwrap_or(usize::MAX).max(MAX_ENTRIES),
+        }
+    }
+}
+
+struct Entry {
+    name: String,
+    index: usize,
+    size: u64,
+    compressed: u64,
+    data: OnceCell<Option<Vec<u8>>>,
+    used: Cell<bool>,
+}
+
+/// A media part's bytes as the reader hands them over.
+pub enum Payload {
+    Mem(Vec<u8>),
+    Disk(SpillFile),
+}
+
 /// The files of a package, keyed by normalised part name (no leading slash, lowercase).
 pub struct Package {
-    parts: HashMap<String, (String, Vec<u8>)>,
+    zip: RefCell<zip::ZipArchive<Box<dyn ReadSeek>>>,
+    entries: HashMap<String, Entry>,
+    limits: Limits,
+    in_memory: Cell<u64>,
+    work: Cell<u64>,
+    not_kept: RefCell<Vec<String>>,
+    content_types: OnceCell<Option<xml::Doc>>,
 }
 
 impl Package {
+    /// A package in memory (tests, data handed over as bytes). The bytes are copied once.
     pub fn open(bytes: &[u8]) -> Result<Self, PptxError> {
-        Self::open_within(bytes, MAX_PART, MAX_TOTAL, MAX_INFLATE_WORK)
+        Self::open_reader(Box::new(Cursor::new(bytes.to_vec())))
     }
-    /// [`Package::open`] with explicit limits: per part, kept in total, and inflated in total.
-    fn open_within(bytes: &[u8], max_part: u64, max_total: u64, max_work: u64) -> Result<Self, PptxError> {
-        let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|e| PptxError::NotPptx(format!("{e}")))?;
-        if zip.len() > MAX_ENTRIES {
-            return Err(PptxError::NotPptx(format!("too many entries ({})", zip.len())));
+    /// A package read from `r` (the file on disk), within the process's memory budget.
+    pub fn open_reader(r: Box<dyn ReadSeek>) -> Result<Self, PptxError> {
+        Self::open_within(r, Limits::from_budget(spill::memory_budget()))
+    }
+    /// [`Package::open_reader`] with explicit limits.
+    pub fn open_within(r: Box<dyn ReadSeek>, limits: Limits) -> Result<Self, PptxError> {
+        let mut zip = zip::ZipArchive::new(r).map_err(|e| PptxError::NotPptx(format!("{e}")))?;
+        if zip.len() > limits.entries {
+            return Err(PptxError::NotPptx(format!(
+                "too many entries ({}; this process's memory budget indexes up to {})",
+                zip.len(),
+                limits.entries
+            )));
         }
-        let mut parts = HashMap::new();
-        let mut total: u64 = 0;
-        let mut work: u64 = 0;
+        let mut entries = HashMap::new();
+        let mut not_kept = vec![];
         for i in 0..zip.len() {
-            if work >= max_work {
-                log::warn!("pptx: decompression budget spent; skipping the remaining {} entries", zip.len() - i);
-                break;
-            }
-            let mut f = match zip.by_index(i) {
+            let f = match zip.by_index_raw(i) {
                 Ok(f) => f,
                 Err(e) => {
-                    log::warn!("pptx: skipping unreadable zip entry {i}: {e}");
+                    not_kept.push(format!("zip entry {i} could not be read: {e}"));
                     continue;
                 }
             };
@@ -70,40 +136,127 @@ impl Package {
                 continue;
             }
             let name = f.name().trim_start_matches('/').to_string();
-            let declared = f.size();
-            if declared > max_part {
-                log::warn!("pptx: skipping oversized part {name} ({declared} bytes)");
-                continue;
-            }
-            let mut data = Vec::with_capacity(declared.min(16 * 1024 * 1024) as usize);
-            let cap = max_part.min(max_total.saturating_sub(total)).min(max_work.saturating_sub(work));
-            let read = (&mut f).take(cap.saturating_add(1)).read_to_end(&mut data);
-            // Charge what was inflated whether or not the part is kept.
-            work = work.saturating_add(data.len() as u64);
-            match read {
-                Ok(_) if data.len() as u64 > cap => {
-                    log::warn!("pptx: part {name} exceeds size limits; skipped");
-                    continue;
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    log::warn!("pptx: could not read {name}: {e}");
-                    continue;
-                }
-            }
-            total = total.saturating_add(data.len() as u64);
-            parts.insert(name.to_ascii_lowercase(), (name, data));
+            let e = Entry {
+                name: name.clone(),
+                index: i,
+                size: f.size(),
+                compressed: f.compressed_size(),
+                data: OnceCell::new(),
+                used: Cell::new(false),
+            };
+            entries.insert(name.to_ascii_lowercase(), e);
         }
-        Ok(Package { parts })
+        Ok(Package {
+            zip: RefCell::new(zip),
+            entries,
+            limits,
+            in_memory: Cell::new(0),
+            work: Cell::new(0),
+            not_kept: RefCell::new(not_kept),
+            content_types: OnceCell::new(),
+        })
+    }
+    fn note(&self, msg: String) {
+        log::warn!("pptx: {msg}");
+        let mut v = self.not_kept.borrow_mut();
+        if !v.contains(&msg) {
+            v.push(msg);
+        }
+    }
+    /// Every part the reader could not keep, with the reason, in the order met.
+    pub fn not_kept(&self) -> Vec<String> {
+        self.not_kept.borrow().clone()
+    }
+    /// Inflate an entry into memory within the limits (`None`, reported, past them).
+    fn inflate(&self, e: &Entry) -> Option<Vec<u8>> {
+        let (part, total, work) = (self.limits.part, self.limits.total, self.limits.work);
+        if e.size > part {
+            self.note(format!(
+                "part {} ({} MB unpacked) is larger than one part this process holds in memory ({} MB)",
+                e.name,
+                e.size >> 20,
+                part >> 20
+            ));
+            return None;
+        }
+        if self.work.get() >= work {
+            self.note(format!("part {}: the package inflated past {} MB in memory", e.name, work >> 20));
+            return None;
+        }
+        let cap = part.min(total.saturating_sub(self.in_memory.get())).min(work.saturating_sub(self.work.get()));
+        let mut zip = self.zip.borrow_mut();
+        let mut f = match zip.by_index(e.index) {
+            Ok(f) => f,
+            Err(err) => {
+                self.note(format!("part {} could not be read: {err}", e.name));
+                return None;
+            }
+        };
+        let mut data = Vec::with_capacity(e.size.min(16 * 1024 * 1024) as usize);
+        let read = (&mut f).take(cap.saturating_add(1)).read_to_end(&mut data);
+        self.work.set(self.work.get().saturating_add(data.len() as u64));
+        match read {
+            Ok(_) if data.len() as u64 > cap => {
+                self.note(format!("part {} inflates past the memory left for this package ({} MB)", e.name, cap >> 20));
+                None
+            }
+            Ok(_) => {
+                self.in_memory.set(self.in_memory.get().saturating_add(data.len() as u64));
+                Some(data)
+            }
+            Err(err) => {
+                self.note(format!("part {} could not be read: {err}", e.name));
+                None
+            }
+        }
+    }
+    fn entry(&self, name: &str) -> Option<&Entry> {
+        let e = self.entries.get(&norm(name))?;
+        e.used.set(true);
+        Some(e)
     }
     pub fn get(&self, name: &str) -> Option<&[u8]> {
-        self.parts.get(&norm(name)).map(|(_, d)| d.as_slice())
+        let e = self.entry(name)?;
+        e.data.get_or_init(|| self.inflate(e)).as_deref()
+    }
+    /// The unpacked size a part declares, without inflating it.
+    pub fn size_of(&self, name: &str) -> Option<u64> {
+        self.entries.get(&norm(name)).map(|e| e.size)
+    }
+    /// A media part's bytes: inflated into a spill file on disk when it is large
+    /// ([`spill::should_spill`]), else into memory. Not cached: the caller keeps them.
+    pub fn media(&self, name: &str, content_type: &str) -> Option<Payload> {
+        let e = self.entry(name)?;
+        if let Some(Some(d)) = e.data.get() {
+            return Some(Payload::Mem(d.clone()));
+        }
+        if !spill::should_spill(content_type, e.size) {
+            return self.inflate(e).map(Payload::Mem);
+        }
+        if e.size > 256 << 20 && e.size / e.compressed.max(1) > MAX_SPILL_RATIO {
+            self.note(format!("part {} declares {} MB from {} KB compressed: refused as a zip bomb", e.name, e.size >> 20, e.compressed >> 10));
+            return None;
+        }
+        let mut zip = self.zip.borrow_mut();
+        let mut f = match zip.by_index(e.index) {
+            Ok(f) => f,
+            Err(err) => {
+                self.note(format!("part {} could not be read: {err}", e.name));
+                return None;
+            }
+        };
+        match SpillFile::from_reader(&mut f, e.size) {
+            Ok(s) => Some(Payload::Disk(s)),
+            Err(err) => {
+                self.note(format!("part {} ({} MB) could not be kept on disk in {}: {err}", e.name, e.size >> 20, spill::spill_dir().display()));
+                None
+            }
+        }
     }
     /// An XML part's bytes, when it is within the XML size limit.
     pub fn xml_bytes(&self, name: &str) -> Option<&[u8]> {
         let b = self.get(name)?;
-        if b.len() > MAX_XML_PART {
-            log::warn!("pptx: XML part {name} too large");
+        if b.len() as u64 > self.limits.part {
             return None;
         }
         Some(b)
@@ -111,17 +264,45 @@ impl Package {
     /// Parse an XML part.
     pub fn xml(&self, name: &str) -> Option<xml::Doc> {
         let b = self.get(name)?;
-        if b.len() > MAX_XML_PART {
-            log::warn!("pptx: XML part {name} too large");
-            return None;
-        }
         match xml::parse(b) {
             Ok(d) => Some(d),
             Err(e) => {
-                log::warn!("pptx: {name}: {e}");
+                self.note(format!("part {name} is not well-formed XML: {e}"));
                 None
             }
         }
+    }
+    /// Parts the reader never asked for, with their unpacked sizes: `(part, bytes, referenced)`,
+    /// where `referenced` tells a part some relationship points at from an orphan nothing does.
+    /// Relationship parts and the content types are bookkeeping and never listed.
+    pub fn unused_parts(&self) -> Vec<(String, u64, bool)> {
+        let unused: Vec<(String, u64)> = self
+            .entries
+            .values()
+            .filter(|e| !e.used.get())
+            .filter(|e| {
+                let n = e.name.to_ascii_lowercase();
+                !n.ends_with(".rels") && n != "[content_types].xml"
+            })
+            .map(|e| (e.name.clone(), e.size))
+            .collect();
+        if unused.is_empty() {
+            return vec![];
+        }
+        // Every internal target of every relationship part.
+        let rels: Vec<String> = self.entries.values().filter(|e| e.name.to_ascii_lowercase().ends_with(".rels")).map(|e| e.name.clone()).collect();
+        let mut targets = std::collections::HashSet::new();
+        for r in rels {
+            let part = rels_source(&r);
+            if let Some(doc) = self.get(&r).and_then(|b| xml::parse(b).ok()) {
+                for rel in rels_of(&doc, &part).items.into_iter().filter(|x| !x.external) {
+                    targets.insert(norm(&rel.target));
+                }
+            }
+        }
+        let mut out: Vec<(String, u64, bool)> = unused.into_iter().map(|(n, b)| (n.clone(), b, targets.contains(&norm(&n)))).collect();
+        out.sort();
+        out
     }
     /// Relationships of a part (`ppt/slides/slide1.xml` → `ppt/slides/_rels/slide1.xml.rels`).
     pub fn rels(&self, part: &str) -> Rels {
@@ -131,7 +312,7 @@ impl Package {
     }
     /// Content types: (extension defaults, part overrides).
     pub fn content_type(&self, part: &str) -> Option<String> {
-        let doc = self.xml("[Content_Types].xml")?;
+        let doc = self.content_types.get_or_init(|| self.xml("[Content_Types].xml")).as_ref()?;
         let p = format!("/{}", norm(part));
         for o in doc.root.children_named("Override") {
             if o.attr("PartName").is_some_and(|n| n.to_ascii_lowercase() == p) {
@@ -145,7 +326,7 @@ impl Package {
             .and_then(|d| d.attr("ContentType").map(String::from))
     }
     pub fn original_name(&self, name: &str) -> Option<&str> {
-        self.parts.get(&norm(name)).map(|(n, _)| n.as_str())
+        self.entries.get(&norm(name)).map(|e| e.name.as_str())
     }
 }
 
@@ -251,6 +432,16 @@ pub fn dir_of(part: &str) -> String {
 
 pub fn file_of(part: &str) -> &str {
     part.rsplit('/').next().unwrap_or(part)
+}
+
+/// The part a relationships part belongs to (`ppt/slides/_rels/slide1.xml.rels` →
+/// `ppt/slides/slide1.xml`, `_rels/.rels` → `""`).
+pub fn rels_source(rels: &str) -> String {
+    let rels = rels.trim_start_matches('/');
+    let (dir, file) = rels.rsplit_once('/').unwrap_or(("", rels));
+    let dir = dir.strip_suffix("_rels").unwrap_or(dir).trim_end_matches('/');
+    let file = file.strip_suffix(".rels").unwrap_or(file);
+    if dir.is_empty() { file.to_string() } else { format!("{dir}/{file}") }
 }
 
 pub fn rels_path(part: &str) -> String {
@@ -374,9 +565,40 @@ impl RelsOut {
     }
 }
 
+/// WHIQ: the bytes of a part being written: made for this save, shared with the model, or
+/// streamed from a spill file on disk.
+pub enum PartData {
+    Owned(Vec<u8>),
+    Shared(Arc<Vec<u8>>),
+    Disk(Arc<SpillFile>),
+}
+
+impl PartData {
+    fn len(&self) -> u64 {
+        match self {
+            PartData::Owned(v) => v.len() as u64,
+            PartData::Shared(v) => v.len() as u64,
+            PartData::Disk(s) => s.len(),
+        }
+    }
+    fn write_to(&self, w: &mut dyn Write) -> std::io::Result<()> {
+        match self {
+            PartData::Owned(v) => w.write_all(v),
+            PartData::Shared(v) => w.write_all(v),
+            PartData::Disk(s) => s.copy_to(w).map(|_| ()),
+        }
+    }
+}
+
+impl From<Vec<u8>> for PartData {
+    fn from(v: Vec<u8>) -> Self {
+        PartData::Owned(v)
+    }
+}
+
 /// A package being written.
 pub struct PackageOut {
-    files: Vec<(String, Vec<u8>, bool)>,
+    files: Vec<(String, PartData, bool)>,
     defaults: Vec<(String, String)>,
     overrides: Vec<(String, String)>,
 }
@@ -402,33 +624,41 @@ impl PackageOut {
     }
     pub fn xml_part(&mut self, name: &str, content_type: &str, data: Vec<u8>) {
         self.overrides.push((format!("/{name}"), content_type.to_string()));
-        self.files.push((name.to_string(), data, true));
+        self.files.push((name.to_string(), data.into(), true));
     }
     pub fn rels(&mut self, part: &str, rels: &RelsOut) {
         if rels.items.is_empty() {
             return;
         }
-        self.files.push((rels_path(part), rels.to_xml(), true));
+        self.files.push((rels_path(part), rels.to_xml().into(), true));
     }
     /// Add a part with no content type of its own (a relationships part).
     pub fn raw(&mut self, name: &str, data: Vec<u8>) {
-        self.files.push((name.to_string(), data, true));
+        self.files.push((name.to_string(), data.into(), true));
     }
     /// Add a binary part; its extension gets a Default content type.
-    pub fn binary(&mut self, name: &str, content_type: &str, data: Vec<u8>) {
+    pub fn binary(&mut self, name: &str, content_type: &str, data: impl Into<PartData>) {
         let ext = name.rsplit('.').next().unwrap_or("bin").to_ascii_lowercase();
         if !self.defaults.iter().any(|(e, _)| *e == ext) {
             self.defaults.push((ext, content_type.to_string()));
         } else if !self.defaults.iter().any(|(e, c)| *e == ext && c == content_type) {
             self.overrides.push((format!("/{name}"), content_type.to_string()));
         }
-        self.files.push((name.to_string(), data, false));
+        self.files.push((name.to_string(), data.into(), false));
     }
     /// The package's bytes. WHIQ: `on(stage, done, total)` is told the bytes compressed so far;
     /// `false` stops it.
     pub fn finish_with(self, on: &mut dyn FnMut(&'static str, usize, usize) -> bool) -> Result<Vec<u8>, PptxError> {
-        let total: usize = self.files.iter().map(|f| f.1.len()).sum();
-        let mut done = 0usize;
+        let mut cur = Cursor::new(Vec::new());
+        self.finish_into(&mut cur, on)?;
+        Ok(cur.into_inner())
+    }
+    /// WHIQ: write the package into `out` (a file: nothing of it is held in memory beyond the
+    /// part being compressed; spilled media streams from disk). Returns the bytes written.
+    pub fn finish_into<O: Write + Seek>(self, out: &mut O, on: &mut dyn FnMut(&'static str, usize, usize) -> bool) -> Result<u64, PptxError> {
+        let total: u64 = self.files.iter().map(|f| f.1.len()).sum();
+        let total_us = usize::try_from(total).unwrap_or(usize::MAX);
+        let mut done = 0u64;
         let mut ct = W::new();
         ct.open("Types", A::new().a("xmlns", "http://schemas.openxmlformats.org/package/2006/content-types"));
         for (e, c) in &self.defaults {
@@ -438,7 +668,8 @@ impl PackageOut {
             ct.empty("Override", A::new().a("PartName", p).a("ContentType", c));
         }
         ct.close("Types");
-        let mut zw = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let start = out.stream_position().unwrap_or(0);
+        let mut zw = zip::ZipWriter::new(&mut *out);
         let deflate = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
         let stored = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
         let err = |e: &dyn std::fmt::Display| PptxError::Write(e.to_string());
@@ -452,17 +683,18 @@ impl PackageOut {
                 log::warn!("pptx: part {name} written twice; keeping the first");
                 continue;
             }
-            if !on("compressing the package", done, total) {
+            if !on("compressing the package", usize::try_from(done).unwrap_or(usize::MAX), total_us) {
                 return Err(PptxError::Write("cancelled".into()));
             }
-            done += data.len();
-            let large = data.len() as u64 >= u32::MAX as u64 / 2;
+            done = done.saturating_add(data.len());
+            let large = data.len() >= u64::from(u32::MAX) / 2;
             let opts = if *compress { deflate } else { stored }.large_file(large);
             zw.start_file(name.as_str(), opts).map_err(|e| err(&e))?;
-            zw.write_all(data).map_err(|e| err(&e))?;
+            data.write_to(&mut zw).map_err(|e| err(&format!("{name}: {e}")))?;
         }
-        let cur = zw.finish().map_err(|e| err(&e))?;
-        Ok(cur.into_inner())
+        zw.finish().map_err(|e| err(&e))?;
+        let end = out.stream_position().unwrap_or(start);
+        Ok(end.saturating_sub(start))
     }
 }
 
@@ -486,12 +718,14 @@ mod tests {
         // work is charged, so after d the budget (130) is spent and e is not read, although it
         // would have fit.
         let z = zip_of(&[("a", 80), ("b", 80), ("c", 80), ("d", 80), ("e", 5)]);
-        let p = Package::open_within(&z, 1000, 100, 130).unwrap();
+        let lim = |work| Limits { part: 1000, total: 100, work, entries: 100 };
+        let p = Package::open_within(Box::new(Cursor::new(z.clone())), lim(130)).unwrap();
         assert!(p.get("a").is_some());
-        assert!(p.get("b").is_none() && p.get("d").is_none());
+        assert!(p.get("b").is_none() && p.get("c").is_none() && p.get("d").is_none());
+        assert!(p.not_kept().iter().any(|m| m.contains("part b")), "{:?}", p.not_kept());
         assert!(p.get("e").is_none(), "the inflate budget stops reading");
         // With room to spare the same small part is kept.
-        let p = Package::open_within(&z, 1000, 100, 10_000).unwrap();
+        let p = Package::open_within(Box::new(Cursor::new(z)), lim(10_000)).unwrap();
         assert!(p.get("e").is_some());
     }
 

@@ -279,9 +279,9 @@ fn bring_media(cmd: &str, doc: &mut deckcraft_model::Presentation, media: &[deck
     for m in media {
         match doc.media(m.id) {
             None => doc.media.push(m.clone()),
-            Some(x) if x.data == m.data => {}
+            Some(x) if x.same_bytes(m) => {}
             Some(_) => {
-                let id = doc.add_media(&m.name, &m.content_type, m.data.as_ref().clone()).ok_or_else(|| bad(cmd, NO_ID_SPACE))?;
+                let id = doc.adopt_media(m).ok_or_else(|| bad(cmd, NO_ID_SPACE))?;
                 map.insert(m.id, id);
             }
         }

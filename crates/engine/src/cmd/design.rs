@@ -166,7 +166,7 @@ fn browse_theme(s: &mut Session, p: &Value) -> Result<Value> {
         // The theme's pictures (format-scheme blip fills) get ids of this deck.
         let mut map = std::collections::HashMap::new();
         for m in &media {
-            let id = doc.add_media(&m.name, &m.content_type, m.data.as_ref().clone()).ok_or_else(|| bad("design.browseTheme", NO_ID_SPACE))?;
+            let id = doc.adopt_media(m).ok_or_else(|| bad("design.browseTheme", NO_ID_SPACE))?;
             map.insert(m.id.0, id.0);
         }
         let theme = if map.is_empty() { theme.clone() } else { remap_media_ids(&theme, &map)? };

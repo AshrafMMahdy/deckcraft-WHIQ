@@ -127,10 +127,10 @@ impl Exp<'_> {
             return Some(p.clone());
         }
         let m = self.p.media(id)?;
-        if m.data.is_empty() {
+        if !m.has_bytes() {
             return None;
         }
-        let ext = ext_for(&m.content_type, &m.name, &m.data);
+        let ext = ext_for(&m.content_type, &m.name, &m.head(16));
         let ct = if m.content_type.is_empty() || !m.content_type.contains('/') {
             crate::mime_for(&format!("x.{ext}")).to_string()
         } else {
@@ -143,14 +143,19 @@ impl Exp<'_> {
             self.n_media += 1;
             format!("ppt/media/media{}.{ext}", self.n_media)
         };
-        self.pkg.binary(&name, &ct, m.data.as_ref().clone());
+        // WHIQ: the model's bytes are shared, not copied; a spilled part streams from disk.
+        let data = match &m.spill {
+            Some(sp) if m.data.is_empty() => opc::PartData::Disk(Arc::clone(sp)),
+            _ => opc::PartData::Shared(Arc::clone(&m.data)),
+        };
+        self.pkg.binary(&name, &ct, data);
         self.media_parts.insert(id, name.clone());
         Some(name)
     }
     /// A relationship from `o` to a media item (embedded part, or external link).
     pub fn media_rel(&mut self, o: &mut Out, id: MediaId, kind: &str) -> Option<String> {
         let m = self.p.media(id)?;
-        if m.data.is_empty() {
+        if !m.has_bytes() {
             let link = m.link.clone()?;
             return Some(o.rels.add(kind, &link, true));
         }
@@ -159,7 +164,7 @@ impl Exp<'_> {
     }
     pub fn media_rel_new(&mut self, o: &mut Out, id: MediaId, kind: &str) -> Option<String> {
         let m = self.p.media(id)?;
-        if m.data.is_empty() {
+        if !m.has_bytes() {
             return None;
         }
         let part = self.media_part(id)?;
@@ -535,6 +540,21 @@ pub fn export(p: &Presentation, main_ct: &str) -> Result<Vec<u8>, PptxError> {
 /// slides") and per byte of parts compressed ("compressing the package"); returning `false`
 /// stops the export (`PptxError::Write("cancelled")`).
 pub fn export_with(p: &Presentation, main_ct: &str, on: &mut dyn FnMut(&'static str, usize, usize) -> bool) -> Result<Vec<u8>, PptxError> {
+    build_package(p, main_ct, on)?.finish_with(on)
+}
+
+/// WHIQ: [`export_with`] straight into `out` (a file): the package is never held in memory, and
+/// media kept on disk streams from its spill file. Returns the bytes written.
+pub fn export_into<O: std::io::Write + std::io::Seek>(
+    p: &Presentation,
+    main_ct: &str,
+    out: &mut O,
+    on: &mut dyn FnMut(&'static str, usize, usize) -> bool,
+) -> Result<u64, PptxError> {
+    build_package(p, main_ct, on)?.finish_into(out, on)
+}
+
+fn build_package(p: &Presentation, main_ct: &str, on: &mut dyn FnMut(&'static str, usize, usize) -> bool) -> Result<PackageOut, PptxError> {
     let p = sanitized(p);
     let p: &Presentation = &p;
     let mut x = Exp {
@@ -783,7 +803,7 @@ pub fn export_with(p: &Presentation, main_ct: &str, on: &mut dyn FnMut(&'static 
         root.add_new(&k.rel_type, &k.name, false);
     }
     x.pkg.rels("", &root);
-    x.pkg.finish_with(on)
+    Ok(x.pkg)
 }
 
 /// A kept part may be written at this name: inside the package, not one the writer always makes.
@@ -1126,7 +1146,7 @@ fn write_embedded_fonts(x: &mut Exp, o: &mut Out) -> Vec<WrittenFont> {
         if m.data.is_empty() || m.data.len() > 32 * 1024 * 1024 {
             return None;
         }
-        let bytes = m.data.as_ref().clone();
+        let bytes = opc::PartData::Shared(Arc::clone(&m.data));
         n = n.saturating_add(1);
         let name = format!("ppt/fonts/font{n}.fntdata");
         x.pkg.binary(&name, "application/x-fontdata", bytes);

@@ -36,6 +36,8 @@ pub struct Imp<'a> {
     pub table_style_ids: Vec<String>,
     /// Per legacy VML drawing part: shape id → preview picture part (see `shapes::vml_preview`).
     pub vml_previews: HashMap<String, HashMap<String, String>>,
+    /// WHIQ: what the reader left out, with the reason (besides what the package reports).
+    pub not_kept: Vec<String>,
 }
 
 impl Imp<'_> {
@@ -49,11 +51,16 @@ impl Imp<'_> {
         if let Some(m) = self.media_by_part.get(&key) {
             return Some(*m);
         }
-        let data = self.pkg.get(part)?.to_vec();
         let name = opc::file_of(self.pkg.original_name(part).unwrap_or(part)).to_string();
         let content_type = self.pkg.content_type(part).filter(|c| !c.is_empty()).unwrap_or_else(|| crate::mime_for(&name).to_string());
+        // WHIQ: large media goes to a spill file on disk, never dropped (a part that cannot be
+        // read is reported by the package).
+        let (data, spill) = match self.pkg.media(part, &content_type)? {
+            opc::Payload::Mem(d) => (d, None),
+            opc::Payload::Disk(s) => (Vec::new(), Some(Arc::new(s))),
+        };
         let id = MediaId(self.alloc());
-        self.media.push(MediaItem { id, name, content_type, data: Arc::new(data), link: None });
+        self.media.push(MediaItem { id, name, content_type, data: Arc::new(data), link: None, spill });
         self.media_by_part.insert(key, id);
         Some(id)
     }
@@ -65,7 +72,7 @@ impl Imp<'_> {
         let id = MediaId(self.alloc());
         let name = url.rsplit('/').next().unwrap_or(url).to_string();
         let content_type = crate::mime_for(&name).to_string();
-        self.media.push(MediaItem { id, name, content_type, data: Arc::new(vec![]), link: Some(url.to_string()) });
+        self.media.push(MediaItem { id, name, content_type, data: Arc::new(vec![]), link: Some(url.to_string()), spill: None });
         id
     }
 }
@@ -489,6 +496,7 @@ pub fn import_theme(bytes: &[u8]) -> Result<(deckcraft_model::theme::Theme, Vec<
         custom_show_names: HashMap::new(),
         table_style_ids: Vec::new(),
         vml_previews: HashMap::new(),
+        not_kept: Vec::new(),
     };
     let part = Part::new(&pkg, &theme_path, &doc);
     let theme = theme::read_theme(&mut imp, &part, &doc.root);
@@ -503,14 +511,44 @@ pub fn import(bytes: &[u8]) -> Result<Presentation, PptxError> {
 /// (an error) when it answers `false` (the host cancelled).
 pub fn import_with(bytes: &[u8], on_slide: &mut dyn FnMut(usize, usize) -> bool) -> Result<Presentation, PptxError> {
     let pkg = Package::open(bytes)?;
+    import_package(&pkg, on_slide).map(|(p, _)| p)
+}
+
+/// WHIQ: what an import could not keep.
+#[derive(Clone, Debug, Default)]
+pub struct ImportReport {
+    /// Parts (or pieces of them) left out, one message each with the reason: the file then opens
+    /// as a repaired copy, so a save never overwrites the original without them.
+    pub not_kept: Vec<String>,
+    /// Parts the reader never used: `(part, bytes, referenced)`. An unreferenced part (no
+    /// relationship points at it) is dropped on save, as PowerPoint drops it; a referenced one is
+    /// a part DeckCraft does not model.
+    pub unused: Vec<(String, u64, bool)>,
+}
+
+/// WHIQ: read a package from `r` (the file on disk: it is never read whole into memory; large
+/// media goes to spill files), with what it could not keep.
+pub fn import_reader(r: Box<dyn opc::ReadSeek>, on_slide: &mut dyn FnMut(usize, usize) -> bool) -> Result<(Presentation, ImportReport), PptxError> {
+    let pkg = Package::open_reader(r)?;
+    let (p, mut not_kept) = import_package(&pkg, on_slide)?;
+    let unused = pkg.unused_parts();
+    for m in pkg.not_kept() {
+        if !not_kept.contains(&m) {
+            not_kept.push(m);
+        }
+    }
+    Ok((p, ImportReport { not_kept, unused }))
+}
+
+fn import_package(pkg: &Package, on_slide: &mut dyn FnMut(usize, usize) -> bool) -> Result<(Presentation, Vec<String>), PptxError> {
     let root_rels = pkg.rels("");
     let pres_path = root_rels.first_of("officeDocument").map(|r| r.target.clone()).unwrap_or_else(|| "ppt/presentation.xml".into());
-    let pres_doc = load(&pkg, &pres_path).ok_or_else(|| PptxError::NotPptx(format!("missing or unreadable {pres_path}")))?;
+    let pres_doc = load(pkg, &pres_path).ok_or_else(|| PptxError::NotPptx(format!("missing or unreadable {pres_path}")))?;
     let pres_el = &pres_doc.root;
     if !pres_el.is("presentation") {
         return Err(PptxError::NotPptx(format!("{pres_path} is not a presentation part")));
     }
-    let pres_part = Part::new(&pkg, &pres_path, &pres_doc);
+    let pres_part = Part::new(pkg, &pres_path, &pres_doc);
 
     // Masters, layouts and slides to read.
     let master_paths: Vec<String> = pres_el
@@ -541,14 +579,14 @@ pub fn import_with(bytes: &[u8], on_slide: &mut dyn FnMut(usize, usize) -> bool)
         if docs.contains_key(&key) {
             continue;
         }
-        if let Some(d) = load(&pkg, p) {
+        if let Some(d) = load(pkg, p) {
             max_cnvpr(&d.root, &mut max_id);
             docs.insert(key, d);
         }
     }
 
     let mut imp = Imp {
-        pkg: &pkg,
+        pkg,
         media: vec![],
         media_by_part: HashMap::new(),
         next: max_id.max(1),
@@ -556,6 +594,7 @@ pub fn import_with(bytes: &[u8], on_slide: &mut dyn FnMut(usize, usize) -> bool)
         custom_show_names: HashMap::new(),
         table_style_ids: Vec::new(),
         vml_previews: HashMap::new(),
+        not_kept: Vec::new(),
     };
     // Slide ids first so hyperlinks anywhere can point at slides.
     let mut slide_ids: Vec<(u32, String, SlideId)> = vec![];
@@ -596,9 +635,9 @@ pub fn import_with(bytes: &[u8], on_slide: &mut dyn FnMut(usize, usize) -> bool)
         p.default_text_style = dml::list_style(&mut imp, &pres_part, dts);
     }
     if let Some(r) = pres_part.rels.first_of("tableStyles")
-        && let Some(d) = load(&pkg, &r.target)
+        && let Some(d) = load(pkg, &r.target)
     {
-        let part = Part::new(&pkg, &r.target, &d);
+        let part = Part::new(pkg, &r.target, &d);
         p.table_styles = table_styles(&mut imp, &part, &d.root);
         imp.table_style_ids = p.table_styles.iter().map(|s| s.id.clone()).collect();
     }
@@ -629,14 +668,14 @@ pub fn import_with(bytes: &[u8], on_slide: &mut dyn FnMut(usize, usize) -> bool)
             return Err(PptxError::Unsupported("reading was cancelled".into()));
         }
         let Some(doc) = docs.get(&opc::norm(path)) else { continue };
-        let part = Part::new(&pkg, path, doc);
+        let part = Part::new(pkg, path, doc);
         let layout = part.rels.first_of("slideLayout").and_then(|r| layout_by_part.get(&opc::norm(&r.target)).copied()).unwrap_or(fallback_layout);
         let mut slide = read_slide(&mut imp, &part, doc, *id, layout);
         // Notes.
         if let Some(n) = part.rels.first_of("notesSlide")
-            && let Some(nd) = load(&pkg, &n.target)
+            && let Some(nd) = load(pkg, &n.target)
         {
-            let np = Part::new(&pkg, &n.target, &nd);
+            let np = Part::new(pkg, &n.target, &nd);
             slide.notes = read_notes(&mut imp, &np, &nd.root);
         }
         // Comments. A modern part and the legacy part can describe the same threads (PowerPoint
@@ -655,7 +694,7 @@ pub fn import_with(bytes: &[u8], on_slide: &mut dyn FnMut(usize, usize) -> bool)
             if has_modern && !modern {
                 continue;
             }
-            slide.comments.extend(read_comments(&pkg, &pres_part, &cd.root, modern));
+            slide.comments.extend(read_comments(pkg, &pres_part, &cd.root, modern));
         }
         file_slide_ids.insert(*file_id, *id);
         p.slides.push(Arc::new(slide));
@@ -673,8 +712,7 @@ pub fn import_with(bytes: &[u8], on_slide: &mut dyn FnMut(usize, usize) -> bool)
             }
         }
         // WHIQ: an extension pointing only at parts kept verbatim is kept too (their ids are kept).
-        let kept_ids: Vec<String> =
-            foreign_parts(&pkg, &pres_path, PRES_KNOWN_RELS).into_iter().map(|k| k.rel_id).filter(|i| !i.is_empty()).collect();
+        let kept_ids: Vec<String> = foreign_parts(pkg, &pres_path, PRES_KNOWN_RELS).into_iter().map(|k| k.rel_id).filter(|i| !i.is_empty()).collect();
         let kept: String = ext
             .children_named("ext")
             .filter(|e| e.attr("uri") != Some(crate::SECTION_EXT_URI) && rel_refs(e).iter().all(|id| kept_ids.contains(id)))
@@ -723,15 +761,15 @@ pub fn import_with(bytes: &[u8], on_slide: &mut dyn FnMut(usize, usize) -> bool)
     }
     // Notes master.
     if let Some(r) = pres_part.rels.first_of("notesMaster")
-        && let Some(d) = load(&pkg, &r.target)
+        && let Some(d) = load(pkg, &r.target)
     {
-        let part = Part::new(&pkg, &r.target, &d);
+        let part = Part::new(pkg, &r.target, &d);
         let mut ctx = shapes::IdCtx::default();
         let mut m = Master { id: MasterId(imp.alloc()), name: "Notes Master".into(), ..Default::default() };
         if let Some(t) = part.rels.first_of("theme")
             && let Some(td) = pkg.xml(&t.target)
         {
-            let tp = Part::new(&pkg, &t.target, &td);
+            let tp = Part::new(pkg, &t.target, &td);
             m.theme = theme::read_theme(&mut imp, &tp, &td.root);
         }
         if let Some(csld) = d.root.child("cSld") {
@@ -751,15 +789,15 @@ pub fn import_with(bytes: &[u8], on_slide: &mut dyn FnMut(usize, usize) -> bool)
     }
     // Handout master (header, footer, date and slide number for printed handouts).
     if let Some(r) = pres_part.rels.first_of("handoutMaster")
-        && let Some(d) = load(&pkg, &r.target)
+        && let Some(d) = load(pkg, &r.target)
     {
-        let part = Part::new(&pkg, &r.target, &d);
+        let part = Part::new(pkg, &r.target, &d);
         let mut ctx = shapes::IdCtx::default();
         let mut m = Master { id: MasterId(imp.alloc()), name: "Handout Master".into(), ..Default::default() };
         if let Some(t) = part.rels.first_of("theme")
             && let Some(td) = pkg.xml(&t.target)
         {
-            let tp = Part::new(&pkg, &t.target, &td);
+            let tp = Part::new(pkg, &t.target, &td);
             m.theme = theme::read_theme(&mut imp, &tp, &td.root);
         } else if let Some(first) = p.masters.first() {
             m.theme = first.theme.clone();
@@ -790,9 +828,9 @@ pub fn import_with(bytes: &[u8], on_slide: &mut dyn FnMut(usize, usize) -> bool)
         p.props.company = d.root.child("Company").map(|c| c.text()).unwrap_or_default();
     }
 
-    p.kept_parts = kept_parts(&pkg, &pres_path);
+    p.kept_parts = kept_parts(pkg, &pres_path);
     // WHIQ: unmodelled parts linked from the presentation part come along too.
-    for k in foreign_parts(&pkg, &pres_path, PRES_KNOWN_RELS) {
+    for k in foreign_parts(pkg, &pres_path, PRES_KNOWN_RELS) {
         if !p.kept_parts.iter().any(|e| e.name.eq_ignore_ascii_case(&k.name)) {
             p.kept_parts.push(k);
         }
@@ -805,7 +843,7 @@ pub fn import_with(bytes: &[u8], on_slide: &mut dyn FnMut(usize, usize) -> bool)
     p.media = std::mem::take(&mut imp.media);
     p.next_id = imp.next;
     p.fix_next_id();
-    Ok(p)
+    Ok((p, std::mem::take(&mut imp.not_kept)))
 }
 
 /// Embedded font faces in one file. Past this, further typefaces are dropped.
@@ -824,9 +862,10 @@ fn read_embedded_fonts(imp: &mut Imp, pres: &Part, root: &El) -> Vec<EmbeddedFon
         let slot = |imp: &mut Imp, name: &str| -> Option<MediaId> {
             let id = e.child(name)?.attr("r:id")?;
             let part = pres.rels.target(id)?;
-            let data = imp.pkg.get(part)?;
-            if data.is_empty() || data.len() > MAX_FONT_BYTES {
-                log::warn!("pptx: embedded font {part} skipped ({} bytes)", data.len());
+            let size = imp.pkg.size_of(part)?;
+            if size == 0 || size > MAX_FONT_BYTES as u64 {
+                // WHIQ: reported, not skipped in silence (the text falls back to another face).
+                imp.not_kept.push(format!("embedded font {part} ({size} bytes) is not a font DeckCraft keeps"));
                 return None;
             }
             imp.media_for(part)

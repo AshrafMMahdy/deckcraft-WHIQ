@@ -14,6 +14,7 @@ pub mod defaults;
 pub mod edit;
 pub mod numfmt;
 pub mod resolve;
+pub mod spill;
 pub mod style;
 pub mod table;
 pub mod text;
@@ -943,6 +944,53 @@ pub struct MediaItem {
     pub data: Arc<Vec<u8>>,
     /// External link instead of embedded bytes.
     pub link: Option<String>,
+    /// WHIQ: the bytes of a large part kept on disk instead of `data` (which is then empty); see
+    /// [`spill`]. Saves stream them from there, so nothing is left out.
+    #[serde(skip)]
+    pub spill: Option<Arc<spill::SpillFile>>,
+}
+
+impl MediaItem {
+    /// Embedded bytes, in memory or on disk.
+    pub fn has_bytes(&self) -> bool {
+        !self.data.is_empty() || self.spill.as_ref().is_some_and(|s| !s.is_empty())
+    }
+    /// The number of embedded bytes, in memory or on disk.
+    pub fn byte_len(&self) -> u64 {
+        match &self.spill {
+            Some(s) if self.data.is_empty() => s.len(),
+            _ => self.data.len() as u64,
+        }
+    }
+    /// The bytes, read from disk for a spilled part (empty when that read fails).
+    pub fn bytes(&self) -> std::borrow::Cow<'_, [u8]> {
+        match &self.spill {
+            Some(s) if self.data.is_empty() => std::borrow::Cow::Owned(s.read_all().unwrap_or_default()),
+            _ => std::borrow::Cow::Borrowed(self.data.as_slice()),
+        }
+    }
+    /// The bytes behind an `Arc` (read from disk for a spilled part).
+    pub fn shared_bytes(&self) -> Arc<Vec<u8>> {
+        match &self.spill {
+            Some(s) if self.data.is_empty() => Arc::new(s.read_all().unwrap_or_default()),
+            _ => Arc::clone(&self.data),
+        }
+    }
+    /// The first `n` bytes (format sniffing without reading a spilled part whole).
+    pub fn head(&self, n: usize) -> Vec<u8> {
+        match &self.spill {
+            Some(s) if self.data.is_empty() => s.head(n),
+            _ => self.data.get(..n.min(self.data.len())).unwrap_or_default().to_vec(),
+        }
+    }
+    /// The same bytes as `other` (spilled parts compare by file, then by content).
+    pub fn same_bytes(&self, other: &MediaItem) -> bool {
+        match (&self.spill, &other.spill) {
+            (Some(a), Some(b)) if Arc::ptr_eq(a, b) => true,
+            (None, None) => self.data == other.data,
+            _ => self.byte_len() == other.byte_len() && self.bytes() == other.bytes(),
+        }
+    }
 }
 
 /// A size whose sides may be missing, null or not numbers (NaN then); see `Presentation::slide_size`.
@@ -1097,11 +1145,21 @@ impl Presentation {
     }
     /// Add media bytes, reusing an identical existing item.
     pub fn add_media(&mut self, name: &str, content_type: &str, data: Vec<u8>) -> Option<MediaId> {
-        if let Some(m) = self.media.iter().find(|m| m.data.len() == data.len() && *m.data == data) {
+        if let Some(m) = self.media.iter().find(|m| m.spill.is_none() && m.data.len() == data.len() && *m.data == data) {
             return Some(m.id);
         }
         let id = MediaId(self.alloc_id()?);
-        self.media.push(MediaItem { id, name: name.into(), content_type: content_type.into(), data: Arc::new(data), link: None });
+        self.media.push(MediaItem { id, name: name.into(), content_type: content_type.into(), data: Arc::new(data), link: None, spill: None });
+        Some(id)
+    }
+    /// WHIQ: add a copy of `m` (from another presentation), its bytes shared, whether in memory or
+    /// on disk; reuses an identical existing item.
+    pub fn adopt_media(&mut self, m: &MediaItem) -> Option<MediaId> {
+        if let Some(x) = self.media.iter().find(|x| x.link == m.link && x.byte_len() == m.byte_len() && x.same_bytes(m)) {
+            return Some(x.id);
+        }
+        let id = MediaId(self.alloc_id()?);
+        self.media.push(MediaItem { id, ..m.clone() });
         Some(id)
     }
     /// Section index containing a slide (by position), when sections exist.

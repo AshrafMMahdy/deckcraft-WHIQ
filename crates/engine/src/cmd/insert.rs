@@ -457,9 +457,18 @@ fn picture(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({"id": id}))
 }
 
-const ALBUM_MAX_ITEMS: usize = 48;
-const ALBUM_MAX_BYTES: usize = 32 * 1024 * 1024;
-const ALBUM_MAX_TOTAL: usize = 64 * 1024 * 1024;
+/// WHIQ: an album's pictures are held in memory with the deck, so what one album may add is a
+/// share of the memory budget (a quarter; one picture an eighth), never less than upstream's
+/// 64 MB and 32 MB; the item count follows (one item per 256 KB of that share, at least 48).
+fn album_max_total() -> usize {
+    usize::try_from(deckcraft_model::spill::memory_budget() / 4).unwrap_or(usize::MAX).max(64 * 1024 * 1024)
+}
+fn album_max_bytes() -> usize {
+    (album_max_total() / 2).max(32 * 1024 * 1024)
+}
+fn album_max_items() -> usize {
+    (album_max_total() / (256 * 1024)).max(48)
+}
 const ALBUM_MAX_TEXT: usize = 400;
 
 #[derive(Clone, Copy)]
@@ -705,8 +714,14 @@ fn album_items(p: &Value) -> Result<Vec<AlbumItem>> {
     if arr.is_empty() {
         return Err(bad("insert.photoAlbum", "add at least one picture or text box"));
     }
-    if arr.len() > ALBUM_MAX_ITEMS {
-        return Err(bad("insert.photoAlbum", "a photo album holds at most 48 pictures or text boxes"));
+    if arr.len() > album_max_items() {
+        return Err(bad(
+            "insert.photoAlbum",
+            format!(
+                "one call adds at most {} pictures or text boxes (this process's memory budget); insert the rest with another call",
+                album_max_items()
+            ),
+        ));
     }
     let mut items = Vec::with_capacity(arr.len());
     let mut total = 0usize;
@@ -730,12 +745,24 @@ fn album_items(p: &Value) -> Result<Vec<AlbumItem>> {
             continue;
         }
         let (name, bytes) = media_bytes(item, "insert.photoAlbum")?;
-        if bytes.len() > ALBUM_MAX_BYTES {
-            return Err(bad("insert.photoAlbum", format!("{name} is larger than 32 MB")));
+        if bytes.len() > album_max_bytes() {
+            return Err(bad(
+                "insert.photoAlbum",
+                format!(
+                    "{name} is larger than {} MB, one album picture's share of this process's memory budget; insert it with insert.picture",
+                    album_max_bytes() >> 20
+                ),
+            ));
         }
         let next = total.saturating_add(bytes.len());
-        if next > ALBUM_MAX_TOTAL {
-            return Err(bad("insert.photoAlbum", "the album is larger than 64 MB"));
+        if next > album_max_total() {
+            return Err(bad(
+                "insert.photoAlbum",
+                format!(
+                    "these pictures come to more than {} MB, one album's share of this process's memory budget; insert the rest with another call",
+                    album_max_total() >> 20
+                ),
+            ));
         }
         total = next;
         let ct = content_type(&name, &bytes);

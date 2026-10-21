@@ -281,6 +281,28 @@ fn eviction_auto_saves_and_the_next_call_names_the_file() {
     assert_eq!(e["code"], "evicted");
 }
 
+// WHIQ §3 ─ memory pressure never costs a save: the presentation closed over --max-memory-mb is
+// auto-saved, and the save that comes next writes that work where it was asked.
+#[test]
+fn a_save_after_a_memory_eviction_writes_the_auto_saved_work() {
+    let dir = scratch("evict-save");
+    let mut m = start(&dir, &["--max-memory-mb", "1"], &[]);
+    // One call makes the unsaved work (the watchdog may close the deck as soon as a call ends).
+    let built = m.ok("build_deck", json!({"slides": [{"layout": "bullets", "title": "Saved after the eviction", "bullets": ["a"]}]}));
+    let slides = built["slides"].clone();
+    // The watchdog closes it once no call runs (every resident byte is over a 1 MB limit).
+    std::thread::sleep(Duration::from_millis(1500));
+    let st = m.ok("server_status", json!({}));
+    let rec = st["evicted"][0]["recovered_path"].as_str().unwrap_or_else(|| panic!("evicted: {st}")).to_string();
+    assert!(st["evicted"][0]["reason"].as_str().unwrap().contains("MB limit"), "{st}");
+    let target = dir.join("after-eviction.pptx");
+    let r = m.ok("save_presentation", json!({"path": target.to_str().unwrap()}));
+    assert!(r["saved_from"].as_str().unwrap().ends_with(std::path::Path::new(&rec).file_name().unwrap().to_str().unwrap()), "{r}");
+    assert_eq!(std::fs::read(&target).unwrap(), std::fs::read(&rec).unwrap(), "the save is the auto-saved work, byte for byte");
+    let o = m.ok("open_presentation", json!({"path": target.to_str().unwrap()}));
+    assert_eq!(o["slides"], slides, "{o} {built}");
+}
+
 // §3 ─ SIGTERM saves unsaved work; the next run names the recovered file.
 #[cfg(unix)]
 #[test]

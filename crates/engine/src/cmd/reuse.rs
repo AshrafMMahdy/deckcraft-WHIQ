@@ -180,7 +180,7 @@ fn copy_media(doc: &mut Presentation, src: &Presentation, used: &[MediaId], map:
             doc.media.push(item);
             new
         } else {
-            doc.add_media(&m.name, &m.content_type, m.data.as_ref().clone()).ok_or_else(|| bad("slide.reuse", NO_ID_SPACE))?
+            doc.adopt_media(m).ok_or_else(|| bad("slide.reuse", NO_ID_SPACE))?
         };
         map.insert(id, new);
     }

@@ -173,14 +173,15 @@ fn export(doc: &Presentation, current: usize, p: &Value) -> Result<Value, String
             if let Some(text) = p.get("slides").and_then(Value::as_str) {
                 gp["slides"] = json!(f::parse_slide_range(text, n).map_err(|e| e.to_string())?);
             }
-            let bytes = f::gif_bytes(doc, &gp).map_err(|e| e.to_string())?;
-            write_whole(&path, &bytes)?;
-            Ok(json!({"path": path, "bytes": bytes.len()}))
+            // WHIQ: streamed into the file a frame at a time.
+            let opts = deckcraft_engine::gif_export::GifOptions::from_params(&gp).map_err(|e| e.to_string())?;
+            let (_, bytes) = f::gif_to_path(doc, &opts, &path).map_err(|e| e.to_string())?;
+            Ok(json!({"path": path, "bytes": bytes}))
         }
         "pptx" | "potx" | "ppsx" | "deckcraft" | "outline" | "txt" => {
-            let bytes = f::save_bytes(doc, &format).map_err(|e| e.to_string())?;
-            write_whole(&path, &bytes)?;
-            Ok(json!({"path": path, "bytes": bytes.len()}))
+            // WHIQ: streamed into the file (spilled media from disk), never whole in memory.
+            let bytes = f::save_to_path(doc, &format, &path).map_err(|e| e.to_string())?;
+            Ok(json!({"path": path, "bytes": bytes}))
         }
         other => Err(format!("file.export: unknown format `{other}`")),
     }

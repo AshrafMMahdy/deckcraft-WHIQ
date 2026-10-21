@@ -128,9 +128,9 @@ pub fn tick(shared: &Shared, roots: Option<&Arc<AutomationRoots>>, now: Instant)
         let fmt = crate::autosave::recovered_format(d.path.as_deref());
         let dir = crate::autosave::recovery_dir(shared, d.path.as_deref());
         let path = c.path.clone().unwrap_or_else(|| dir.join(file_name(d, fmt, &dir)).to_string_lossy().to_string());
-        let result = deckcraft_engine::cmd::file::save_bytes(&d.doc, fmt)
-            .map_err(|e| e.to_string())
-            .and_then(|bytes| file_access::confine(roots, || deckcraft_engine::io::write_file(&path, &bytes)));
+        // WHIQ: streamed into the file (spilled media from disk), never whole in memory.
+        let result =
+            file_access::confine(roots, || deckcraft_engine::cmd::file::save_to_path(&d.doc, fmt, &path).map(|_| ()).map_err(|e| e.to_string()));
         match result {
             Ok(()) => {
                 c.path = Some(path.clone());

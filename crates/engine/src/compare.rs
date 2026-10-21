@@ -105,10 +105,6 @@ fn shape_label(s: &Shape) -> String {
     if s.name.trim().is_empty() { format!("Shape {}", s.id.0) } else { s.name.clone() }
 }
 
-fn media_bytes(p: &Presentation, id: MediaId) -> Option<&[u8]> {
-    p.media(id).map(|m| m.data.as_slice())
-}
-
 /// A shape without its ids (shape and media), for comparing across decks.
 fn plain_shape(s: &Shape) -> Shape {
     let mut c = s.clone();
@@ -143,7 +139,7 @@ fn shape_details(cp: &Presentation, a: &Shape, rp: &Presentation, b: &Shape, out
         what.push("formatting");
     }
     let pic = |p: &Presentation, s: &Shape| match &s.kind {
-        ShapeKind::Picture { fill } => media_bytes(p, fill.media).map(|b| b.to_vec()),
+        ShapeKind::Picture { fill } => p.media(fill.media).map(|m| m.bytes().into_owned()),
         _ => None,
     };
     if pic(cp, a) != pic(rp, b) {
@@ -239,12 +235,10 @@ pub fn adopt(doc: &mut Presentation, rev: &Presentation, slide: &Slide, replacin
     for id in mids {
         let Some(m) = rev.media(id) else { continue };
         match doc.media(id) {
-            Some(x) if x.data == m.data => {}
+            Some(x) if x.same_bytes(m) => {}
             None => doc.media.push(m.clone()),
             Some(_) => {
-                let new = doc
-                    .add_media(&m.name, &m.content_type, m.data.as_ref().clone())
-                    .ok_or_else(|| crate::cmd::bad("review.accept", crate::cmd::NO_ID_SPACE))?;
+                let new = doc.adopt_media(m).ok_or_else(|| crate::cmd::bad("review.accept", crate::cmd::NO_ID_SPACE))?;
                 media_map.insert(id, new);
             }
         }

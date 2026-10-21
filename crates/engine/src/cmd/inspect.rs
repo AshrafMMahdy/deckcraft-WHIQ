@@ -40,7 +40,7 @@ fn document(s: &mut Session, _p: &Value) -> Result<Value> {
         "fonts": m.map(|m| json!({"major": m.theme.fonts.major.latin, "minor": m.theme.fonts.minor.latin})),
         "layouts": m.map(|m| m.layouts.iter().map(|l| json!({"id": l.id, "name": l.name})).collect::<Vec<_>>()),
         "selection": serde_json::to_value(&st.selection).unwrap_or_default(),
-        "media": d.media.iter().map(|x| json!({"id": x.id, "name": x.name, "type": x.content_type, "bytes": x.data.len()})).collect::<Vec<_>>(),
+        "media": d.media.iter().map(|x| json!({"id": x.id, "name": x.name, "type": x.content_type, "bytes": x.byte_len(), "onDisk": x.spill.is_some()})).collect::<Vec<_>>(),
         "undo": st.history.undo.last().map(|e| e.label.clone()),
         "redo": st.history.redo.last().map(|e| e.label.clone()),
     }))

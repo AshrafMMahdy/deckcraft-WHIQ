@@ -446,7 +446,7 @@ pub fn shape(w: &mut W, x: &mut Exp, o: &mut Out, cx: &mut Ctx, s: &Shape, depth
 }
 
 fn model_rel(x: &mut Exp, o: &mut Out, media: deckcraft_model::MediaId) -> Option<String> {
-    if x.p.media(media).is_none_or(|m| m.data.is_empty()) {
+    if x.p.media(media).is_none_or(|m| !m.has_bytes()) {
         return None;
     }
     x.media_rel(o, media, crate::opc::RT_MODEL3D)
@@ -479,7 +479,7 @@ fn write_model(
         return;
     };
     let id = cx.id_for(s);
-    let poster = poster.filter(|p| x.p.media(*p).is_some_and(|m| !m.data.is_empty()));
+    let poster = poster.filter(|p| x.p.media(*p).is_some_and(|m| m.has_bytes()));
     let Some(poster) = poster else {
         write_model_part(w, x, o, id, s, &rid);
         return;

@@ -291,7 +291,7 @@ impl Decoder {
             workers,
             in_flight: VecDeque::new(),
             max_in_flight: fthreads + 2,
-            memory_budget: deckcraft_bitstream::budget::DECODE_MEMORY_BUDGET,
+            memory_budget: deckcraft_bitstream::budget::decode_memory_budget(),
             out: VecDeque::new(),
             pts: 0,
         }

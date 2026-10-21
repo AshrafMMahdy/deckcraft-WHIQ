@@ -530,6 +530,7 @@ fn diagram_data(imp: &mut Imp, target: &str) -> Option<deckcraft_model::MediaId>
         content_type,
         data: std::sync::Arc::new(xml.into_bytes()),
         link: None,
+        spill: None,
     });
     Some(id)
 }

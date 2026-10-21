@@ -41,6 +41,7 @@ pub use deckcraft_geom as geom;
 pub use deckcraft_media as media;
 pub use deckcraft_model as model;
 pub use deckcraft_pdf as pdf;
+pub use deckcraft_pptx as pptx;
 pub use deckcraft_render as render;
 pub use tools::{Mods, PointerEvent, PointerKind, ToolKind};
 
@@ -223,6 +224,9 @@ pub struct DocState {
     pub composition: Option<Composition>,
     /// Review › Compare in progress: the revised copy.
     pub compare: Option<compare::Compare>,
+    /// WHIQ: parts of the opened file nothing refers to (`part`, bytes), dropped by the next save
+    /// (which names them).
+    pub unreferenced_parts: Vec<(String, u64)>,
 }
 
 static NEXT_UID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -250,6 +254,7 @@ impl DocState {
             missing_fonts: Vec::new(),
             composition: None,
             compare: None,
+            unreferenced_parts: Vec::new(),
         }
     }
     pub fn is_dirty(&self) -> bool {

@@ -144,7 +144,7 @@ impl Decoder {
             pool,
             in_flight: VecDeque::new(),
             max_in_flight: threads.max(1) + 2,
-            memory_budget: deckcraft_bitstream::budget::DECODE_MEMORY_BUDGET,
+            memory_budget: deckcraft_bitstream::budget::decode_memory_budget(),
             draft: false,
         }
     }

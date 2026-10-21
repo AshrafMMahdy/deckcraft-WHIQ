@@ -29,9 +29,18 @@ pub const DEFAULT_SECONDS: f64 = 5.0;
 /// GIF delays are in hundredths of a second; viewers treat delays under 0.02 s as 0.1 s anyway.
 pub const MIN_SECONDS: f64 = 0.1;
 pub const MAX_SECONDS: f64 = 600.0;
-pub const MAX_FRAMES: usize = 500;
-/// Cap on frames × width × height (≈ 96 Full HD frames or 480 frames at 960×540).
+/// WHIQ: a `slides` list longer than this is not a request but hostile input. Frame counts are
+/// otherwise not limited: an export to a file streams frame by frame (one frame in memory).
+pub const MAX_FRAMES: usize = 100_000;
+/// Floor of the in-memory cap below (≈ 96 Full HD frames or 480 frames at 960×540).
 pub const MAX_TOTAL_PIXELS: u64 = 200_000_000;
+
+/// WHIQ: frames × width × height a GIF built in memory may have (`file.saveBytes`, the app's
+/// own buffer): half the memory budget, at least [`MAX_TOTAL_PIXELS`]. An export to a file has
+/// no such cap: it streams.
+pub fn max_total_pixels_in_memory() -> u64 {
+    MAX_TOTAL_PIXELS.max(deckcraft_model::spill::memory_budget() / 2)
+}
 /// NeuQuant sampling: 1 is slowest and best, 30 fastest; 10 is the usual balance.
 const QUANTIZER_SPEED: i32 = 10;
 
@@ -198,23 +207,43 @@ fn on_white(img: &deckcraft_render::Image, w: u32, h: u32) -> Vec<u8> {
     px
 }
 
-/// Render and encode the GIF.
+/// Render and encode the GIF in memory (within [`max_total_pixels_in_memory`]).
 pub fn encode(doc: &Presentation, opts: &GifOptions) -> Result<GifOutput> {
+    let frames = opts.frames(doc)?;
+    let (w, h) = frame_size(doc, opts.width);
+    let total = (frames.len() as u64).saturating_mul(u64::from(w)).saturating_mul(u64::from(h));
+    let cap = max_total_pixels_in_memory();
+    if total > cap {
+        return Err(bad(
+            CMD,
+            format!(
+                "{} slides at {w}×{h} is more GIF than this process builds in memory ({} million pixels of {}); export it to a file (`file.export` with a .gif `path` streams it), or as PDF or PNG slides",
+                frames.len(),
+                total / 1_000_000,
+                cap / 1_000_000
+            ),
+        ));
+    }
+    let mut bytes = Vec::new();
+    let mut out = encode_into(doc, opts, &mut bytes)?;
+    out.bytes = bytes;
+    Ok(out)
+}
+
+/// WHIQ: render and encode the GIF into `sink` (a file) one frame at a time: one frame is held in
+/// memory however many slides there are. The returned output's `bytes` is empty.
+pub fn encode_into(doc: &Presentation, opts: &GifOptions, sink: &mut dyn std::io::Write) -> Result<GifOutput> {
     use image::codecs::gif::{GifEncoder, Repeat};
 
     let frames = opts.frames(doc)?;
     let delay_cs = opts.delay_cs()?;
     let (w, h) = frame_size(doc, opts.width);
-    let total = (frames.len() as u64).saturating_mul(u64::from(w)).saturating_mul(u64::from(h));
-    if total > MAX_TOTAL_PIXELS {
-        return Err(bad(CMD, format!("{} slides at {w}×{h} is too large for a GIF; choose a smaller size or fewer slides", frames.len())));
-    }
     let scale = f64::from(w) / doc.slide_size.width;
     let scale = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
     let enc_err = |e: image::ImageError| EngineError::Other(format!("GIF encoding failed: {e}"));
-    let mut bytes = Vec::new();
+    let bytes = Vec::new();
     {
-        let mut enc = GifEncoder::new_with_speed(&mut bytes, QUANTIZER_SPEED);
+        let mut enc = GifEncoder::new_with_speed(sink, QUANTIZER_SPEED);
         // No repeat block at all means "play once"; a repeat count of 0 means "forever".
         if opts.loop_forever {
             enc.set_repeat(Repeat::Infinite).map_err(enc_err)?;

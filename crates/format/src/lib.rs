@@ -18,10 +18,21 @@ pub const LEGACY_MIMETYPE: &str = concat!("application/vnd.storyteller.", "slide
 pub const EXTENSION: &str = "deckcraft";
 /// Format version written into the manifest.
 pub const VERSION: u32 = 1;
-/// Largest entry we will inflate (guards against zip bombs).
+/// Largest entry we will inflate into memory (guards against zip bombs) at the smallest memory
+/// budget. WHIQ: the working limit is the process's memory budget when that is more
+/// ([`deckcraft_model::spill::memory_budget`]); large media is inflated to a spill file on disk
+/// instead and has no limit but the disk (and the zip-bomb ratio below).
 const MAX_ENTRY: u64 = 2 << 30;
-/// All embedded media together, inflated (#393).
+/// All embedded media inflated into memory together, at the smallest budget (#393); twice the
+/// memory budget when that is more.
 const MAX_TOTAL_MEDIA: u64 = 4 << 30;
+/// A media member that expands more than this many times over its compressed size, past
+/// 256 MiB, is refused as a zip bomb (reported as damaged media).
+const MAX_SPILL_RATIO: u64 = 1_000;
+
+fn max_entry() -> u64 {
+    MAX_ENTRY.max(deckcraft_model::spill::memory_budget())
+}
 /// Media items one file may list.
 const MAX_MEDIA_ITEMS: usize = 100_000;
 
@@ -55,8 +66,14 @@ struct Manifest {
 /// Serialize a presentation.
 pub fn save(p: &Presentation) -> Result<Vec<u8>> {
     let mut buf = Cursor::new(Vec::new());
+    save_into(p, &mut buf)?;
+    Ok(buf.into_inner())
+}
+
+/// WHIQ: [`save`] straight into `out` (a file): media kept on disk streams from its spill file.
+pub fn save_into<O: Write + std::io::Seek>(p: &Presentation, out: &mut O) -> Result<()> {
     {
-        let mut z = zip::ZipWriter::new(&mut buf);
+        let mut z = zip::ZipWriter::new(out);
         let stored = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
         let deflate = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
         let w = |e: zip::result::ZipError| FormatError::Write(e.to_string());
@@ -72,17 +89,22 @@ pub fn save(p: &Presentation) -> Result<Vec<u8>> {
         z.start_file("presentation.json", deflate).map_err(w)?;
         z.write_all(&json).map_err(|e| FormatError::Write(e.to_string()))?;
         for item in &p.media {
-            if item.link.is_some() && item.data.is_empty() {
+            if item.link.is_some() && !item.has_bytes() {
                 continue;
             }
             // Already-compressed media is stored, not deflated again.
             let opts = if is_compressed(&item.content_type) { stored } else { deflate };
+            let opts = opts.large_file(item.byte_len() >= u64::from(u32::MAX) / 2);
             z.start_file(format!("media/{}", item.id.0), opts).map_err(w)?;
-            z.write_all(&item.data).map_err(|e| FormatError::Write(e.to_string()))?;
+            match &item.spill {
+                Some(sp) if item.data.is_empty() => sp.copy_to(&mut z).map(|_| ()),
+                _ => z.write_all(&item.data),
+            }
+            .map_err(|e| FormatError::Write(format!("media {}: {e}", item.name)))?;
         }
         z.finish().map_err(w)?;
     }
-    Ok(buf.into_inner())
+    Ok(())
 }
 
 fn is_compressed(ct: &str) -> bool {
@@ -99,16 +121,20 @@ pub fn sniff(bytes: &[u8]) -> bool {
     bytes.starts_with(b"PK") && [MIMETYPE, LEGACY_MIMETYPE].iter().any(|m| bytes.windows(m.len()).take(200).any(|w| w == m.as_bytes()))
 }
 
-fn read_entry(z: &mut zip::ZipArchive<Cursor<&[u8]>>, name: &str) -> Result<Vec<u8>> {
-    read_entry_max(z, name, MAX_ENTRY)
+fn read_entry<R: Read + std::io::Seek>(z: &mut zip::ZipArchive<R>, name: &str) -> Result<Vec<u8>> {
+    read_entry_max(z, name, max_entry())
 }
 
 /// Read one member, refusing it before inflating if it declares more than `max` bytes, and
 /// stopping at `max` if it inflates further than it declared.
-fn read_entry_max(z: &mut zip::ZipArchive<Cursor<&[u8]>>, name: &str, max: u64) -> Result<Vec<u8>> {
+fn read_entry_max<R: Read + std::io::Seek>(z: &mut zip::ZipArchive<R>, name: &str, max: u64) -> Result<Vec<u8>> {
     let f = z.by_name(name).map_err(|e| FormatError::Damaged(format!("{name}: {e}")))?;
     if f.size() > max {
-        return Err(FormatError::Damaged(format!("{name} is too large")));
+        return Err(FormatError::Damaged(format!(
+            "{name} is too large to hold in memory ({} MB; this process's limit is {} MB)",
+            f.size() >> 20,
+            max >> 20
+        )));
     }
     let mut out = Vec::with_capacity(f.size().min(64 << 20) as usize);
     let mut f = f.take(max.saturating_add(1));
@@ -128,11 +154,29 @@ pub fn load(bytes: &[u8]) -> Result<Presentation> {
 /// Read a presentation and list the embedded media that couldn't be read (missing, too large
 /// or failing its CRC), one message each. Linked media saved without its bytes isn't damage.
 pub fn load_checked(bytes: &[u8]) -> Result<(Presentation, Vec<String>)> {
-    load_within(bytes, Budget { total: MAX_TOTAL_MEDIA, items: MAX_MEDIA_ITEMS })
+    load_within(Cursor::new(bytes), default_budget())
 }
 
-fn load_within(bytes: &[u8], budget: Budget) -> Result<(Presentation, Vec<String>)> {
-    let mut z = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|e| FormatError::NotOurs(e.to_string()))?;
+/// WHIQ: [`load_checked`] from an open file: the file is not read whole; large media goes to
+/// spill files on disk.
+pub fn load_reader<R: Read + std::io::Seek>(r: R) -> Result<(Presentation, Vec<String>)> {
+    load_within(r, default_budget())
+}
+
+/// WHIQ: [`sniff`] on an open file: its first bytes.
+pub fn sniff_reader<R: Read + std::io::Seek>(r: &mut R) -> bool {
+    let mut head = Vec::with_capacity(512);
+    let ok = r.by_ref().take(512).read_to_end(&mut head).is_ok();
+    let _ = r.seek(std::io::SeekFrom::Start(0));
+    ok && sniff(&head)
+}
+
+fn default_budget() -> Budget {
+    Budget { total: MAX_TOTAL_MEDIA.max(deckcraft_model::spill::memory_budget().saturating_mul(2)), items: MAX_MEDIA_ITEMS }
+}
+
+fn load_within<R: Read + std::io::Seek>(r: R, budget: Budget) -> Result<(Presentation, Vec<String>)> {
+    let mut z = zip::ZipArchive::new(r).map_err(|e| FormatError::NotOurs(e.to_string()))?;
     let json = read_entry(&mut z, "presentation.json").map_err(|_| FormatError::NotOurs("no presentation.json".into()))?;
     let m = parse_manifest(&json)?;
     if m.format != "deckcraft" {
@@ -151,10 +195,35 @@ fn load_within(bytes: &[u8], budget: Budget) -> Result<(Presentation, Vec<String
     for item in &mut p.media {
         let name = format!("media/{}", item.id.0);
         let linked_only = item.link.is_some() && z.index_for_name(&name).is_none();
-        if z.by_name(&name).is_ok_and(|f| f.size() > left) {
-            return Err(FormatError::Damaged("embedded media is larger than DeckCraft can open".into()));
+        // WHIQ: large media goes to a spill file on disk (no memory limit applies to it).
+        let sizes = z.by_name(&name).ok().map(|f| (f.size(), f.compressed_size()));
+        if let Some((size, packed)) = sizes
+            && deckcraft_model::spill::should_spill(&item.content_type, size)
+        {
+            if size > 256 << 20 && size / packed.max(1) > MAX_SPILL_RATIO {
+                damaged.push(format!("{name} declares {} MB from {} KB compressed: refused as a zip bomb", size >> 20, packed >> 10));
+                continue;
+            }
+            let spilled = z
+                .by_name(&name)
+                .map_err(|e| e.to_string())
+                .and_then(|mut f| deckcraft_model::spill::SpillFile::from_reader(&mut f, size).map_err(|e| e.to_string()));
+            match spilled {
+                Ok(sp) => {
+                    item.data = Arc::new(Vec::new());
+                    item.spill = Some(Arc::new(sp));
+                }
+                Err(e) => damaged.push(format!("{name} ({} MB) could not be kept on disk: {e}", size >> 20)),
+            }
+            continue;
         }
-        match read_entry_max(&mut z, &name, left.min(MAX_ENTRY)) {
+        if z.by_name(&name).is_ok_and(|f| f.size() > left) {
+            return Err(FormatError::Damaged(format!(
+                "the embedded media held in memory is larger than this process's budget allows ({} MB)",
+                budget.total >> 20
+            )));
+        }
+        match read_entry_max(&mut z, &name, left.min(max_entry())) {
             Ok(data) => {
                 left -= data.len() as u64;
                 item.data = Arc::new(data);
@@ -571,9 +640,9 @@ mod tests {
         p.add_media("b.bin", "application/octet-stream", vec![2; 600]);
         let bytes = save(&p).unwrap();
         // Exactly at the limit opens; one byte under is refused, though each item fits.
-        assert!(load_within(&bytes, Budget { total: 1200, items: 2 }).is_ok());
-        assert!(load_within(&bytes, Budget { total: 1199, items: 2 }).is_err());
-        assert!(load_within(&bytes, Budget { total: 1200, items: 1 }).is_err());
+        assert!(load_within(Cursor::new(&bytes), Budget { total: 1200, items: 2 }).is_ok());
+        assert!(load_within(Cursor::new(&bytes), Budget { total: 1199, items: 2 }).is_err());
+        assert!(load_within(Cursor::new(&bytes), Budget { total: 1200, items: 1 }).is_err());
     }
 
     #[test]
@@ -602,7 +671,7 @@ mod tests {
         }
         let bytes = out.finish().unwrap().into_inner();
         // 51 references to one 1000-byte member fit a 1000-byte budget: it's inflated once.
-        let q = load_within(&bytes, Budget { total: 1000, items: 51 }).unwrap().0;
+        let q = load_within(Cursor::new(&bytes), Budget { total: 1000, items: 51 }).unwrap().0;
         assert_eq!(q.media.len(), 1);
         assert_eq!(q.media[0].data.len(), 1000);
         // And the deck saves again.
@@ -879,4 +948,23 @@ fn outline_includes_table_text() {
     assert!(out.contains("Text box body"), "{out}");
     assert!(out.contains("Cell A1\tCell B1"), "{out}");
     assert!(out.contains("Cell A2\tCell B2"), "{out}");
+
+    #[test]
+    fn whiq_large_media_round_trips_through_a_spill_file() {
+        let mut p = Presentation::default();
+        let len = deckcraft_model::spill::SPILL_MIN as usize + 77;
+        let video: Vec<u8> = (0..len).map(|i| (i % 241) as u8).collect();
+        let id = p.add_media("v.mp4", "video/mp4", video.clone()).unwrap();
+        let bytes = save(&p).unwrap();
+        let (q, damaged) = load_reader(Cursor::new(bytes)).unwrap();
+        assert!(damaged.is_empty(), "{damaged:?}");
+        let m = q.media(id).unwrap();
+        assert!(m.data.is_empty() && m.spill.is_some(), "kept on disk");
+        assert_eq!(m.bytes().as_ref(), video.as_slice());
+        // Saved again, the bytes stream from the spill file.
+        let mut out = Cursor::new(Vec::new());
+        save_into(&q, &mut out).unwrap();
+        let (r, _) = load_checked(&out.into_inner()).unwrap();
+        assert_eq!(r.media(id).unwrap().bytes().as_ref(), video.as_slice());
+    }
 }

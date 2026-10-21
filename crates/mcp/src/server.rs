@@ -447,6 +447,14 @@ impl Server {
 
         // Gates: a document the server closed, a document still opening.
         if needs_document(name, &args) && !self.has_document() {
+            // WHIQ: a save is never lost to an eviction. The work the server auto-saved when it
+            // closed the presentation (or the unchanged original) is written where the save asks,
+            // byte for byte, without opening it again.
+            if let Some(ev) = self.shared.evicted().last().cloned()
+                && let Some(r) = self.save_evicted(name, &args, &ev)
+            {
+                return self.finish(name, &args, r, warnings, vec![]);
+            }
             if let Some(ev) = self.shared.evicted().last() {
                 let reopen = ev.reopen_path().unwrap_or_default().to_string();
                 let e = ToolError::new(
@@ -656,14 +664,43 @@ impl Server {
                 let roots = self.backend.automation_roots();
                 let cx = self.error_context("roundtrip_check");
                 let r = deckcraft_engine::file_access::confine(roots.as_ref(), || -> Result<Value, String> {
+                    // WHIQ: neither package is held in memory: the save goes to a scratch file in
+                    // the spill folder and binary parts compare by their zip CRC.
                     deckcraft_engine::task::phase("round trip: reading", 0.0, 0.3);
-                    let bytes = deckcraft_engine::io::read_file_reporting(&path)?;
-                    deckcraft_engine::task::phase("round trip: saving and comparing", 0.3, 1.0);
+                    let before = deckcraft_engine::io::open_file(&path)?;
                     let loaded = deckcraft_engine::cmd::file::read_presentation_file(&path).map_err(|e| e.to_string())?;
+                    deckcraft_engine::task::phase("round trip: saving and comparing", 0.3, 1.0);
                     let fmt = deckcraft_engine::cmd::file::format_for_path(&path);
                     let fmt = if matches!(fmt, "pptx" | "potx" | "ppsx") { fmt } else { "pptx" };
-                    let saved = deckcraft_engine::cmd::file::save_bytes(&loaded.doc, fmt).map_err(|e| e.to_string())?;
-                    crate::roundtrip::compare(&bytes, &saved).map_err(|e| format!("{path}: {e}"))
+                    let dir = deckcraft_engine::model::spill::spill_dir();
+                    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+                    let scratch = dir.join(format!(
+                        "roundtrip-{}-{}.{fmt}",
+                        std::process::id(),
+                        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)
+                    ));
+                    let r = (|| {
+                        let mut f = std::fs::File::create(&scratch).map_err(|e| format!("{}: {e}", scratch.display()))?;
+                        {
+                            let mut w = std::io::BufWriter::with_capacity(1 << 20, &mut f);
+                            deckcraft_engine::pptx::export_into(&loaded.doc, fmt, &mut w, &mut |_, _, _| deckcraft_engine::task::check().is_ok())
+                                .map_err(|e| e.to_string())?;
+                            std::io::Write::flush(&mut w).map_err(|e| e.to_string())?;
+                        }
+                        let after = std::fs::File::open(&scratch).map_err(|e| format!("{}: {e}", scratch.display()))?;
+                        crate::roundtrip::compare_readers(std::io::BufReader::new(before), std::io::BufReader::new(after))
+                    })();
+                    let _ = std::fs::remove_file(&scratch);
+                    let mut v = r.map_err(|e| format!("{path}: {e}"))?;
+                    // What the open could not keep, or found unreferenced, is part of the answer.
+                    if !loaded.damaged.is_empty() {
+                        v["notKept"] = json!(loaded.damaged);
+                        v["lossless"] = json!(false);
+                    }
+                    if !loaded.unreferenced.is_empty() {
+                        v["unreferencedParts"] = deckcraft_engine::cmd::file::unreferenced_json(&loaded.unreferenced);
+                    }
+                    Ok(v)
                 });
                 match r {
                     Ok(mut v) => {
@@ -971,6 +1008,68 @@ impl Server {
         }
         let active = s.active().map(|d| handle_of(d.uid));
         Ok(Outcome::new(json!({"closed": true, "name": title, "document": handle, "active_document": active})))
+    }
+
+    /// WHIQ: `save_presentation` (or an `export` in the same format) of a presentation the server
+    /// closed: the auto-saved copy (or the unchanged original) is copied to the path asked, which
+    /// is the save. `None` when the call is not such a save, or the format differs (that needs the
+    /// presentation open again, and the `evicted` answer says so).
+    fn save_evicted(&mut self, name: &str, args: &Value, ev: &Evicted) -> Option<Result<Outcome, ToolError>> {
+        let wants_save = match name {
+            "save_presentation" => true,
+            "export" => true,
+            "run_command" => args.get("command").and_then(Value::as_str).is_some_and(|c| c == "file.save" || c == "file.saveAs"),
+            _ => false,
+        };
+        if !wants_save {
+            return None;
+        }
+        let params = if name == "run_command" { args.get("params").cloned().unwrap_or(Value::Null) } else { args.clone() };
+        let source = ev.reopen_path()?.to_string();
+        let target = params.get("path").and_then(Value::as_str).map(String::from).or_else(|| ev.original.clone())?;
+        let fmt = |p: &str| deckcraft_engine::cmd::file::format_for_path(p).to_string();
+        let target_fmt = params.get("format").and_then(Value::as_str).map(String::from).unwrap_or_else(|| fmt(&target));
+        if target_fmt != fmt(&source) || !matches!(target_fmt.as_str(), "pptx" | "potx" | "ppsx" | "deckcraft") {
+            return None;
+        }
+        let roots = self.backend.automation_roots();
+        let keep_old = self.shared.config.keep_old && !params.get("overwrite").and_then(Value::as_bool).unwrap_or(false);
+        let same = std::fs::canonicalize(&source).ok().zip(std::fs::canonicalize(&target).ok()).is_some_and(|(a, b)| a == b);
+        let copy = || -> Result<u64, String> {
+            if same {
+                return std::fs::metadata(&source).map(|m| m.len()).map_err(|e| format!("{source}: {e}"));
+            }
+            let mut src = std::fs::File::open(&source).map_err(|e| format!("{source}: {e}"))?;
+            let mut n = 0;
+            deckcraft_engine::io::write_file_streamed(&target, &mut |f| {
+                n = std::io::copy(&mut src, f).map_err(|e| format!("{source}: {e}"))?;
+                Ok(())
+            })?;
+            Ok(n)
+        };
+        let (r, renamed) = deckcraft_engine::file_access::confine(roots.as_ref(), || {
+            if keep_old { deckcraft_engine::io::keep_previous(copy) } else { (copy(), vec![]) }
+        });
+        Some(match r {
+            Ok(bytes) => {
+                let mut v = json!({
+                    "path": absolute(&target),
+                    "bytes": bytes,
+                    "saved_from": absolute(&source),
+                    "evicted": ev.to_value(),
+                    "next_step": format!(
+                        "saved. The presentation had been closed by the server ({}); the save wrote its work from {}. Call open_presentation {{path: \"{}\"}} to edit it further",
+                        ev.reason, source, absolute(&target)
+                    ),
+                });
+                if !renamed.is_empty() {
+                    v["previous_files_renamed"] =
+                        json!(renamed.iter().map(|r| json!({"path": absolute(&r.path), "previous": absolute(&r.previous)})).collect::<Vec<_>>());
+                }
+                Ok(Outcome::new(v))
+            }
+            Err(e) => Err(contract::classify(&e, &self.error_context(name))),
+        })
     }
 
     /// Auto-save every open presentation with unsaved work, then close them all.
