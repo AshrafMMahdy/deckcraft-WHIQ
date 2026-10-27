@@ -450,7 +450,7 @@ impl Server {
             // WHIQ: a save is never lost to an eviction. The work the server auto-saved when it
             // closed the presentation (or the unchanged original) is written where the save asks,
             // byte for byte, without opening it again.
-            // The presentation the call names (the first closed, when it names none).
+            // The presentation the call names (the last closed, when it names none).
             let want = args.get("document").and_then(|v| v.as_str().map(str::to_string).or_else(|| v.as_u64().map(handle_of)));
             let all = self.shared.evicted();
             let chosen = match &want {
