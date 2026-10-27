@@ -209,10 +209,13 @@ fn on_white(img: &deckcraft_render::Image, w: u32, h: u32) -> Vec<u8> {
 
 /// Render and encode the GIF in memory (within [`max_total_pixels_in_memory`]).
 pub fn encode(doc: &Presentation, opts: &GifOptions) -> Result<GifOutput> {
+    encode_within(doc, opts, max_total_pixels_in_memory())
+}
+
+fn encode_within(doc: &Presentation, opts: &GifOptions, cap: u64) -> Result<GifOutput> {
     let frames = opts.frames(doc)?;
     let (w, h) = frame_size(doc, opts.width);
     let total = (frames.len() as u64).saturating_mul(u64::from(w)).saturating_mul(u64::from(h));
-    let cap = max_total_pixels_in_memory();
     if total > cap {
         return Err(bad(
             CMD,
@@ -432,8 +435,8 @@ mod tests {
         let slide = big.slides[0].clone();
         big.slides = vec![slide; 200];
         let o = GifOptions { width: MAX_WIDTH, ..Default::default() };
-        let e = encode(&big, &o).unwrap_err().to_string();
-        assert!(e.contains("too large"), "{e}");
+        let e = encode_within(&big, &o, MAX_TOTAL_PIXELS).unwrap_err().to_string();
+        assert!(e.contains("more GIF than this process builds"), "{e}");
         // A degenerate slide size falls back to 16:9 rather than dividing by zero.
         let mut odd = Presentation::clone(doc);
         odd.slide_size = deckcraft_geom::Size::new(0.0, f64::NAN);

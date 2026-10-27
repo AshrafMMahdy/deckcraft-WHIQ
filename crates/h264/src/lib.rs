@@ -43,9 +43,9 @@ mod synth_tests;
 mod tables;
 mod transform;
 
-pub use decoder::{DecodeStats, Decoder, default_threads};
 /// WHIQ: the video decoders' memory budget, tied to the host's (shared by every decoder).
 pub use deckcraft_bitstream::budget::set_decode_memory_budget;
+pub use decoder::{DecodeStats, Decoder, default_threads};
 pub use error::{Error, Result};
 
 /// Colour description from the VUI (ITU-T H.273 code points).

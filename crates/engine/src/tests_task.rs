@@ -90,12 +90,11 @@ fn every_job_reports_its_stages_and_progress() {
         assert!(!loaded.doc.slides.is_empty());
         let stages = t.stages();
         assert_eq!(stages.first().map(String::as_str), Some("reading the file"), "{stages:?}");
-        assert!(stages.iter().any(|s| s == "reading the presentation"), "{stages:?}");
+        // A .pptx is read slide by slide from the file; a .deckcraft as one presentation.
+        let body = if f == "p.pptx" { "reading slides" } else { "reading the presentation" };
+        assert!(stages.iter().any(|s| s == body), "{stages:?}");
         assert_eq!(stages.last().map(String::as_str), Some("adding it to the session"), "{stages:?}");
         assert!((t.overall() - 0.9).abs() < 1e-9);
-        if f == "p.pptx" {
-            assert!(stages.iter().any(|s| s == "reading slides"), "{stages:?}");
-        }
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

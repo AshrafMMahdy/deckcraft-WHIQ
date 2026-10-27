@@ -2130,7 +2130,7 @@ mod icon_and_picture_tests {
         assert!(s.execute("insert.photoAlbum", &json!({"pictures": [{"name": "notes.txt", "data": base64_encode(b"hello")}]} )).is_err());
         assert!(s.execute("insert.photoAlbum", &json!({"pictures": [{"text": "  "}]})).is_err());
         let mut many = Vec::new();
-        for i in 0..49 {
+        for i in 0..=album_max_items() {
             many.push(json!({"text": format!("box {i}")}));
         }
         assert!(s.execute("insert.photoAlbum", &json!({"pictures": many})).is_err());

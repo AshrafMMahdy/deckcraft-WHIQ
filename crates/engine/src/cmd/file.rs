@@ -440,15 +440,17 @@ pub fn writable_format_for_path(path: &str) -> Option<&'static str> {
 /// WHIQ: the GIF streamed into the file at `path` (one frame in memory): the output and the bytes.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn gif_to_path(doc: &Presentation, opts: &crate::gif_export::GifOptions, path: &str) -> Result<(crate::gif_export::GifOutput, u64)> {
-    crate::task::phase("rendering GIF frames", 0.0, 1.0);
     let mut out = None;
     let mut n = 0;
     crate::io::write_file_streamed(path, &mut |file| {
         {
             let mut w = std::io::BufWriter::with_capacity(1 << 20, &mut *file);
             out = Some(crate::gif_export::encode_into(doc, opts, &mut w).map_err(|e| e.to_string())?);
+            // The frames are 0..0.9 of the work (`encode_into`); the last tenth is the file.
+            crate::task::phase("writing the file", 0.9, 1.0);
             std::io::Write::flush(&mut w).map_err(|e| e.to_string())?;
         }
+        crate::task::step(1, 1).map_err(|e| e.to_string())?;
         n = file.metadata().map(|m| m.len()).unwrap_or(0);
         Ok(())
     })
@@ -555,7 +557,8 @@ pub fn save_to_path(doc: &Presentation, format: &str, path: &str) -> Result<u64>
                 n = deckcraft_pptx::export_into(doc, f, &mut w, &mut on).map_err(|e| e.to_string())?;
                 // The package is compressed into the file as it goes; what is left is its end.
                 crate::task::phase("writing the file", 0.95, 1.0);
-                std::io::Write::flush(&mut w).map_err(|e| e.to_string())
+                std::io::Write::flush(&mut w).map_err(|e| e.to_string())?;
+                crate::task::step(1, 1).map_err(|e| e.to_string())
             })
             .map_err(|e| if crate::task::check().is_err() { crate::task::cancelled() } else { EngineError::Other(e) })?;
             Ok(n)
@@ -570,6 +573,7 @@ pub fn save_to_path(doc: &Presentation, format: &str, path: &str) -> Result<u64>
                     crate::task::phase("writing the file", 0.95, 1.0);
                     std::io::Write::flush(&mut w).map_err(|e| e.to_string())?;
                 }
+                crate::task::step(1, 1).map_err(|e| e.to_string())?;
                 n = file.metadata().map(|m| m.len()).unwrap_or(0);
                 Ok(())
             })

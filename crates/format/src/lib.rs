@@ -948,6 +948,13 @@ fn outline_includes_table_text() {
     assert!(out.contains("Text box body"), "{out}");
     assert!(out.contains("Cell A1\tCell B1"), "{out}");
     assert!(out.contains("Cell A2\tCell B2"), "{out}");
+}
+
+#[cfg(test)]
+mod whiq_spill_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+    use std::io::Cursor;
 
     #[test]
     fn whiq_large_media_round_trips_through_a_spill_file() {

@@ -29,11 +29,11 @@ use std::sync::Arc;
 
 pub use audio::Pcm;
 pub use clip::ClipParams;
+/// WHIQ: tie every video decoder's memory budget to the host's (`--max-memory-mb`).
+pub use deckcraft_h264::set_decode_memory_budget;
 pub use feed::VideoFeed;
 pub use player::{AudioOut, PlayState, Player, VoiceSpec, VoiceStatus};
 pub use probe::{AudioInfo, MediaInfo, VideoInfo, probe};
-/// WHIQ: tie every video decoder's memory budget to the host's (`--max-memory-mb`).
-pub use deckcraft_h264::set_decode_memory_budget;
 pub use video::{Frame, VideoDecoder, poster_frame, poster_png};
 
 /// Shared media bytes (the model's `MediaItem::data`).
