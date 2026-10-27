@@ -198,7 +198,8 @@ fn overlay_deck() -> Value {
 }
 
 /// The overlay regression deck: every mark kind, solid and dashed, arrowed, open and filled,
-/// labelled, rendered to PNG and probed where each mark must be (box: 43.2, 122.4, 873.6 × 288).
+/// labelled, rendered to PNG and probed where each mark must be: in percent of the visible
+/// picture (a 16:9 picture letterboxed in the 873.6 × 288 slot: 224, 122.4, 512 × 288).
 #[test]
 fn overlay_regression_deck_renders_every_mark() {
     let dir = scratch("overlays");
@@ -215,7 +216,7 @@ fn overlay_regression_deck_renders_every_mark() {
     let _ = std::fs::copy(dir.join("overlays.pptx"), PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("overlay-regression.pptx"));
     let img = image::load_from_memory(&bytes).unwrap().to_rgba8();
     assert_eq!((img.width(), img.height()), (960, 540));
-    let (bx, by, bw, bh) = (43.2, 122.4, 873.6, 288.0);
+    let (bx, by, bw, bh) = (224.0, 122.4, 512.0, 288.0);
     let at = |px: f64, py: f64| (bx + px / 100.0 * bw, by + py / 100.0 * bh);
     let any = |pts: &[[u8; 3]], f: &dyn Fn([u8; 3]) -> bool| pts.iter().any(|p| f(*p));
     let all = |pts: &[[u8; 3]], f: &dyn Fn([u8; 3]) -> bool| pts.iter().all(|p| f(*p));
@@ -257,6 +258,83 @@ fn overlay_regression_deck_renders_every_mark() {
     }
     let sh = shapes(&mut m, 0);
     assert_eq!(sh.iter().filter(|s| s["name"].as_str().unwrap().starts_with("Overlay")).count(), 6 + 4, "6 marks, 4 labels");
+}
+
+/// A drawing with the Polaris scan's aspect (4967 × 3509), letterboxed in a full-width slot.
+fn drawing(dir: &Path) -> PathBuf {
+    let p = dir.join("drawing.png");
+    image::RgbImage::from_pixel(1415, 1000, image::Rgb([250, 250, 245])).save(&p).unwrap();
+    p
+}
+
+fn boxed(shapes: &[Value], name: &str) -> [f64; 4] {
+    let s = shapes.iter().find(|s| s["name"] == name).unwrap_or_else(|| panic!("no {name}"));
+    let b = s["box"].as_array().unwrap();
+    [0, 1, 2, 3].map(|k| b[k].as_f64().unwrap())
+}
+
+fn assert_box(got: [f64; 4], want: [f64; 4], what: &str) {
+    assert!(got.iter().zip(want).all(|(g, w)| (g - w).abs() < 0.05), "{what}: {got:?}, expected {want:?}");
+}
+
+/// D1: build_deck draws overlays in percent of the visible picture, not of its slot, when the
+/// picture is letterboxed; `relativeTo: box` at slide, image or overlay level keeps the slot.
+#[test]
+fn build_deck_overlays_land_on_the_visible_picture_of_a_letterboxed_drawing() {
+    let dir = scratch("overlay-letterbox");
+    let mut m = start(&dir);
+    drawing(&dir);
+    let marks = || {
+        json!([
+            {"kind": "rect", "x": 10, "y": 10, "w": 20, "h": 20, "label": "TP-001"},
+            {"kind": "rect", "x": 10, "y": 10, "w": 20, "h": 20, "label": "Slot", "relativeTo": "box"}
+        ])
+    };
+    let r = m.ok("build_deck", json!({"titleSlide": false, "slides": [
+        {"layout": "image", "title": "Default", "image": {"path": "drawing.png", "position": "full"}, "overlays": marks()},
+        {"layout": "image", "title": "Slide box", "relativeTo": "box", "image": {"path": "drawing.png", "position": "full"}, "overlays": marks()},
+        {"layout": "image", "title": "Image box", "image": {"path": "drawing.png", "position": "full", "relativeTo": "box"}, "overlays": marks()},
+        {"layout": "image", "title": "Slide box, image image", "relativeTo": "box", "image": {"path": "drawing.png", "relativeTo": "image"}, "overlays": marks()}
+    ]}));
+    assert!(r["warnings"].as_array().unwrap().is_empty(), "{r}");
+    // Slot 43.2, 122.4, 873.6 × 288; the drawing (1.415:1) inside it: 276.24, 122.4, 407.52 × 288.
+    let slot = [43.2 + 87.36, 122.4 + 28.8, 174.72, 57.6];
+    let visible = [276.24 + 40.752, 122.4 + 28.8, 81.504, 57.6];
+    for (k, first) in [(0, visible), (1, slot), (2, slot), (3, visible)] {
+        let sh = shapes(&mut m, k);
+        assert_box(boxed(&sh, "Picture"), [43.2, 122.4, 873.6, 288.0], "the picture keeps its slot");
+        assert_box(boxed(&sh, "Overlay: TP-001"), first, &format!("slide {k}"));
+        assert_box(boxed(&sh, "Overlay: Slot"), slot, &format!("slide {k}: the mark's own relativeTo"));
+    }
+}
+
+/// D2: add_overlays {relativeTo: image} on a letterboxed drawing measures the visible picture:
+/// every mark keeps its width (it used to collapse to a point at the picture's left edge).
+#[test]
+fn add_overlays_relative_to_the_image_keeps_each_mark_on_the_drawing() {
+    let dir = scratch("overlay-image");
+    let mut m = start(&dir);
+    drawing(&dir);
+    m.ok("build_deck", json!({"titleSlide": false, "slides": [{"layout": "image", "title": "Plan", "image": {"path": "drawing.png"}}]}));
+    let sh = shapes(&mut m, 0);
+    let id = sh.iter().find(|s| s["name"] == "Picture").unwrap()["id"].as_u64().unwrap();
+    m.ok(
+        "add_overlays",
+        json!({"id": id, "relativeTo": "image", "overlays": [
+            {"kind": "rect", "x": 0, "y": 0, "w": 100, "h": 100, "label": "Whole"},
+            {"kind": "rect", "x": 8, "y": 12, "w": 22, "h": 14, "label": "TP-001 Storage compound"},
+            {"kind": "line", "x": 5, "y": 85, "w": 92, "h": 85, "label": "Haul road"}
+        ]}),
+    );
+    let sh = shapes(&mut m, 0);
+    let (ix, iy, iw, ih) = (276.24, 122.4, 407.52, 288.0);
+    assert_box(boxed(&sh, "Overlay: Whole"), [ix, iy, iw, ih], "the whole drawing");
+    assert_box(boxed(&sh, "Overlay: TP-001 Storage compound"), [ix + 0.08 * iw, iy + 0.12 * ih, 0.22 * iw, 0.14 * ih], "a compound");
+    let line = boxed(&sh, "Overlay Line: Haul road");
+    assert_box(line, [ix + 0.05 * iw, iy + 0.85 * ih, 0.87 * iw, 0.0], "a haul road");
+    // The default stays the picture box.
+    m.ok("add_overlays", json!({"id": id, "overlays": [{"kind": "rect", "x": 0, "y": 0, "w": 100, "h": 100, "label": "Box"}]}));
+    assert_box(boxed(&shapes(&mut m, 0), "Overlay: Box"), [43.2, 122.4, 873.6, 288.0], "relativeTo box by default");
 }
 
 /// The same vocabulary on a picture already on a slide (in place), from the platform's table rows.

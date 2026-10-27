@@ -32,7 +32,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Build Deck",
             [],
             None,
-            "{slides: [{layout: bullets|two-column|table|callout|kpi|section|quote|chart|image, title, notes, bullets, paragraphs, left, right, table, kpis, quote, attribution, text, chart, image, images, overlays}], title?, subtitle?, titleSlide?: bool, theme?: corporate|slate|warm|mono|{colours, fontHead, fontBody}, template?: .pptx/.potx path, logo?: image path, slideNumbers?: bool, path?: save to (.pptx/.potx/.deckcraft)} → {document, slides, warnings, path?}",
+            "{slides: [{layout: bullets|two-column|table|callout|kpi|section|quote|chart|image, title, notes, bullets, paragraphs, left, right, table, kpis, quote, attribution, text, chart, image: {path, position, caption, relativeTo?}, images, overlays (percent of the visible picture; relativeTo: box on the slide, image or mark for its slot), relativeTo?}], title?, subtitle?, titleSlide?: bool, theme?: corporate|slate|warm|mono|{colours, fontHead, fontBody}, template?: .pptx/.potx path, logo?: image path, slideNumbers?: bool, path?: save to (.pptx/.potx/.deckcraft)} → {document, slides, warnings, path?}",
             always,
             build
         ),
@@ -41,7 +41,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Picture Overlays",
             [],
             None,
-            "{id?: picture (else the selected one), overlays: [{kind: rect|ellipse|line|text|path, x, y, w, h (percent of the picture box), color, label, points, dashed, arrow: end|both, filled}] | rows: [[shape, x, y, w, h, colour, label, points?, style?]], relativeTo?: box|image} → {ids}",
+            "{id?: picture (else the selected one), overlays: [{kind: rect|ellipse|line|text|path, x, y, w, h (percent of the picture box), color, label, points, dashed, arrow: end|both, filled, relativeTo?}] | rows: [[shape, x, y, w, h, colour, label, points?, style?]], relativeTo?: box|image} → {ids}",
             has_slide,
             picture_overlay
         ),
@@ -527,7 +527,7 @@ impl Builder {
 
     fn picture(&mut self, media: deckcraft_model::MediaId, rect: Xfrm, name: &str) -> Result<Shape> {
         // `contain`: the whole picture inside the box, centred; padding through negative crop.
-        let (pw, ph) = self.doc.media(media).map(|m| image_px(m.data.as_ref())).unwrap_or((4.0, 3.0));
+        let (pw, ph) = self.doc.media(media).map(|m| image_px(&m.bytes())).unwrap_or((4.0, 3.0));
         let (ia, ba) = (pw / ph.max(1e-9), rect.w / rect.h.max(1e-9));
         let crop = if ia > ba {
             let pad = (ia / ba - 1.0) / 2.0;
@@ -729,12 +729,14 @@ struct ImageSpec {
     path: String,
     pos: &'static str,
     caption: String,
+    /// `relativeTo` given on the image: what its overlays' percentages measure.
+    relative_to: Option<Rel>,
 }
 
 fn images(slide: &Value) -> Vec<ImageSpec> {
     let one = |v: &Value| -> Option<ImageSpec> {
         match v {
-            Value::String(p) => Some(ImageSpec { path: p.clone(), pos: "full", caption: String::new() }),
+            Value::String(p) => Some(ImageSpec { path: p.clone(), pos: "full", caption: String::new(), relative_to: None }),
             Value::Object(o) => {
                 let path = o.get("path").or_else(|| o.get("src")).or_else(|| o.get("file")).and_then(Value::as_str)?.to_string();
                 let pos =
@@ -745,7 +747,7 @@ fn images(slide: &Value) -> Vec<ImageSpec> {
                         _ => "full",
                     };
                 let caption = o.get("caption").or_else(|| o.get("alt")).and_then(Value::as_str).unwrap_or_default().to_string();
-                Some(ImageSpec { path, pos, caption })
+                Some(ImageSpec { path, pos, caption, relative_to: rel_param(v) })
             }
             _ => None,
         }
@@ -774,6 +776,53 @@ pub struct Overlay {
     /// `None`, `end` or `both`.
     pub arrow: Option<&'static str>,
     pub filled: bool,
+    /// The mark's own `relativeTo`, over the call's, the image's and the slide's.
+    pub relative_to: Option<Rel>,
+}
+
+/// What an overlay's percentages measure: the picture's box (its slot on the slide) or the visible
+/// picture inside it, which is smaller when the picture is letterboxed to keep its aspect.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rel {
+    Box,
+    Image,
+}
+
+/// `relativeTo` (or `relative_to`) of an object: `image`/`picture`/`drawing` or `box`/`slot`/`frame`.
+fn rel_param(v: &Value) -> Option<Rel> {
+    let r = v.get("relativeTo").or_else(|| v.get("relative_to")).and_then(Value::as_str)?;
+    match r.trim().to_ascii_lowercase().as_str() {
+        "image" | "picture" | "drawing" | "visible" | "content" => Some(Rel::Image),
+        "box" | "slot" | "frame" | "shape" => Some(Rel::Box),
+        _ => None,
+    }
+}
+
+/// The crop of a picture shape (none for any other shape).
+fn picture_crop(sh: &Shape) -> [f64; 4] {
+    match &sh.kind {
+        ShapeKind::Picture { fill } => fill.crop,
+        _ => [0.0; 4],
+    }
+}
+
+/// The visible picture inside its box `bx`, from the picture's crop (fractions of the picture per
+/// side, left/top/right/bottom; a negative crop is padding, the letterbox). The box itself when
+/// nothing pads it.
+pub fn visible_picture(bx: Xfrm, crop: [f64; 4]) -> Xfrm {
+    let [l, t, r, b] = crop.map(|c| if c.is_finite() { c } else { 0.0 });
+    // The box shows the source rectangle [l, 1-r] × [t, 1-b] of the picture; the picture's own
+    // [0, 1] × [0, 1] lands at (u - l) / (1 - l - r) of the box, clipped to the box.
+    let span = |a: f64, z: f64, len: f64, origin: f64| -> (f64, f64) {
+        let f = (1.0 - a - z).max(1e-6);
+        let lo = (0.0f64.max(a) - a) / f;
+        let hi = ((1.0 - z).min(1.0) - a) / f;
+        let (lo, hi) = (lo.clamp(0.0, 1.0), hi.clamp(0.0, 1.0));
+        (origin + lo * len, ((hi - lo) * len).max(1e-3))
+    };
+    let (x, w) = span(l, r, bx.w, bx.x);
+    let (y, h) = span(t, b, bx.h, bx.y);
+    Xfrm { x, y, w, h, ..bx }
 }
 
 fn pct(v: Option<&Value>) -> f64 {
@@ -855,7 +904,7 @@ pub fn parse_overlays(v: &Value, warnings: &mut Vec<String>) -> Vec<Overlay> {
     let (points_col, style_col) = (col("points", 7), col("style", 8));
     let mut out = vec![];
     for (i, item) in items.iter().enumerate().take(2000) {
-        let (kind_raw, x, y, w, h, color, label, points, style, dashed, arrow, filled) = match item {
+        let (kind_raw, x, y, w, h, color, label, points, style, dashed, arrow, filled, relative_to) = match item {
             Value::Array(r) => {
                 let s = |k: usize| r.get(k).map(|c| c.as_str().map(String::from).unwrap_or_else(|| c.to_string())).unwrap_or_default();
                 let kind = s(0);
@@ -872,6 +921,7 @@ pub fn parse_overlays(v: &Value, warnings: &mut Vec<String>) -> Vec<Overlay> {
                     s(6),
                     parse_points(r.get(points_col)),
                     s(style_col),
+                    None,
                     None,
                     None,
                     None,
@@ -901,6 +951,7 @@ pub fn parse_overlays(v: &Value, warnings: &mut Vec<String>) -> Vec<Overlay> {
                     o.get("dashed").and_then(Value::as_bool),
                     arrow,
                     o.get("filled").or_else(|| o.get("fill")).and_then(Value::as_bool),
+                    rel_param(item),
                 )
             }
             _ => continue,
@@ -927,6 +978,7 @@ pub fn parse_overlays(v: &Value, warnings: &mut Vec<String>) -> Vec<Overlay> {
             dashed: dashed.unwrap_or(sd),
             arrow: arrow.unwrap_or(sa).or(arrow_word),
             filled: filled.unwrap_or(sf),
+            relative_to,
         };
         if o.kind == "path" && o.points.len() < 2 {
             warnings.push(format!("overlay {i}: a path needs at least two points"));
@@ -937,14 +989,12 @@ pub fn parse_overlays(v: &Value, warnings: &mut Vec<String>) -> Vec<Overlay> {
     out
 }
 
-/// The shapes that draw `marks` over the picture box `bx` (points), as the platform draws them.
-fn overlay_shapes(b: &mut Builder, bx: Xfrm, marks: &[Overlay]) -> Result<Vec<Shape>> {
-    let clamp = |p: f64| p.clamp(0.0, 100.0);
-    let fx = |p: f64| bx.x + clamp(p) / 100.0 * bx.w;
-    let fy = |p: f64| bx.y + clamp(p) / 100.0 * bx.h;
+/// The shapes that draw `marks` over a picture (points), as the platform draws them: each mark in
+/// percent of the picture's box `slot` or of the visible picture inside it (from the picture's
+/// `crop`), by its own `relativeTo`, else `default`.
+fn overlay_shapes(b: &mut Builder, slot: Xfrm, crop: [f64; 4], default: Rel, marks: &[Overlay]) -> Result<Vec<Shape>> {
+    let visible = visible_picture(slot, crop);
     let min_side = 0.02 * 72.0 * b.sx;
-    let fw = |p: f64| (clamp(p) / 100.0 * bx.w).max(min_side);
-    let fh = |p: f64| (clamp(p) / 100.0 * bx.h).max(min_side);
     let stroke = |m: &Overlay, width: f64| Line {
         fill: Some(Fill::solid(ColorRef::rgb(m.color))),
         width: Some(width),
@@ -966,6 +1016,12 @@ fn overlay_shapes(b: &mut Builder, bx: Xfrm, marks: &[Overlay]) -> Result<Vec<Sh
     };
     let mut out = vec![];
     for m in marks {
+        let bx = if m.relative_to.unwrap_or(default) == Rel::Image { visible } else { slot };
+        let clamp = |p: f64| p.clamp(0.0, 100.0);
+        let fx = |p: f64| bx.x + clamp(p) / 100.0 * bx.w;
+        let fy = |p: f64| bx.y + clamp(p) / 100.0 * bx.h;
+        let fw = |p: f64| (clamp(p) / 100.0 * bx.w).max(min_side);
+        let fh = |p: f64| (clamp(p) / 100.0 * bx.h).max(min_side);
         let label = [Para { text: m.label.clone(), level: 0, bullet: false }];
         match m.kind.as_str() {
             "text" => {
@@ -1306,6 +1362,8 @@ fn build_slide(b: &mut Builder, i: usize, spec: &Value) -> Result<Vec<Slide>> {
     }
 
     let rows = table_rows(spec.get("table"));
+    // Overlays measure the visible picture unless the slide (or its image, or the mark) says `box`.
+    let slide_rel = rel_param(spec);
     let marks = match spec.get("overlays").or_else(|| spec.get("overlay")).or_else(|| spec.get("markup")) {
         Some(v) => {
             let mut w = vec![];
@@ -1356,9 +1414,10 @@ fn build_slide(b: &mut Builder, i: usize, spec: &Value) -> Result<Vec<Slide>> {
             let ix = if im.pos == "left" { 0.6 } else { 0.9 + half };
             let bx = b.r(ix, 1.7, half, 4.4);
             let pic = b.picture(*m, bx, if im.caption.is_empty() { "Picture" } else { &im.caption })?;
+            let crop = picture_crop(&pic);
             s.shapes.push(pic);
             if !marks.is_empty() {
-                let shapes = overlay_shapes(b, bx, &marks)?;
+                let shapes = overlay_shapes(b, bx, crop, im.relative_to.or(slide_rel).unwrap_or(Rel::Image), &marks)?;
                 s.shapes.extend(shapes);
             }
             if !im.caption.is_empty() {
@@ -1380,9 +1439,10 @@ fn build_slide(b: &mut Builder, i: usize, spec: &Value) -> Result<Vec<Slide>> {
                 let x = 0.6 + k as f64 * (gw + 0.3);
                 let bx = b.r(x, 1.7, gw, 4.0);
                 let pic = b.picture(*m, bx, if im.caption.is_empty() { "Picture" } else { &im.caption })?;
+                let crop = picture_crop(&pic);
                 s.shapes.push(pic);
                 if k == 0 && !marks.is_empty() {
-                    let shapes = overlay_shapes(b, bx, &marks)?;
+                    let shapes = overlay_shapes(b, bx, crop, im.relative_to.or(slide_rel).unwrap_or(Rel::Image), &marks)?;
                     s.shapes.extend(shapes);
                 }
                 if !im.caption.is_empty() {
@@ -1734,15 +1794,9 @@ fn picture_overlay(s: &mut Session, p: &Value) -> Result<Value> {
     let ShapeKind::Picture { fill } = &pic.kind else {
         return Err(bad("picture.overlay", format!("shape {} is not a picture", id.0)));
     };
-    let mut bx = xfrm_of(&st.doc, &st.selection, &pic);
-    if str_param(p, "relativeTo").is_some_and(|r| r.eq_ignore_ascii_case("image")) {
-        // The picture itself inside its box (padding by negative crop excluded).
-        let [l, t, r, bt] = fill.crop;
-        let (fw, fh) = ((1.0 - l - r).max(1e-6), (1.0 - t - bt).max(1e-6));
-        let (ox, oy) = ((-l).max(0.0) / fw * bx.w, (-t).max(0.0) / fh * bx.h);
-        let (iw, ih) = (bx.w * (1.0 - (-l).max(0.0) - (-r).max(0.0)) / fw, bx.h * (1.0 - (-t).max(0.0) - (-bt).max(0.0)) / fh);
-        bx = Xfrm::new(bx.x + ox, bx.y + oy, iw.max(1.0), ih.max(1.0));
-    }
+    let bx = xfrm_of(&st.doc, &st.selection, &pic);
+    // Percent of the picture box unless `relativeTo: image` (the call's, or a mark's own).
+    let (crop, default) = (fill.crop, rel_param(p).unwrap_or(Rel::Box));
     let mut warnings = vec![];
     let src = p.get("overlays").or_else(|| p.get("rows").map(|_| p)).cloned().unwrap_or(Value::Null);
     let marks = parse_overlays(&src, &mut warnings);
@@ -1762,7 +1816,7 @@ fn picture_overlay(s: &mut Session, p: &Value) -> Result<Value> {
         logo: None,
         slide_numbers: false,
     };
-    let shapes = overlay_shapes(&mut b, bx, &marks)?;
+    let shapes = overlay_shapes(&mut b, bx, crop, default, &marks)?;
     let next_id = b.doc.next_id;
     let ids: Vec<u32> = shapes.iter().map(|x| x.id.0).collect();
     s.edit(|doc, sel| {
@@ -1912,6 +1966,39 @@ mod tests {
         assert_eq!(o[1].points.len(), 3);
         assert_eq!(o[1].arrow, Some("end"));
         assert!(o[1].filled);
+    }
+
+    /// D1/D2: the visible picture inside a letterboxed box, both ways, and a mark's own relativeTo.
+    #[test]
+    fn whiq_overlays_measure_the_visible_picture_of_a_letterboxed_box() {
+        let near = |a: Xfrm, b: [f64; 4]| {
+            for (x, y) in [a.x, a.y, a.w, a.h].into_iter().zip(b) {
+                assert!((x - y).abs() < 1e-6, "{a:?} vs {b:?}");
+            }
+        };
+        let bx = Xfrm::new(43.2, 122.4, 873.6, 288.0);
+        // A 4967 × 3509 scan in a 3.03:1 slot: padded left and right (pad > 0.5 of its width,
+        // where the old formula collapsed it to one point at its left edge).
+        let ia = 4967.0 / 3509.0;
+        let pad = (bx.w / bx.h / ia - 1.0) / 2.0;
+        assert!(pad > 0.5);
+        let iw = bx.h * ia;
+        near(visible_picture(bx, [-pad, 0.0, -pad, 0.0]), [43.2 + (873.6 - iw) / 2.0, 122.4, iw, 288.0]);
+        // A tall picture in a wide box, and a wide one in a tall box: padded top and bottom.
+        near(visible_picture(Xfrm::new(0.0, 0.0, 100.0, 400.0), [0.0, -0.5, 0.0, -0.5]), [0.0, 100.0, 100.0, 200.0]);
+        // Nothing padded (a real crop): the box itself.
+        near(visible_picture(bx, [0.1, 0.0, 0.2, 0.0]), [43.2, 122.4, 873.6, 288.0]);
+        near(visible_picture(bx, [0.0; 4]), [43.2, 122.4, 873.6, 288.0]);
+
+        let mut w = vec![];
+        let o = parse_overlays(
+            &json!([{"kind": "rect", "x": 0, "y": 0, "w": 50, "h": 50, "relativeTo": "box"}, {"kind": "rect", "x": 0, "y": 0, "w": 50, "h": 50}]),
+            &mut w,
+        );
+        assert_eq!((o[0].relative_to, o[1].relative_to), (Some(Rel::Box), None));
+        assert_eq!(rel_param(&json!({"relativeTo": "image"})), Some(Rel::Image));
+        assert_eq!(rel_param(&json!({"relative_to": "slot"})), Some(Rel::Box));
+        assert_eq!(rel_param(&json!({"relativeTo": "?"})), None);
     }
 
     #[test]

@@ -90,6 +90,27 @@ kept as `target/tmp/overlay-regression.png` and `.pptx` — and probes each mark
 DrawingML: `prstDash`, `headEnd`/`tailEnd`, `custGeom`, `close`, alpha),
 `overlays_go_on_an_existing_picture_from_the_platform_table`.
 
+**Corrected 2026-10-21 (platform corpus check, D1 / D2).** A picture is placed `contain` (the whole
+picture in its slot, centred, the letterbox as negative crop), so on a drawing whose aspect differs
+from the slot the slot's percentages miss the drawing (the Polaris DC-1 site-logistics markup landed
+off the scan). Now:
+
+- **D1** — `build_deck` measures overlays in percent of the **visible picture** by default;
+  `relativeTo: box` (also `slot`) on the slide, on its `image`, or on one mark measures the slot
+  instead, the innermost winning (mark › image › slide). It was ignored at all three levels.
+- **D2** — `add_overlays {relativeTo: image}` computed the visible width as
+  `(1 − pad_left − pad_right) / (1 + pad_left + pad_right)` of the box, which goes negative once the
+  letterbox is more than the picture's own width (a 1.415:1 scan in a 3:1 slot) and was clamped to
+  one point: every mark collapsed onto the picture's left edge. The visible picture is now one
+  function for both tools (`visible_picture(slot, crop)`: the picture's [0, 1] mapped through the
+  crop's source rectangle and clipped to the box). `add_overlays` keeps the box as its default and
+  takes `relativeTo` on a mark too.
+
+Tests: `build.rs` `whiq_overlays_measure_the_visible_picture_of_a_letterboxed_box`;
+`deck.rs` `build_deck_overlays_land_on_the_visible_picture_of_a_letterboxed_drawing` (the scan's
+1.415:1 aspect, all four levels), `add_overlays_relative_to_the_image_keeps_each_mark_on_the_drawing`;
+`overlay_regression_deck_renders_every_mark` now probes the visible picture.
+
 ## 4. Theme adoption from a company template, `.potx`
 
 - `build_deck {template: company.pptx|.potx}` builds on the template itself: its theme (colours,
