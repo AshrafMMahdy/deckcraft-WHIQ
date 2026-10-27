@@ -641,6 +641,9 @@ fn render(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(bad("file.render", format!("no slide {i}")));
     }
     let (png, w, h) = render_png(&st.doc, i, f64_or(p, "scale", 1.0), bool_or(p, "edit", false));
+    if let Some(why) = st.doc.media_failure() {
+        return Err(EngineError::Other(format!("nothing was rendered: {why}")));
+    }
     Ok(json!({"png": base64_encode(&png), "width": w, "height": h}))
 }
 
@@ -691,6 +694,9 @@ fn export(s: &mut Session, p: &Value) -> Result<Value> {
                 crate::task::step(k, slides.len())
                     .map_err(|e| if written.is_empty() { e } else { EngineError::Other(format!("{e} (slides 1–{k} were written)")) })?;
                 let img = deckcraft_render::render_slide(&st.doc, *i, &deckcraft_render::RenderOpts { scale, ..Default::default() });
+                if let Some(why) = st.doc.media_failure() {
+                    return Err(EngineError::Other(format!("nothing was written for slide {i}: {why}")));
+                }
                 let bytes = picture_bytes(&img, &format, scale);
                 let out = if slides.len() == 1 {
                     path.clone()

@@ -98,7 +98,8 @@ fn info(s: &mut Session, p: &Value) -> Result<Value> {
     let (id, m) = target(s, p, "media.info")?;
     let st = s.doc()?;
     let item = st.doc.media(m.media).ok_or_else(|| EngineError::Other("the media data is missing".into()))?;
-    let probe = deckcraft_media::probe(&item.shared_bytes()).map(|i| probe_json(&i)).unwrap_or_else(|e| json!({"error": e.to_string()}));
+    let bytes = item.try_shared_bytes().map_err(|e| EngineError::Other(format!("{}: the media could not be read back: {e}", item.name)))?;
+    let probe = deckcraft_media::probe(&bytes).map(|i| probe_json(&i)).unwrap_or_else(|e| json!({"error": e.to_string()}));
     Ok(json!({
         "id": id,
         "name": item.name,
@@ -137,7 +138,8 @@ fn poster_frame(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(bad("media.posterFrame", "only videos have poster frames"));
     }
     let ms = ms_param(p, "ms").or_else(|| s.media_status.get(&id).map(|st: &MediaStatus| st.position_ms)).unwrap_or(0);
-    let data = s.doc()?.doc.media(m.media).map(|i| i.shared_bytes()).ok_or_else(|| EngineError::Other("the media data is missing".into()))?;
+    let item = s.doc()?.doc.media(m.media).ok_or_else(|| EngineError::Other("the media data is missing".into()))?;
+    let data = item.try_shared_bytes().map_err(|e| EngineError::Other(format!("{}: the media could not be read back: {e}", item.name)))?;
     let png = poster_png(&data, ms).ok_or_else(|| EngineError::Other("no frame could be decoded there".into()))?;
     let name = format!("poster{id}.png");
     let poster = s.edit(|doc, _| doc.add_media(&name, "image/png", png).ok_or_else(|| bad("media.posterFrame", NO_ID_SPACE)))?;

@@ -962,19 +962,40 @@ impl MediaItem {
             _ => self.data.len() as u64,
         }
     }
-    /// The bytes, read from disk for a spilled part (empty when that read fails).
+    /// The bytes, read from disk for a spilled part. A part that cannot be read back gives NO bytes
+    /// here and the failure is kept ([`MediaItem::failure`]); callers that can report it use
+    /// [`MediaItem::try_bytes`].
     pub fn bytes(&self) -> std::borrow::Cow<'_, [u8]> {
         match &self.spill {
             Some(s) if self.data.is_empty() => std::borrow::Cow::Owned(s.read_all().unwrap_or_default()),
             _ => std::borrow::Cow::Borrowed(self.data.as_slice()),
         }
     }
-    /// The bytes behind an `Arc` (read from disk for a spilled part).
+    /// The bytes, or why they cannot be read (a spill file that is gone or short).
+    pub fn try_bytes(&self) -> std::io::Result<std::borrow::Cow<'_, [u8]>> {
+        match &self.spill {
+            Some(s) if self.data.is_empty() => s.read_all().map(std::borrow::Cow::Owned),
+            _ => Ok(std::borrow::Cow::Borrowed(self.data.as_slice())),
+        }
+    }
+    /// The bytes behind an `Arc` (read from disk for a spilled part; none when that fails: see
+    /// [`MediaItem::try_shared_bytes`]).
     pub fn shared_bytes(&self) -> Arc<Vec<u8>> {
         match &self.spill {
             Some(s) if self.data.is_empty() => Arc::new(s.read_all().unwrap_or_default()),
             _ => Arc::clone(&self.data),
         }
+    }
+    /// [`MediaItem::shared_bytes`], or why the bytes cannot be read.
+    pub fn try_shared_bytes(&self) -> std::io::Result<Arc<Vec<u8>>> {
+        match &self.spill {
+            Some(s) if self.data.is_empty() => s.read_all().map(Arc::new),
+            _ => Ok(Arc::clone(&self.data)),
+        }
+    }
+    /// Why this part could not be read back from its spill file, if it could not.
+    pub fn failure(&self) -> Option<String> {
+        self.spill.as_ref().and_then(|s| s.failure()).map(|why| format!("{}: {why}", self.name))
     }
     /// The first `n` bytes (format sniffing without reading a spilled part whole).
     pub fn head(&self, n: usize) -> Vec<u8> {
@@ -1142,6 +1163,11 @@ impl Presentation {
     }
     pub fn media(&self, id: MediaId) -> Option<&MediaItem> {
         self.media.iter().find(|m| m.id == id)
+    }
+    /// Why a media part could not be read back from disk, if one could not: a save, render or
+    /// export of the presentation then refuses rather than leave it out.
+    pub fn media_failure(&self) -> Option<String> {
+        self.media.iter().find_map(MediaItem::failure)
     }
     /// Add media bytes, reusing an identical existing item.
     pub fn add_media(&mut self, name: &str, content_type: &str, data: Vec<u8>) -> Option<MediaId> {

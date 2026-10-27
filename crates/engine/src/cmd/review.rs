@@ -648,7 +648,12 @@ fn revised_bytes(p: &Value) -> Result<(String, Vec<u8>)> {
 fn revisions_json(st: &crate::DocState) -> Result<Value> {
     let c = st.compare.as_ref().ok_or_else(|| bad("review.revisions", "not comparing"))?;
     let name = std::path::Path::new(&c.name).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| c.name.clone());
-    Ok(json!({"name": name, "changes": crate::compare::diff(&st.doc, &c.revised, c.by_position), "byPosition": c.by_position}))
+    let changes = crate::compare::diff(&st.doc, &c.revised, c.by_position);
+    // A picture that could not be read back from disk is not "unchanged": say so.
+    if let Some(why) = st.doc.media_failure().or_else(|| c.revised.media_failure()) {
+        return Err(EngineError::Other(why));
+    }
+    Ok(json!({"name": name, "changes": changes, "byPosition": c.by_position}))
 }
 
 fn compare(s: &mut Session, p: &Value) -> Result<Value> {

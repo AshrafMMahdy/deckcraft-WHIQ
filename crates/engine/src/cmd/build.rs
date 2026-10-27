@@ -527,7 +527,10 @@ impl Builder {
 
     fn picture(&mut self, media: deckcraft_model::MediaId, rect: Xfrm, name: &str) -> Result<Shape> {
         // `contain`: the whole picture inside the box, centred; padding through negative crop.
-        let (pw, ph) = self.doc.media(media).map(|m| image_px(&m.bytes())).unwrap_or((4.0, 3.0));
+        let (pw, ph) = match self.doc.media(media) {
+            Some(m) => image_px(&m.try_bytes().map_err(|e| EngineError::Other(format!("{}: the picture could not be read back: {e}", m.name)))?),
+            None => (4.0, 3.0),
+        };
         let (ia, ba) = (pw / ph.max(1e-9), rect.w / rect.h.max(1e-9));
         let crop = if ia > ba {
             let pad = (ia / ba - 1.0) / 2.0;
