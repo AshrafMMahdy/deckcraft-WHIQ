@@ -450,12 +450,30 @@ impl Server {
             // WHIQ: a save is never lost to an eviction. The work the server auto-saved when it
             // closed the presentation (or the unchanged original) is written where the save asks,
             // byte for byte, without opening it again.
-            if let Some(ev) = self.shared.evicted().last().cloned()
+            // The presentation the call names (the first closed, when it names none).
+            let want = args.get("document").and_then(|v| v.as_str().map(str::to_string).or_else(|| v.as_u64().map(handle_of)));
+            let all = self.shared.evicted();
+            let chosen = match &want {
+                Some(h) => all.iter().find(|e| &e.handle == h).cloned(),
+                None => all.last().cloned(),
+            };
+            if let (Some(h), None) = (&want, &chosen)
+                && name == "save_presentation"
+            {
+                let had: Vec<&str> = all.iter().map(|e| e.handle.as_str()).collect();
+                let e = ToolError::new(
+                    code::FAILED,
+                    format!("no presentation closed by the eviction has the handle `{h}` (they were: {})", had.join(", ")),
+                    "use one of those handles, or open the recovered file",
+                );
+                return self.finish(name, &args, Err(e), warnings, vec![]);
+            }
+            if let Some(ev) = chosen.clone()
                 && let Some(r) = self.save_evicted(name, &args, &ev)
             {
                 return self.finish(name, &args, r, warnings, vec![]);
             }
-            if let Some(ev) = self.shared.evicted().last() {
+            if let Some(ev) = chosen.as_ref().or(all.last()) {
                 let reopen = ev.reopen_path().unwrap_or_default().to_string();
                 let e = ToolError::new(
                     code::EVICTED,
@@ -1081,7 +1099,7 @@ impl Server {
         let n = s.documents().len();
         for i in (0..n).rev() {
             let Some(st) = s.documents().get(i) else { continue };
-            let (title, original) = (st.title(), st.path.clone());
+            let (title, original, uid) = (st.title(), st.path.clone(), st.uid);
             let unsaved = st.is_dirty() || st.path.is_none();
             let recovered = if unsaved {
                 match crate::autosave::write_recovered(
@@ -1104,7 +1122,7 @@ impl Server {
                 None
             };
             s.close_document(i);
-            let ev = Evicted { title, original, recovered, reason: reason.to_string() };
+            let ev = Evicted { handle: handle_of(uid), title, original, recovered, reason: reason.to_string() };
             shared.add_evicted(ev.clone());
             out.push(ev);
         }

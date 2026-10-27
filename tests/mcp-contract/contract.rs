@@ -303,6 +303,30 @@ fn a_save_after_a_memory_eviction_writes_the_auto_saved_work() {
     assert_eq!(o["slides"], slides, "{o} {built}");
 }
 
+// WHIQ ─ a save after an eviction saves the presentation the call NAMES, not another one's work.
+#[test]
+fn a_save_after_an_eviction_saves_the_presentation_it_names() {
+    let dir = scratch("evict-names");
+    let mut m = start(&dir, &[], &[]);
+    let a = m.ok("new_presentation", json!({}))["document"].as_str().unwrap().to_string();
+    m.ok("add_slide", json!({"title": "A1", "document": a}));
+    let b = m.ok("new_presentation", json!({}))["document"].as_str().unwrap().to_string();
+    for t in ["B1", "B2", "B3"] {
+        m.ok("add_slide", json!({"title": t, "document": b}));
+    }
+    assert_ne!(a, b);
+    m.ok("evict", json!({}));
+    let (out_a, out_b) = (dir.join("a-saved.pptx"), dir.join("b-saved.pptx"));
+    m.ok("save_presentation", json!({"path": out_b.to_str().unwrap(), "document": b}));
+    m.ok("save_presentation", json!({"path": out_a.to_str().unwrap(), "document": a}));
+    let mut m2 = start(&dir, &[], &[]);
+    assert_eq!(m2.ok("open_presentation", json!({"path": out_b.to_str().unwrap()}))["slides"], 4, "B has its own slides");
+    assert_eq!(m2.ok("open_presentation", json!({"path": out_a.to_str().unwrap()}))["slides"], 2, "A has its own");
+    // A handle the eviction did not close is an error, not another presentation's work.
+    let e = m.err("save_presentation", json!({"path": dir.join("c.pptx").to_str().unwrap(), "document": "doc-999"}));
+    assert_eq!(e["code"], "failed", "{e}");
+}
+
 // §3 ─ SIGTERM saves unsaved work; the next run names the recovered file.
 #[cfg(unix)]
 #[test]

@@ -89,6 +89,8 @@ impl Recovered {
 /// A presentation closed by the server (idle, memory) rather than by the agent.
 #[derive(Clone, Debug)]
 pub struct Evicted {
+    /// The document handle the presentation had (`doc-<n>`): a save names it.
+    pub handle: String,
     pub title: String,
     pub original: Option<String>,
     /// The auto-saved copy, when it had unsaved work; else reopen `original`.
@@ -102,7 +104,7 @@ impl Evicted {
     }
     /// The shape every craft app reports: `{name, reason, recovered_path, original_path}`.
     pub fn to_value(&self) -> Value {
-        json!({"name": self.title, "reason": self.reason, "recovered_path": self.recovered, "original_path": self.original})
+        json!({"document": self.handle, "name": self.title, "reason": self.reason, "recovered_path": self.recovered, "original_path": self.original})
     }
 }
 
