@@ -92,6 +92,14 @@ pub fn release_caches() -> usize {
     })
 }
 
+/// WHIQ: the stored bytes a decoded picture came from, when its pixels are those bytes as stored
+/// (no colour adjustment, recolouring or transparency applied): what an SVG can embed instead of
+/// re-encoding the pixels. `None` for adjusted pictures, animation frames and evicted entries.
+pub fn source_of(pm: &Arc<Pixmap>) -> Option<Arc<Vec<u8>>> {
+    let plain = adjust_key(&PictureAdjust::default());
+    with(|c| c.map.iter().find(|((_, _, adj), e)| *adj == plain && Arc::ptr_eq(&e.pm, pm)).map(|(_, e)| e._bytes.clone()))
+}
+
 fn adjust_key(a: &PictureAdjust) -> u64 {
     use std::hash::Hasher;
     // A real hash: an FNV-style xor-multiply mix let (b, c) and (-b, -c) collide (the sign bits

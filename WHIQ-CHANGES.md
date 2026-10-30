@@ -426,6 +426,81 @@ cut. Measured over MCP stdio with the audit's driver (`--max-memory-mb 400`, RSS
 | GIF export streams into the file a frame at a time (one frame in memory, no frame or size cap; a `slides` list longer than 100,000 is refused as hostile). A GIF built in memory (`file.saveBytes`) is capped at half the budget (at least 200 M pixels) and the refusal names the file route. Photo albums: what one call adds is a share of the budget (a quarter, one picture an eighth, at least 64 MB / 32 MB; items follow), each refusal saying to insert the rest with another call. | `engine/src/gif_export.rs` (`encode_into`), `cmd/file.rs` (`gif_to_path`), `cmd/insert.rs` | `gif_export` tests |
 | `--max-memory-mb` sets the readers' budget (`spill::set_memory_budget`); without it, half the machine's memory (Linux) or 4 GB. | `apps/deckcraft-cli/src/main.rs` | `spill.rs` `the_budget_follows_the_host` |
 
+## Engine-drawn preview, reading markdown, bulk batches (2026-10-30, whiq-v0.7.4)
+
+The owner's decision (third ledger, item 13): the platform's Preview tab is drawn by the engines, not
+by the platform's own renderers, and not as pictures. DeckCraft now draws the preview page the
+platform's `shared/render/pptx.ts` (+ `pptxShapes.ts`) made, from its own model and renderer, and
+reads a deck as markdown for the platform's `read_document`. The platform calls `render_preview`
+itself when a file is created or opened.
+
+| Change | Where | Tested by |
+|---|---|---|
+| **`render_preview`** (new tool; command `file.renderPreview`; CLI `deckcraft-cli preview`): one self-contained HTML page (no fetch, no script; the same kind of page `renderPptxHtml` returned: a heading, one card per slide in order with `n/N`, speaker notes in a `<details>`, light and dark styles), each slide **vector SVG drawn by the renderer itself**: it records the slide on the `Recorder` (the display list the vector PDF uses) and writes the operations as SVG: paths with their fills, outlines, dashes, caps and joins; linear and radial gradients as paint servers; clips; opacity groups; blur filters (shadows, glow, soft edges) as `feGaussianBlur`; the Porter-Duff layers of the effects (a shadow recoloured in the shape's silhouette, a soft edge, a fade) as masks; blend modes as `mix-blend-mode`. So the layout and master background, preset geometries, lines, connectors with their arrowheads, freeforms, tables, native charts, slide-number fields and pictures come out as the app draws them. Text is the shaped glyphs of the embedded fonts (Arabic and every script look as in the app, RTL included), each glyph outline written once per page and drawn with `<use>`, with the characters kept as invisible `<text>` over them for search and copy. Pictures are data URIs, written once per page: the picture's own bytes when a browser shows them as stored (PNG, GIF, WebP, JPEG without an EXIF rotation, each up to 3 MiB and 24 MiB a page), else its pixels at the size drawn (JPEG or PNG). Nothing is painted to pixels. Any size of deck: `slide_start` (0-based) / `slide_count`; returned in `html`, a page stops before the slide that would pass the answer budget (`max_bytes`, default `--max-result-bytes`) and `next_slide_start` says where to go on (never trimmed; a single slide over the budget is retried with its pictures smaller, then `too_large` naming `out`); with `out` the page goes to an .html file whole. Reads `path` (a file, not opened, kept for the next window while unchanged; released under memory pressure) or the open presentation. | `crates/render/src/svg.rs` (new), `images.rs` (`source_of`), `crates/engine/src/preview.rs` (new), `cmd/preview.rs` (new), `crates/mcp/src/tools.rs`, `server.rs`, `runtime.rs`, `apps/deckcraft-cli/src/main.rs`, `help.rs` | `engine` `preview::tests` (the page's shape, shapes / connectors / arrows / freeforms, a chart, a table, a picture embedded once as its own bytes, notes, Arabic shaped and right to left, a 100-slide deck in windows and by budget, gradients and shadows as vectors); `svg::tests`; `mcp_deck` `render_preview_and_export_markdown_read_a_fifty_slide_deck_in_windows`; `mcp_contract` `annotations_tell_reads_from_writes` |
+| **`export_markdown`** (new tool; command `file.exportMarkdown`; CLI `deckcraft-cli markdown`): the deck as markdown for an agent: `## Slide N: title` (hidden marked), text with bullet levels and numbering as the slide shows them (the master's list styles resolved), **bold** / *italic*, tables as markdown tables (merged cells empty, `|` escaped), chart data as a categories × series table (scatter: x), pictures' descriptions, SmartArt nodes, speaker notes as a quote; footer, date and slide-number placeholders left out. Windows as `render_preview` (`slide_start`, `slide_count`, the budget, `next_slide_start`, `out` for an .md file). `inspect_document` lists slides but not their content and `export` `outline` drops tables' structure, charts and notes, so neither fitted. | same files | the same tests |
+| **`batch` takes the editing tools**: an item is `{command, params}` as before or `{tool, args}` with `add_slide`, `go_to_slide`, `add_shape`, `add_text_box`, `set_text`, `insert_picture`, `insert_table`, `insert_chart`, `add_overlays`, `select`, `run_command` (names forgiving; an unknown one is `not_found` with `closest` before anything runs); `slide` on an item makes that slide current first. A trimmed batch answer no longer tells the caller to call the batch again with `continue_from` (which ran every edit a second time): it says the commands all ran. Measured: one `build_deck` call builds 50 slides (charts, tables, pictures, Arabic); one `batch` of 212 items (10 slides, 150 shapes, 30 `set_text`, 10 tables, 10 commands, a picture with overlays) runs in one call. Nothing else limited large batches (`deck.build` takes 2000 slides a call; a long call becomes a job). | `crates/mcp/src/tools.rs` (`BATCH_TOOLS`, `batch_tool`), `server.rs` | `mcp_deck` `one_batch_applies_hundreds_of_edits`, `render_preview_and_export_markdown_read_a_fifty_slide_deck_in_windows` |
+| **A deck worked like a person in PowerPoint** (owner, 2026-10-30): new tools `find_text`, `replace_text`, `delete_shapes`, `delete_slides`, `set_notes`, `set_bounds`, `format_shape`, `edit_chart` (each a few existing commands, `slide` to act on another slide; all but `find_text` also batch items); `inspect_document` lists every slide master with its layouts (`masters`); `inspect_slide` gives a picture's file (`picture: {media, name, type, bytes}`). The coverage table below is tested row by row on a real .pptx. | `crates/mcp/src/tools.rs` (`edit_tool`), `crates/engine/src/cmd/inspect.rs` | `mcp_deck` `an_agent_reads_creates_edits_deletes_and_searches_a_real_deck` |
+
+Coverage: what an agent can do with a deck through MCP, all in
+`mcp_deck::an_agent_reads_creates_edits_deletes_and_searches_a_real_deck` (a `build_deck` .pptx saved,
+reopened, worked, saved and reopened) unless another test is named.
+
+| Capability | Tool (command) | Checked |
+|---|---|---|
+| Read the slides in order, their layouts; the masters and their layouts | `inspect_document` (`slides`, `layouts`, `masters`) | titles in order; masters' layouts |
+| Read every shape's text, placeholders, boxes, fills; groups and their children | `inspect_slide` (`shapes[].text`, `children`) | bullets' text; a group's two children |
+| Read a table's cells | `inspect_slide` (`table.cells`), `export_markdown` | cells; markdown table |
+| Read a chart and its data | `inspect_slide` (`chart.categories`, `series`), `export_markdown` | categories and values |
+| Read pictures | `inspect_slide` (`picture`), `export_markdown` (`*[Picture: …]*`) | `image/png` |
+| Read speaker notes | `inspect_slide` (`notes`), `inspect_document`, `export_markdown` | notes text |
+| Read the whole deck for an agent, any size | `export_markdown` (windows) | also `render_preview_and_export_markdown_read_a_fifty_slide_deck_in_windows` |
+| Look at a slide | `render_slide` (PNG), `render_preview` (vector page) | an image block; 5 cards |
+| Create a slide from a layout | `add_slide`, `build_deck` | `titleOnly` slide |
+| Create shapes, lines, connectors (with arrows) | `add_shape`, `run_command shape.connect`, `format_shape {tail}` | ids read back; arrowhead and dash |
+| Create text boxes, tables, charts, pictures | `add_text_box`, `insert_table`, `insert_chart`, `insert_picture` | ids read back |
+| Create notes | `set_notes` | notes found by `find_text` |
+| Group / ungroup | `run_command arrange.group` / `arrange.ungroup` | children read back |
+| Edit text (shapes, table cells) | `set_text`, `text.set {cell}` | edited text, cell `99` |
+| Edit position, size, rotation | `set_bounds` | box `[50, 130, 140, 70]` |
+| Edit style: fill, outline, dash, arrowheads, text bold / size / colour / alignment | `format_shape` | fill `#00B050`; bold, size 20 in the shape |
+| Edit a chart's type, data, title | `edit_chart` | categories, title, bar type |
+| Edit a table's structure | `run_command table.insertRowBelow` (and the other `table.*`) | 3 rows |
+| Change a slide's layout | `run_command slide.layout` | `Two Content` |
+| Many edits in one call | `batch` (`{tool, args}` / `{command, params}`, `slide`), `build_deck` | the edits above in one batch; `one_batch_applies_hundreds_of_edits` (212 items) |
+| Delete shapes, tables, charts, pictures, lines | `delete_shapes` | gone from `inspect_slide` |
+| Delete notes | `set_notes {text: ""}` | empty notes |
+| Delete slides | `delete_slides` | titles after |
+| Find text across slides → slide + shape (+ cell, notes) | `find_text` | slides 1 and 2 with shape ids; a notes match with no shape |
+| Find and replace | `replace_text` | replaced count = found count |
+| Save and reopen with the edits | `save_presentation`, `open_presentation` | markdown of the reopened file |
+
+Tool schemas (every tool also takes `caller`, `async`, `continue_from`, `max_bytes`, `document`):
+
+- `render_preview {path?, slide_start?, slide_count?, out?, notes?}` → `{format: "html", html | out, bytes, slide_count, slide_size: {width_pt, height_pt, width_in, height_in, width_emu, height_emu}, slide_start, slides_rendered, next_slide_start (null at the end), complete, slides: [{index, number, title, hidden, notes}], pictures: {embedded, original, reencoded, bytes}, source?, next_step?, warnings?}`. `_meta["whiq/files"] = {read: ["path"], opens: false}`; not read-only (it may write `out`), not destructive, idempotent.
+- `export_markdown {path?, slide_start?, slide_count?, out?}` → `{format: "markdown", markdown | out, bytes, slide_count, slide_size, slide_start, slides_exported, next_slide_start, complete, source?, next_step?, warnings?}`; the same `_meta` and hints.
+- `batch {commands: [{command?, params?, tool?, args?, slide?}], keepGoing?}` (was `[{command, params}]`).
+- `find_text {text, matchCase?, wholeWords?}` → `{count, matches: [{slide, shape (null: notes), cell?, para, start, end, name, paragraph}]}` (read-only).
+- `replace_text {text, with, matchCase?, wholeWords?}` → `{replaced}`.
+- `delete_shapes {ids, slide?}` → `{deleted}`; `delete_slides {indices}` → `{deleted}`; `set_notes {text, slide?}`.
+- `set_bounds {id, x?, y?, w?, h?, rot?, slide?}` → `{id}`; `format_shape {id, fill?, line?, lineWidth?, dash?, head?, tail?, bold?, italic?, size?, color?, align?, slide?}` → `{id}`; `edit_chart {id, type?, categories?, series?, title?, slide?}` → `{id}`.
+
+Test status (Linux x86_64, craft-fonts 4391305, 2026-10-30): `cargo test -p deckcraft-render -p
+deckcraft-engine -p deckcraft-mcp -p deckcraft-cli`: render 175, engine 335 (+1 ignored), mcp 24 + 6,
+CLI 12 + 8 + 2, `mcp_contract` 25/25, `mcp_deck` 12/12 (3 new), `mcp_roots` 2 pass. Under the loaded
+build machine one timing test failed per full run, a different one each time
+(`long_work_runs_as_a_job`, `a_running_call_stops_at_a_safe_point_when_cancelled`,
+`recovery::tests::another_running_instance_keeps_its_entries`); each passes on its own and on the next
+run. `smoke.py` passes on the debug binary; `cargo clippy --no-deps -D warnings` on the four crates with
+`--all-targets`, `cargo fmt --check`, and `cargo check --target wasm32-unknown-unknown -p
+deckcraft-engine` pass. The preview was compared by eye with `render` PNGs in a headless Chromium (the
+sample deck; a slide with shadows, glow, a gradient, a bent connector with an arrowhead, a freeform, an
+Arabic title and table, a picture): the same drawing.
+
+Not done here: the platform side (calling `render_preview` on create / open, and `read_document` through
+`export_markdown`) is the platform's change. SVG has no conic gradient, so a sweep gradient is drawn as a
+radial one between its first and middle colours; a tiled picture mirrored on alternate tiles repeats
+unmirrored; masks (`mask-type: alpha`) need a current browser.
+
 ## Not done / known limits
 
 - By design, not a gap: busy is per process — one worker serves calls in order (one process per

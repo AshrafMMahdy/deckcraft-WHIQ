@@ -39,6 +39,8 @@ fn document(s: &mut Session, _p: &Value) -> Result<Value> {
         "theme": m.map(|m| m.theme.name.clone()),
         "fonts": m.map(|m| json!({"major": m.theme.fonts.major.latin, "minor": m.theme.fonts.minor.latin})),
         "layouts": m.map(|m| m.layouts.iter().map(|l| json!({"id": l.id, "name": l.name})).collect::<Vec<_>>()),
+        // WHIQ: every slide master with its layouts (`layouts` above is the first master's).
+        "masters": d.masters.iter().map(|m| json!({"id": m.id, "name": m.name, "theme": m.theme.name, "shapes": m.shapes.len(), "layouts": m.layouts.iter().map(|l| json!({"id": l.id, "name": l.name, "kind": serde_json::to_value(l.kind).unwrap_or_default(), "shapes": l.shapes.len()})).collect::<Vec<_>>()})).collect::<Vec<_>>(),
         "selection": serde_json::to_value(&st.selection).unwrap_or_default(),
         "media": d.media.iter().map(|x| json!({"id": x.id, "name": x.name, "type": x.content_type, "bytes": x.byte_len(), "onDisk": x.spill.is_some()})).collect::<Vec<_>>(),
         "undo": st.history.undo.last().map(|e| e.label.clone()),
@@ -95,6 +97,12 @@ pub fn shape_summary(ctx: Option<&Ctx>, sh: &Shape, depth: usize) -> Value {
             }
             ShapeKind::Group { children, .. } if depth < 8 => {
                 o.insert("children".into(), Value::Array(children.iter().map(|c| shape_summary(None, c, depth + 1)).collect()));
+            }
+            // WHIQ: a picture's file (its name, type and size).
+            ShapeKind::Picture { fill } if ctx.is_some() => {
+                if let Some(item) = ctx.and_then(|c| c.pres.media(fill.media)) {
+                    o.insert("picture".into(), json!({"media": fill.media, "name": item.name, "type": item.content_type, "bytes": item.byte_len()}));
+                }
             }
             ShapeKind::Media(m) => {
                 o.insert("media".into(), json!({"id": m.media, "video": m.video, "autoplay": m.autoplay, "loop": m.loop_play}));

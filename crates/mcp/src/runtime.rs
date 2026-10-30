@@ -456,6 +456,8 @@ pub fn serve(server: Server, input: impl BufRead + Send + 'static, output: impl 
                 {
                     last_memory_evict = Some(Instant::now());
                     let shed = deckcraft_render::release_caches();
+                    // WHIQ: and the presentation kept for preview / markdown windows read by path.
+                    deckcraft_engine::preview::release_cache();
                     let after = crate::state::rss_bytes().unwrap_or(rss);
                     if after / (1024 * 1024) > limit {
                         let ev = s

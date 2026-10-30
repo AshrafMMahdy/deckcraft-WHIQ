@@ -54,6 +54,8 @@ fn main() -> ExitCode {
         Some("bench") => report(bench(rest)),
         Some("render") => report(render(rest)),
         Some("render-transition") => report(render_transition(rest)),
+        Some("preview") => report(preview_or_markdown(rest, true)),
+        Some("markdown") => report(preview_or_markdown(rest, false)),
         Some("convert") => report(convert(rest)),
         Some("run") => report(run(rest)),
         Some("commands") => {
@@ -285,6 +287,54 @@ fn render(args: &[String]) -> Result<(), String> {
         let path = if all { format!("{out}/slide-{:02}.png", i + 1) } else { out.clone() };
         std::fs::write(&path, png).map_err(|e| format!("{path}: {e}"))?;
         outln!("{path} ({w}×{h})");
+    }
+    Ok(())
+}
+
+/// WHIQ: `preview` (the preview page, file.renderPreview) and `markdown` (file.exportMarkdown).
+fn preview_or_markdown(args: &[String], page: bool) -> Result<(), String> {
+    let name = if page { "preview" } else { "markdown" };
+    let mut input = None;
+    let mut sample = false;
+    let mut out = None;
+    let mut params = json!({});
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--sample" => sample = true,
+            "--start" => params["slideStart"] = json!(it.next().and_then(|v| v.parse::<u64>().ok()).ok_or("--start needs a number")?),
+            "--count" => params["slideCount"] = json!(it.next().and_then(|v| v.parse::<u64>().ok()).ok_or("--count needs a number")?),
+            "--no-notes" if page => params["notes"] = json!(false),
+            "--help" | "-h" => {
+                outln!("{}", help_page(name));
+                return Ok(());
+            }
+            other if other.starts_with('-') => return Err(format!("unknown option `{other}`")),
+            other if input.is_none() && !sample => input = Some(other.to_string()),
+            other => out = Some(other.to_string()),
+        }
+    }
+    if page && out.is_none() {
+        return Err("preview needs an output path (OUT.html)".into());
+    }
+    if input.is_none() && !sample {
+        return Err(format!("{name} needs a FILE (or --sample)"));
+    }
+    let mut s = Session::new();
+    open(&mut s, input.as_deref(), sample)?;
+    if let Some(o) = &out {
+        params["out"] = json!(o);
+    }
+    let v = s.execute(if page { "file.renderPreview" } else { "file.exportMarkdown" }, &params).map_err(|e| e.to_string())?;
+    match v.get("markdown").and_then(Value::as_str) {
+        Some(md) if out.is_none() => outln!("{md}"),
+        _ => {
+            let mut info = v.clone();
+            if let Some(o) = info.as_object_mut() {
+                o.remove("slides");
+            }
+            outln!("{}", serde_json::to_string_pretty(&info).unwrap_or_default());
+        }
     }
     Ok(())
 }

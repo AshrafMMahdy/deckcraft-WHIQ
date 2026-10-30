@@ -32,6 +32,34 @@ slide. Prints each image's path and size.
   deckcraft-cli render deck.deckcraft --slide 2 slide-3.png",
     },
     Subcommand {
+        name: "preview",
+        usage: "preview (FILE | --sample) [--start N] [--count N] [--no-notes] OUT.html",
+        summary: "write the preview page: every slide as vector SVG in one HTML page",
+        details: "Writes OUT.html: one self-contained page (nothing fetched), a card per slide in order, each slide
+drawn as vector SVG by the renderer (background, text, shapes, connectors, tables, charts, pictures
+as data URIs), its speaker notes under it. The same page the MCP tool render_preview returns. Prints
+the page's slide window and size as JSON.
+
+  --start N    the first slide, 0-based (0)
+  --count N    how many slides (all)
+  --no-notes   leave the speaker notes out
+
+  deckcraft-cli preview deck.pptx --start 0 --count 20 deck-1.html",
+    },
+    Subcommand {
+        name: "markdown",
+        usage: "markdown (FILE | --sample) [--start N] [--count N] [OUT.md]",
+        summary: "the deck as markdown: titles, text, tables, chart data, notes",
+        details: "Prints the presentation as markdown, or writes it to OUT.md: per slide its title, text (bullet
+levels), tables, chart data, pictures' descriptions and speaker notes. The same text the MCP tool
+export_markdown returns.
+
+  --start N    the first slide, 0-based (0)
+  --count N    how many slides (all)
+
+  deckcraft-cli markdown deck.pptx --start 40 --count 20",
+    },
+    Subcommand {
         name: "render-transition",
         usage: "render-transition FILE --slide N --t T[,T...] [--width PX] OUT.png",
         summary: "draw frames of the transition into a slide as PNG images",

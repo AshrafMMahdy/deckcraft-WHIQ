@@ -29,6 +29,7 @@ mod pathgrad;
 mod placed;
 mod radar;
 mod ramp;
+pub mod svg;
 mod table;
 mod transition;
 mod warp;
@@ -50,6 +51,7 @@ use vello_common::filter_effects::{EdgeMode, Filter, FilterPrimitive};
 use vello_cpu::{RenderContext, Resources, peniko};
 
 pub use canvas::{Canvas, Op, Recorder, TextOp, rasterize, record_slide, replay};
+pub use svg::{PictureLimits, SvgDoc, SvgStats, slide_svg};
 
 pub use deckcraft_anim::{transition_frame, transition_layers, uses_slide_parts};
 pub use extent::{Region, TILE, layout_extent, pasteboard_region, slide_extent};

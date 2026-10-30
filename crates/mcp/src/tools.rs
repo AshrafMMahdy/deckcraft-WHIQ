@@ -127,6 +127,8 @@ fn files_meta(name: &str) -> Option<Value> {
         // `path` is where the deck is saved, not read.
         "build_deck" => (&["template", "logo"], true),
         "adopt_template" | "roundtrip_check" | "insert_picture" => (&["path"], false),
+        // WHIQ: read by path for a window, never opened as a document.
+        "render_preview" | "export_markdown" => (&["path"], false),
         _ => return None,
     };
     Some(json!({"read": read, "opens": opens}))
@@ -143,6 +145,10 @@ fn hints(name: &str, read_only: bool) -> (bool, bool) {
         "run_command" | "batch" | "call_app" | "key" | "pointer" | "type_text" => (true, false),
         "save_presentation" | "export" | "build_deck" => (true, false),
         "set_text" | "adopt_template" => (true, true),
+        "replace_text" | "delete_shapes" | "delete_slides" | "set_notes" => (true, false),
+        "set_bounds" | "format_shape" | "edit_chart" => (false, true),
+        // They change no presentation; `out` is written like an export (an existing file kept as OLD_).
+        "render_preview" | "export_markdown" => (false, true),
         "close_presentation" => (true, false),
         "go_to_slide" | "select" | "select_tool" | "cancel" | "evict" => (false, true),
         _ => (false, false),
@@ -176,9 +182,15 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "batch",
             "Run several commands",
-            "Run commands in order; stops at the first error unless keepGoing. Returns each result.",
+            "Run many edits in one call, in order: each item is a command ({command, params}) or one of the editing tools ({tool: add_slide|go_to_slide|add_shape|add_text_box|set_text|insert_picture|insert_table|insert_chart|add_overlays|select|run_command, args}); `slide` on an item makes that slide current first. Stops at the first error unless keepGoing (a stop or a cancel leaves the presentation as before the call). Returns each result. Thousands of items fit one call.",
             obj(
-                json!({"commands": {"type": "array", "items": obj(json!({"command": string("id"), "params": {"type": "object"}}), &["command"])}, "keepGoing": boolean("Continue after errors")}),
+                json!({"commands": {"type": "array", "items": obj(json!({
+                    "command": string("Command id (or use tool)"),
+                    "params": {"type": "object", "description": "The command's parameters"},
+                    "tool": string("An editing tool's name instead of a command"),
+                    "args": {"type": "object", "description": "The tool's arguments"},
+                    "slide": int("Make this slide (0-based) current before the item runs")
+                }), &[])}, "keepGoing": boolean("Continue after errors")}),
                 &["commands"],
             ),
             false,
@@ -270,6 +282,126 @@ pub fn tool_definitions() -> Vec<Value> {
                 &[],
             ),
             true,
+        ),
+        tool(
+            "render_preview",
+            "Preview page",
+            "The presentation drawn by DeckCraft as one self-contained HTML page for a preview pane (nothing fetched: pictures are data URIs): a card per slide in order, each slide vector SVG drawn by the renderer itself (layout and master background, text as formatted, RTL included, preset shapes, lines, connectors and arrows, freeforms, tables, native charts, pictures, slide numbers), its speaker notes under it, hidden slides marked. Reads `path` (a .pptx/.potx/.ppsx/.deckcraft; not opened, the open presentations are untouched) or else the open presentation (`document`). Any size of deck: a window of slides (slide_start is 0-based, slide_count); without `out` the page comes back in `html` and stops before the slide that would pass max_bytes (next_slide_start says where to go on); with `out` the page is written to that .html file. The answer gives slide_count and slide_size.",
+            obj(
+                json!({
+                    "path": string("Presentation file to read (default: the open presentation)"),
+                    "slide_start": int("First slide, 0-based (default 0)"),
+                    "slide_count": int("Slides on the page (default: all, or as many as max_bytes holds)"),
+                    "out": string("Write the page to this .html file instead of returning it (no size limit)"),
+                    "notes": boolean("Speaker notes under each slide (default true)")
+                }),
+                &[],
+            ),
+            false,
+        ),
+        tool(
+            "export_markdown",
+            "Export markdown",
+            "The presentation as markdown to read: per slide `## Slide N: title`, its text (bullet levels, numbering, bold and italic), tables (as markdown tables), chart data (categories × series), pictures' descriptions and speaker notes. Reads `path` (not opened) or else the open presentation. Any size: a window of slides (slide_start 0-based, slide_count); without `out` the text comes back in `markdown` and stops before the slide that would pass max_bytes (next_slide_start says where to go on); with `out` it is written to that .md file.",
+            obj(
+                json!({
+                    "path": string("Presentation file to read (default: the open presentation)"),
+                    "slide_start": int("First slide, 0-based (default 0)"),
+                    "slide_count": int("Slides to export (default: all, or as many as max_bytes holds)"),
+                    "out": string("Write the markdown to this .md file instead of returning it")
+                }),
+                &[],
+            ),
+            false,
+        ),
+        tool(
+            "find_text",
+            "Find text",
+            "Find text across every slide, its shapes, table cells and speaker notes: each match's slide index, shape id (null: the notes), table cell, paragraph and character range, with the shape's name and the paragraph's text.",
+            obj(json!({"text": string("Text to find"), "matchCase": boolean("Match case"), "wholeWords": boolean("Whole words only")}), &["text"]),
+            true,
+        ),
+        tool(
+            "replace_text",
+            "Replace text",
+            "Replace every match of `text` (in shapes, tables and notes of every slide) with `with`, keeping each run's formatting. Returns how many were replaced.",
+            obj(
+                json!({"text": string("Text to find"), "with": string("Replacement"), "matchCase": boolean("Match case"), "wholeWords": boolean("Whole words only")}),
+                &["text", "with"],
+            ),
+            false,
+        ),
+        tool(
+            "delete_shapes",
+            "Delete shapes",
+            "Delete shapes (text boxes, pictures, tables, charts, lines, groups) by id from a slide (default: the current one).",
+            obj(json!({"ids": {"type": "array", "items": {"type": "integer"}}, "slide": int("Slide index (default: current)")}), &["ids"]),
+            false,
+        ),
+        tool(
+            "delete_slides",
+            "Delete slides",
+            "Delete slides by index (0-based).",
+            obj(json!({"indices": {"type": "array", "items": {"type": "integer", "minimum": 0}}}), &["indices"]),
+            false,
+        ),
+        tool(
+            "set_notes",
+            "Set speaker notes",
+            "Replace a slide's speaker notes (empty text deletes them).",
+            obj(json!({"text": string("Notes text (one paragraph per line)"), "slide": int("Slide index (default: current)")}), &["text"]),
+            false,
+        ),
+        tool(
+            "set_bounds",
+            "Move and size",
+            "Move, resize or rotate a shape: any of x, y, w, h (pt) and rot (degrees).",
+            obj(
+                json!({"id": int("Shape id"), "x": num("Left (pt)"), "y": num("Top (pt)"), "w": num("Width (pt)"), "h": num("Height (pt)"), "rot": num("Rotation (degrees)"), "slide": int("Slide index (default: current)")}),
+                &["id"],
+            ),
+            false,
+        ),
+        tool(
+            "format_shape",
+            "Format shape",
+            "Style a shape: fill colour (#RRGGBB, accent1..6 or `none`), outline colour (or `none`), outline width (pt), dash, arrowheads (lines and connectors), and its text: bold, italic, size (pt), colour, alignment.",
+            obj(
+                json!({
+                    "id": int("Shape id"),
+                    "fill": string("Fill colour or `none`"),
+                    "line": string("Outline colour or `none`"),
+                    "lineWidth": num("Outline width (pt)"),
+                    "dash": string("solid|dot|dash|lgDash|dashDot|sysDot|sysDash"),
+                    "head": string("Arrowhead at the start: none|triangle|stealth|diamond|oval|arrow"),
+                    "tail": string("Arrowhead at the end"),
+                    "bold": boolean("Text bold"),
+                    "italic": boolean("Text italic"),
+                    "size": num("Text size (pt)"),
+                    "color": string("Text colour"),
+                    "align": string("left|center|right|justify"),
+                    "slide": int("Slide index (default: current)")
+                }),
+                &["id"],
+            ),
+            false,
+        ),
+        tool(
+            "edit_chart",
+            "Edit chart",
+            "Change a chart: its type, data (categories and series) and title.",
+            obj(
+                json!({
+                    "id": int("Chart shape id"),
+                    "type": string("Chart type (column, bar, line, pie, doughnut, area, scatter, stackedColumn…)"),
+                    "categories": {"type": "array", "items": {"type": "string"}},
+                    "series": {"type": "array", "items": obj(json!({"name": string("Series name"), "values": {"type": "array", "items": {"type": "number"}}}), &["values"])},
+                    "title": string("Chart title (empty: none)"),
+                    "slide": int("Slide index (default: current)")
+                }),
+                &["id"],
+            ),
+            false,
         ),
         tool(
             "add_slide",
@@ -487,6 +619,215 @@ pub fn tool_definitions() -> Vec<Value> {
     ]
 }
 
+/// WHIQ: the editing tools a `batch` item may name (`{tool, args}`).
+pub const BATCH_TOOLS: &[&str] = &[
+    "add_slide",
+    "go_to_slide",
+    "add_shape",
+    "add_text_box",
+    "set_text",
+    "insert_picture",
+    "insert_table",
+    "insert_chart",
+    "add_overlays",
+    "select",
+    "run_command",
+    "replace_text",
+    "delete_shapes",
+    "delete_slides",
+    "set_notes",
+    "set_bounds",
+    "format_shape",
+    "edit_chart",
+];
+
+/// One `{tool, args}` item of a batch: the tool's answer as a value, or its error.
+fn batch_tool(b: &mut dyn Backend, name: &str, args: Value) -> Result<Value, String> {
+    let Ok(name) = crate::contract::resolve_tool(name, BATCH_TOOLS) else {
+        return Err(format!("unknown tool `{name}` in a batch (a batch item's tool is one of: {})", BATCH_TOOLS.join(", ")));
+    };
+    let r = call_tool(b, name, &args);
+    let text = r.content.iter().find_map(|c| c.get("text").and_then(Value::as_str)).unwrap_or_default().to_string();
+    if r.is_error {
+        return Err(text);
+    }
+    Ok(serde_json::from_str(&text).unwrap_or(Value::String(text)))
+}
+
+/// WHIQ: `find_text`, `replace_text`, `delete_shapes`, `delete_slides`, `set_notes`, `set_bounds`,
+/// `format_shape`, `edit_chart`: a slide made current first when `slide` is given, then commands.
+fn edit_tool(b: &mut dyn Backend, name: &str, a: &Value) -> Result<Value, String> {
+    if let Some(sl) = a.get("slide").filter(|v| !v.is_null())
+        && name != "set_notes"
+    {
+        exec(b, "slide.go", json!({"index": sl}))?;
+    }
+    let pick = |keys: &[&str]| -> Value {
+        let mut o = serde_json::Map::new();
+        for k in keys {
+            if let Some(v) = a.get(*k).filter(|v| !v.is_null()) {
+                o.insert((*k).to_string(), v.clone());
+            }
+        }
+        Value::Object(o)
+    };
+    let id = a.get("id").cloned().unwrap_or(Value::Null);
+    match name {
+        "find_text" => {
+            let found = exec(b, "text.find", pick(&["text", "matchCase", "wholeWords"]))?;
+            let mut matches = found.as_array().cloned().unwrap_or_default();
+            // Each match with its shape's name and its paragraph's text, read from the slide.
+            let mut slides: std::collections::HashMap<u64, Value> = std::collections::HashMap::new();
+            for m in matches.iter_mut().take(2000) {
+                let Some(si) = m.get("slide").and_then(Value::as_u64) else { continue };
+                let sv = slides.entry(si).or_insert_with(|| exec(b, "slide.inspect", json!({"index": si})).unwrap_or(Value::Null));
+                let para = m.get("para").and_then(Value::as_u64).unwrap_or(0) as usize;
+                match m.get("shape").and_then(Value::as_u64) {
+                    Some(sid) => {
+                        if let Some(sh) = find_shape_json(sv.get("shapes"), sid) {
+                            m["name"] = sh.get("name").cloned().unwrap_or(Value::Null);
+                            let text = match m.get("cell").and_then(Value::as_array) {
+                                Some(rc) => cell_text(&sh, rc),
+                                None => sh.get("text").and_then(Value::as_str).map(String::from),
+                            };
+                            if let Some(t) = text {
+                                m["paragraph"] = json!(t.split('\n').nth(para).unwrap_or(""));
+                            }
+                        }
+                    }
+                    None => {
+                        if let Some(t) = sv.get("notes").and_then(Value::as_str) {
+                            m["paragraph"] = json!(t.split('\n').nth(para).unwrap_or(""));
+                        }
+                    }
+                }
+            }
+            Ok(json!({"count": matches.len(), "matches": matches}))
+        }
+        "replace_text" => exec(b, "text.replace", pick(&["text", "with", "matchCase", "wholeWords"])),
+        "delete_shapes" => {
+            let ids = a.get("ids").cloned().unwrap_or(json!([]));
+            if ids.as_array().is_none_or(Vec::is_empty) {
+                return Err("invalid `ids`: name the shapes to delete (inspect_slide lists them)".into());
+            }
+            exec(b, "edit.delete", json!({"ids": ids}))?;
+            Ok(json!({"deleted": ids}))
+        }
+        "delete_slides" => {
+            let mut idx: Vec<u64> =
+                a.get("indices").and_then(Value::as_array).map(|v| v.iter().filter_map(Value::as_u64).collect()).unwrap_or_default();
+            if idx.is_empty() {
+                return Err("invalid `indices`: name the slides to delete (0-based)".into());
+            }
+            idx.sort_unstable();
+            idx.dedup();
+            // Last first, so the indices still name the slides asked for.
+            for i in idx.iter().rev() {
+                exec(b, "slide.delete", json!({"index": i}))?;
+            }
+            Ok(json!({"deleted": idx}))
+        }
+        "set_notes" => {
+            let mut p = pick(&["text"]);
+            if let Some(sl) = a.get("slide").filter(|v| !v.is_null()) {
+                p["index"] = sl.clone();
+            }
+            exec(b, "slide.notes", p)
+        }
+        "set_bounds" => {
+            let mut p = pick(&["x", "y", "w", "h", "rot"]);
+            if p.as_object().is_some_and(serde_json::Map::is_empty) {
+                return Err("invalid arguments: give at least one of x, y, w, h, rot".into());
+            }
+            p["ids"] = json!([id]);
+            exec(b, "shape.sizePosition", p)?;
+            Ok(json!({"id": id}))
+        }
+        "format_shape" => {
+            let ids = json!([id]);
+            if let Some(c) = a.get("fill").and_then(Value::as_str) {
+                let p = if c == "none" { json!({"ids": ids, "none": true}) } else { json!({"ids": ids, "color": c}) };
+                exec(b, "shape.fill", p)?;
+            }
+            let mut line = serde_json::Map::new();
+            if let Some(c) = a.get("line").and_then(Value::as_str) {
+                if c == "none" {
+                    line.insert("none".into(), json!(true));
+                } else {
+                    line.insert("color".into(), json!(c));
+                }
+            }
+            for (k, to) in [("lineWidth", "width"), ("dash", "dash"), ("head", "head"), ("tail", "tail")] {
+                if let Some(v) = a.get(k).filter(|v| !v.is_null()) {
+                    line.insert(to.into(), v.clone());
+                }
+            }
+            if !line.is_empty() {
+                line.insert("ids".into(), ids.clone());
+                exec(b, "shape.line", Value::Object(line))?;
+            }
+            let text_keys = ["bold", "italic", "size", "color", "align"];
+            if text_keys.iter().any(|k| a.get(*k).is_some_and(|v| !v.is_null())) {
+                let _ = exec(b, "text.exit", json!({}));
+                exec(b, "edit.select", json!({"ids": ids}))?;
+                if let Some(v) = a.get("bold").and_then(Value::as_bool) {
+                    exec(b, "format.bold", json!({"on": v}))?;
+                }
+                if let Some(v) = a.get("italic").and_then(Value::as_bool) {
+                    exec(b, "format.italic", json!({"on": v}))?;
+                }
+                if let Some(v) = a.get("size").filter(|v| v.is_number()) {
+                    exec(b, "format.size", json!({"size": v}))?;
+                }
+                if let Some(v) = a.get("color").filter(|v| v.is_string()) {
+                    exec(b, "format.color", json!({"color": v}))?;
+                }
+                if let Some(v) = a.get("align").filter(|v| v.is_string()) {
+                    exec(b, "format.align", json!({"align": v}))?;
+                }
+            }
+            Ok(json!({"id": id}))
+        }
+        "edit_chart" => {
+            if let Some(t) = a.get("type").filter(|v| v.is_string()) {
+                exec(b, "chart.type", json!({"id": id, "type": t}))?;
+            }
+            let data = pick(&["categories", "series"]);
+            if data.as_object().is_some_and(|o| !o.is_empty()) {
+                let mut p = data;
+                p["id"] = id.clone();
+                exec(b, "chart.data", p)?;
+            }
+            if let Some(t) = a.get("title").filter(|v| v.is_string()) {
+                let t = if t.as_str() == Some("") { Value::Null } else { t.clone() };
+                exec(b, "chart.options", json!({"id": id, "title": t}))?;
+            }
+            Ok(json!({"id": id}))
+        }
+        other => Err(format!("unknown tool `{other}`")),
+    }
+}
+
+/// A shape by id in `slide.inspect`'s shape list (groups' children too).
+fn find_shape_json(shapes: Option<&Value>, id: u64) -> Option<Value> {
+    for sh in shapes.and_then(Value::as_array)? {
+        if sh.get("id").and_then(Value::as_u64) == Some(id) {
+            return Some(sh.clone());
+        }
+        if let Some(found) = find_shape_json(sh.get("children"), id) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn cell_text(sh: &Value, rc: &[Value]) -> Option<String> {
+    let (r, c) = (rc.first()?.as_u64()? as usize, rc.get(1)?.as_u64()? as usize);
+    let rows = sh.get("table").and_then(|t| t.get("cells").or_else(|| t.get("rows"))).or_else(|| sh.get("cells"))?;
+    let cell = rows.as_array()?.get(r)?.as_array()?.get(c)?;
+    cell.as_str().map(String::from).or_else(|| cell.get("text").and_then(Value::as_str).map(String::from))
+}
+
 fn exec(b: &mut dyn Backend, cmd: &str, params: Value) -> Result<Value, String> {
     b.call("engine.execute", json!({"command": cmd, "params": params}))
 }
@@ -534,7 +875,8 @@ pub fn call_tool(b: &mut dyn Backend, name: &str, a: &Value) -> ToolResult {
             // before the call), as in every craft app.
             let before = b.session().and_then(|s| s.active_index().zip(s.active().cloned()));
             for (k, c) in commands.into_iter().enumerate() {
-                let id = c.get("command").and_then(Value::as_str).unwrap_or("");
+                let tool_name = c.get("tool").and_then(Value::as_str).filter(|t| !t.is_empty());
+                let id = tool_name.or_else(|| c.get("command").and_then(Value::as_str)).unwrap_or("");
                 // WHIQ: a safe point between commands, with the progress of the batch.
                 if let Err(e) = deckcraft_engine::task::step(k, n) {
                     let mut rolled = false;
@@ -550,7 +892,18 @@ pub fn call_tool(b: &mut dyn Backend, name: &str, a: &Value) -> ToolResult {
                     out.push(json!({"command": id, "ok": false, "error": format!("{e}{note}")}));
                     return ToolResult { content: vec![json!({"type": "text", "text": Value::Array(out).to_string()})], is_error: true };
                 }
-                match exec(b, id, c.get("params").cloned().unwrap_or(json!({}))) {
+                // WHIQ: `slide` makes that slide current first; `tool` runs an editing tool.
+                let mut r = match c.get("slide").filter(|v| !v.is_null()) {
+                    Some(sl) => exec(b, "slide.go", json!({"index": sl})).map(|_| Value::Null),
+                    None => Ok(Value::Null),
+                };
+                if r.is_ok() {
+                    r = match tool_name {
+                        Some(t) => batch_tool(b, t, c.get("args").or_else(|| c.get("params")).cloned().unwrap_or(json!({}))),
+                        None => exec(b, id, c.get("params").cloned().unwrap_or(json!({}))),
+                    };
+                }
+                match r {
                     Ok(v) => out.push(json!({"command": id, "ok": true, "result": v})),
                     Err(e) => {
                         out.push(json!({"command": id, "ok": false, "error": e}));
@@ -568,6 +921,8 @@ pub fn call_tool(b: &mut dyn Backend, name: &str, a: &Value) -> ToolResult {
         "export" => wrap(exec(b, "file.export", a)),
         "inspect_document" => wrap(b.call("document.inspect", json!({}))),
         "inspect_slide" => wrap(exec(b, "slide.inspect", a)),
+        "render_preview" => wrap(exec(b, "file.renderPreview", a)),
+        "export_markdown" => wrap(exec(b, "file.exportMarkdown", a)),
         "render_slide" => match b.call("ui.render", a.clone()) {
             Ok(v) => match v.get("png").and_then(Value::as_str) {
                 Some(png) => {
@@ -577,6 +932,10 @@ pub fn call_tool(b: &mut dyn Backend, name: &str, a: &Value) -> ToolResult {
             },
             Err(e) => ToolResult::error(e),
         },
+        // WHIQ: the read / edit / delete / search tools (each a few commands).
+        "find_text" | "replace_text" | "delete_shapes" | "delete_slides" | "set_notes" | "set_bounds" | "format_shape" | "edit_chart" => {
+            wrap(edit_tool(b, name, &a))
+        }
         "add_slide" => wrap(exec(b, "slide.new", a)),
         "go_to_slide" => wrap(exec(b, "slide.go", a)),
         "add_shape" => {

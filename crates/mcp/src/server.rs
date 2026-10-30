@@ -126,6 +126,8 @@ fn needs_document(name: &str, args: &Value) -> bool {
         "list_commands" | "new_presentation" | "open_presentation" | "build_deck" | "server_status" | "job_status" | "list_jobs" | "evict"
         | "cancel" | "select_tool" | "screenshot" | "call_app" | "roundtrip_check" => false,
         "run_command" => !args.get("command").and_then(Value::as_str).is_some_and(command_needs_no_document),
+        // WHIQ: a file named by `path` is read for the window, without an open presentation.
+        "render_preview" | "export_markdown" => args.get("path").and_then(Value::as_str).is_none_or(|p| p.trim().is_empty()),
         "batch" => !args
             .get("commands")
             .and_then(Value::as_array)
@@ -769,6 +771,25 @@ impl Server {
                 let mut warnings = vec![];
                 if let Some(cmds) = a.get_mut("commands").and_then(Value::as_array_mut) {
                     for c in cmds.iter_mut() {
+                        // WHIQ: a `{tool, args}` item names an editing tool, checked when it runs.
+                        if let Some(t) = c.get("tool").and_then(Value::as_str).filter(|t| !t.is_empty()).map(String::from) {
+                            match contract::resolve_tool(&t, crate::tools::BATCH_TOOLS) {
+                                Ok(canonical) if canonical != t => {
+                                    warnings.push(format!("tool `{t}` read as `{canonical}`"));
+                                    c["tool"] = json!(canonical);
+                                }
+                                Ok(_) => {}
+                                Err(close) => {
+                                    return Err(ToolError::new(
+                                        code::NOT_FOUND,
+                                        format!("unknown tool `{t}` in a batch item"),
+                                        format!("a batch item's tool is one of: {}", crate::tools::BATCH_TOOLS.join(", ")),
+                                    )
+                                    .with("closest", json!(close)));
+                                }
+                            }
+                            continue;
+                        }
                         let id = c.get("command").and_then(Value::as_str).unwrap_or_default().to_string();
                         let canonical = self.command_id(&id)?;
                         if canonical != id {
@@ -782,6 +803,15 @@ impl Server {
                 Ok(o)
             }
             "render_slide" => self.render(args),
+            "render_preview" | "export_markdown" => {
+                // WHIQ: an answer that is returned stops at the result budget (the page or text
+                // as JSON string bytes, with room for the rest of the answer), never trimmed.
+                let cap =
+                    args.get("max_bytes").and_then(Value::as_u64).map_or(self.shared.config.max_result_bytes, |m| (m as usize).clamp(1024, 64 << 20));
+                let mut a = args.clone();
+                a["max_bytes"] = json!(cap.saturating_sub(12 << 10).max(16 << 10));
+                self.tool(name, &a)
+            }
             "build_deck" | "new_presentation" => {
                 let o = self.tool(name, args)?;
                 self.shared.clear_evicted();
@@ -1225,7 +1255,13 @@ impl Server {
                     sc["continue_from"] = json!(from);
                     sc["total"] = json!(total.unwrap_or(offset + t.total));
                     sc["truncated_path"] = json!(t.path);
-                    sc["next_step"] = json!(if t.path.is_empty() {
+                    sc["next_step"] = json!(if name == "batch" {
+                        // WHIQ: the commands all ran; calling the batch again would run them twice.
+                        format!(
+                            "every command of the batch ran; this answer lists the first {} results (inspect_slide reads back what was made). Do not run the batch again for the rest: that would repeat the edits",
+                            t.kept
+                        )
+                    } else if t.path.is_empty() {
                         "the answer was cut to stay small; ask for less (one slide, a smaller range)".to_string()
                     } else {
                         format!("the answer was cut at {} items; call {name} again with continue_from: {from} for the rest", t.kept)

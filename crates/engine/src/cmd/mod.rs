@@ -18,6 +18,7 @@ pub mod media;
 pub mod merge;
 pub mod picture_style;
 pub mod points;
+pub mod preview;
 pub mod recolor;
 pub mod reuse;
 pub mod review;
@@ -192,6 +193,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(zoom::specs());
         v.extend(compress::specs());
         v.extend(build::specs());
+        v.extend(preview::specs());
         v
     })
 }

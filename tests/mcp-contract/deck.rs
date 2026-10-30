@@ -564,3 +564,266 @@ fn editing_in_place_keeps_media_animations_fonts_and_unknown_parts() {
     let ct = zip_text(&after, "[Content_Types].xml");
     assert!(ct.contains("/ppt/addin/state.xml") && ct.contains("application/vnd.acme.note+xml"), "{ct}");
 }
+
+/// A 50-slide deck in the platform's layouts: charts, tables, pictures, notes, Arabic.
+fn fifty_slides() -> Vec<Value> {
+    (0..50)
+        .map(|k| match k % 5 {
+            0 => json!({"layout": "bullets", "title": format!("Point {k}"), "bullets": ["first", "  second"], "notes": format!("notes {k}")}),
+            1 => json!({"layout": "table", "title": format!("Register {k}"), "table": [["ID", "Item"], [format!("R-{k}"), "Crane"]]}),
+            2 => json!({"layout": "chart", "title": format!("Output {k}"), "chart": {"kind": "bar", "categories": ["Jan", "Feb"], "series": [{"name": "Plan", "values": [k, k + 1]}]}}),
+            3 => json!({"layout": "image", "title": format!("Plan {k}"), "image": {"path": "pic.png", "position": "full"}}),
+            _ => json!({"layout": "bullets", "title": format!("مراجعة {k}"), "bullets": ["المرحلة الأولى"]}),
+        })
+        .collect()
+}
+
+#[test]
+fn render_preview_and_export_markdown_read_a_fifty_slide_deck_in_windows() {
+    let dir = scratch("preview");
+    let mut m = start(&dir);
+    picture(&mut m, &dir, "pic.png");
+    // One call builds all 50 slides (and the title slide).
+    let built = m.ok("build_deck", json!({"title": "Big deck", "slides": fifty_slides(), "path": "big.pptx"}));
+    assert_eq!(built["slides"], 51, "{built}");
+    m.ok("close_presentation", json!({"discard": true}));
+
+    // The tool reads the file by path (nothing open), a window at a time within the answer budget.
+    let tools = m.request("tools/list", json!({}));
+    let def = tools["result"]["tools"].as_array().unwrap().iter().find(|t| t["name"] == "render_preview").unwrap().clone();
+    assert_eq!(def["_meta"]["whiq/files"], json!({"read": ["path"], "opens": false}));
+    let (mut start_at, mut seen) = (0u64, vec![]);
+    let mut first = Value::Null;
+    loop {
+        let r = m.call("render_preview", json!({"path": "big.pptx", "slide_start": start_at}));
+        assert_eq!(r["isError"], false, "{r}");
+        let v = r["structuredContent"].clone();
+        assert!(v.get("truncated").is_none(), "a window is never trimmed: it stops at the budget");
+        let html = v["html"].as_str().unwrap();
+        assert!(html.starts_with("<!DOCTYPE html>") && html.ends_with("</body></html>"));
+        assert_eq!(v["slide_count"], 51);
+        seen.extend(v["slides"].as_array().unwrap().iter().map(|s| s["index"].as_u64().unwrap()));
+        if first.is_null() {
+            first = v.clone();
+        }
+        match v["next_slide_start"].as_u64() {
+            Some(n) => {
+                assert_eq!(v["complete"], false);
+                start_at = n;
+            }
+            None => break,
+        }
+    }
+    assert_eq!(seen, (0..51).collect::<Vec<_>>(), "every slide once, in order");
+    assert_eq!(first["slide_size"]["width_emu"], 12_192_000);
+    assert_eq!(first["slide_size"]["height_emu"], 6_858_000);
+    // The whole deck to a file in one call; pictures as data URIs, charts and text as vectors.
+    let v = m.ok("render_preview", json!({"path": "big.pptx", "out": "big.html"}));
+    assert_eq!((v["slides_rendered"].clone(), v["complete"].clone()), (json!(51), json!(true)));
+    let html = std::fs::read_to_string(dir.join("big.html")).unwrap();
+    assert_eq!(html.matches("<section class=\"slide").count(), 51);
+    assert!(html.contains("data:image/png;base64,") && v["pictures"]["embedded"].as_u64().unwrap() >= 1);
+    assert!(html.contains(">Jan</text>") && html.contains(">R-6</text>") && html.contains(">المرحلة الأولى</text>"));
+    assert!(html.contains("<details class=\"notes\"><summary>Speaker notes</summary><div class=\"n\" dir=\"auto\">notes 5</div>"));
+    // A window past the end is out_of_range.
+    let e = m.err("render_preview", json!({"path": "big.pptx", "slide_start": 51}));
+    assert_eq!(e["code"], "out_of_range", "{e}");
+
+    // Markdown, by window.
+    let md = m.ok("export_markdown", json!({"path": "big.pptx", "slide_start": 1, "slide_count": 5}));
+    assert_eq!((md["slides_exported"].clone(), md["next_slide_start"].clone()), (json!(5), json!(6)));
+    let text = md["markdown"].as_str().unwrap();
+    assert!(text.contains("## Slide 2: Point 0") && text.contains("- first\n  - second"), "{text}");
+    assert!(text.contains("> notes 0"), "{text}");
+    assert!(text.contains("| ID | Item |\n| --- | --- |\n| R-1 | Crane |"), "{text}");
+    assert!(text.contains("| Category | Plan |") && text.contains("| Feb | 3 |"), "{text}");
+    assert!(text.contains("## Slide 6: مراجعة 4"), "{text}");
+    assert!(!text.contains("## Slide 7:"));
+
+    // The open presentation, when no path is given.
+    m.ok("open_presentation", json!({"path": "big.pptx"}));
+    let v = m.ok("render_preview", json!({"slide_start": 10, "slide_count": 3}));
+    assert_eq!((v["slide_start"].clone(), v["slides_rendered"].clone(), v["next_slide_start"].clone()), (json!(10), json!(3), json!(13)));
+    m.close();
+}
+
+#[test]
+fn one_batch_applies_hundreds_of_edits() {
+    let dir = scratch("bulk");
+    let mut m = start(&dir);
+    let pic = picture(&mut m, &dir, "pic.png");
+    m.ok("new_presentation", json!({"blank": true}));
+    let mut items = vec![];
+    for k in 0..10 {
+        items.push(json!({"tool": "add_slide", "args": {"layout": "titleOnly", "title": format!("Slide {k}")}}));
+    }
+    for k in 0..10 {
+        for j in 0..15 {
+            items.push(json!({"slide": k, "tool": "add_shape", "args": {"preset": "roundRect", "x": 20 + j * 40, "y": 120, "w": 36, "h": 30, "text": format!("{k}.{j}"), "fill": "accent2"}}));
+            if j % 5 == 0 {
+                // set_text on the shape just made (the selection).
+                items.push(json!({"tool": "set_text", "args": {"text": format!("Set {k}.{j}")}}));
+            }
+        }
+        items.push(json!({"slide": k, "tool": "insert_table", "args": {"rows": 2, "cols": 2, "data": [["A", "B"], [format!("{k}"), "x"]], "x": 40, "y": 200, "w": 300, "h": 80}}));
+        items.push(json!({"slide": k, "command": "shape.insert", "params": {"preset": "rightArrow", "rect": [400, 300, 120, 60]}}));
+    }
+    items.push(json!({"slide": 0, "tool": "insert_picture", "args": {"path": pic.to_str().unwrap(), "x": 500, "y": 300, "w": 300, "h": 180}}));
+    items.push(json!({"slide": 0, "tool": "add_overlays", "args": {"overlays": [{"kind": "rect", "x": 10, "y": 10, "w": 30, "h": 30, "color": "#FF0000"}, {"kind": "line", "x": 5, "y": 90, "w": 90, "h": 10, "arrow": "end"}]}}));
+    let n = items.len();
+    assert!(n >= 200, "{n}");
+    let r = m.call("batch", json!({"commands": items}));
+    assert_eq!(r["isError"], false, "{r}");
+    let steps = r["structuredContent"]["result"].as_array().cloned().unwrap_or_default();
+    assert!(steps.iter().all(|s| s["ok"] == true), "{r}");
+    let doc = m.ok("inspect_document", json!({}));
+    assert_eq!(doc["slides"].as_array().unwrap().len(), 10);
+    for k in 0..10 {
+        let shapes = m.ok("inspect_slide", json!({"index": k}))["shapes"].as_array().unwrap().clone();
+        assert!(shapes.len() >= 18, "slide {k}: {} shapes", shapes.len());
+        let all = serde_json::to_string(&shapes).unwrap();
+        assert!(all.contains(&format!("Set {k}.5")) && all.contains(&format!("{k}.14")) && !all.contains(&format!("\"{k}.5\"")), "slide {k}");
+    }
+    // A batch with an unknown tool is refused before anything runs, with the closest names.
+    let e = m.err("batch", json!({"commands": [{"tool": "paint_everything", "args": {}}]}));
+    assert_eq!(e["code"], "not_found", "{e}");
+    m.close();
+}
+
+/// The coverage table of WHIQ-CHANGES.md ("A deck worked like a person in PowerPoint"), row by row,
+/// on a real .pptx: built, saved, opened again, then read, created in, edited, deleted from and
+/// searched through MCP only.
+#[test]
+fn an_agent_reads_creates_edits_deletes_and_searches_a_real_deck() {
+    let dir = scratch("coverage");
+    let mut m = start(&dir);
+    let pic = picture(&mut m, &dir, "pic.png");
+    m.ok(
+        "build_deck",
+        json!({"title": "Coverage", "path": "real.pptx", "slides": [
+            {"layout": "bullets", "title": "Scope", "bullets": ["Crane", "  Gate"], "notes": "say scope"},
+            {"layout": "table", "title": "Register", "table": [["ID", "Item"], ["R-1", "Crane"]]},
+            {"layout": "chart", "title": "Output", "chart": {"kind": "column", "categories": ["Jan", "Feb"], "series": [{"name": "Plan", "values": [1, 2]}]}},
+            {"layout": "image", "title": "Plan", "image": {"path": "pic.png", "position": "full"}}
+        ]}),
+    );
+    m.ok("close_presentation", json!({"discard": true}));
+    m.ok("open_presentation", json!({"path": "real.pptx"}));
+
+    // READ: slides in order, layouts and masters.
+    let doc = m.ok("inspect_document", json!({}));
+    let titles: Vec<&str> = doc["slides"].as_array().unwrap().iter().map(|s| s["title"].as_str().unwrap_or("")).collect();
+    assert_eq!(titles, ["Coverage", "Scope", "Register", "Output", "Plan"]);
+    assert!(doc["masters"].as_array().unwrap().first().unwrap()["layouts"].as_array().unwrap().len() >= 5, "{doc}");
+    assert!(doc["layouts"].as_array().unwrap().len() >= 5);
+    // READ: every shape's text, a table's cells, a chart's data, a picture, the notes.
+    let s1 = m.ok("inspect_slide", json!({"index": 1}));
+    assert!(serde_json::to_string(&s1["shapes"]).unwrap().contains("Crane\\nGate"), "{s1}");
+    assert_eq!(s1["notes"], "say scope", "{s1}");
+    let s2 = shapes(&mut m, 2);
+    assert!(s2.iter().any(|s| s["table"]["cells"] == json!([["ID", "Item"], ["R-1", "Crane"]])), "{s2:?}");
+    let s3 = shapes(&mut m, 3);
+    let chart = s3.iter().find(|s| s["chart"].is_object()).unwrap();
+    assert_eq!(chart["chart"]["categories"], json!(["Jan", "Feb"]));
+    assert_eq!(chart["chart"]["series"][0]["values"], json!([1.0, 2.0]));
+    let s4 = shapes(&mut m, 4);
+    assert!(s4.iter().any(|s| s["picture"]["type"] == "image/png"), "{s4:?}");
+    // READ: a picture of a slide; the whole deck as markdown and as the preview page.
+    let png = m.call("render_slide", json!({"slide": 3}));
+    assert_eq!(png["content"][0]["type"], "image", "{png}");
+    let md = m.ok("export_markdown", json!({}));
+    assert!(md["markdown"].as_str().unwrap().contains("| Jan | 1 |"));
+    assert_eq!(m.ok("render_preview", json!({}))["slides_rendered"], 5);
+
+    // CREATE: a slide from a layout, shapes, a connector, a text box, a table, a chart, a picture, notes.
+    m.ok("go_to_slide", json!({"index": 4}));
+    m.ok("add_slide", json!({"layout": "titleOnly", "title": "Created"}));
+    let new_slide = 5;
+    let a = m.ok("add_shape", json!({"preset": "rect", "x": 40, "y": 120, "w": 120, "h": 60, "text": "Box A"}))["id"].clone();
+    let b = m.ok("add_shape", json!({"preset": "ellipse", "x": 400, "y": 300, "w": 120, "h": 60, "text": "Box B"}))["id"].clone();
+    let line = m.ok("add_shape", json!({"preset": "line", "x": 40, "y": 450, "w": 300, "h": 0}))["id"].clone();
+    let conn = m.ok("run_command", json!({"command": "shape.connect", "params": {"from": a, "to": b, "preset": "straightConnector1"}}))["id"].clone();
+    let tb = m.ok("add_text_box", json!({"x": 600, "y": 120, "w": 200, "text": "Free text"}))["id"].clone();
+    let tbl =
+        m.ok("insert_table", json!({"rows": 2, "cols": 2, "data": [["K", "V"], ["a", "1"]], "x": 40, "y": 300, "w": 300, "h": 80}))["id"].clone();
+    let ch = m.ok("insert_chart", json!({"type": "pie", "categories": ["x", "y"], "series": [{"name": "S", "values": [3, 4]}]}))["id"].clone();
+    let im = m.ok("insert_picture", json!({"path": pic.to_str().unwrap(), "x": 600, "y": 300, "w": 160, "h": 90}))["id"].clone();
+    m.ok("set_notes", json!({"text": "created notes", "slide": new_slide}));
+    let made = shapes(&mut m, new_slide);
+    for id in [&a, &b, &line, &conn, &tb, &tbl, &ch, &im] {
+        assert!(made.iter().any(|s| &s["id"] == id), "{id} in {made:?}");
+    }
+    // A group of two shapes reads back with its children.
+    m.ok("run_command", json!({"command": "arrange.group", "params": {"ids": [a, b]}}));
+    let grouped = shapes(&mut m, new_slide);
+    let g = grouped.iter().find(|s| s["children"].is_array()).unwrap();
+    assert_eq!(g["children"].as_array().unwrap().len(), 2);
+    m.ok("run_command", json!({"command": "arrange.ungroup", "params": {"ids": [g["id"]]}}));
+
+    // EDIT: text, position and size, style, a chart's data and type, a table cell, the layout; in one batch.
+    let r = m.call(
+        "batch",
+        json!({"commands": [
+            {"tool": "set_text", "args": {"id": tb, "text": "Edited text"}},
+            {"tool": "set_bounds", "args": {"id": a, "x": 50, "y": 130, "w": 140, "h": 70}},
+            {"tool": "format_shape", "args": {"id": a, "fill": "#00B050", "line": "#C00000", "lineWidth": 3, "bold": true, "size": 20}},
+            {"tool": "format_shape", "args": {"id": conn, "tail": "triangle", "dash": "dash"}},
+            {"tool": "edit_chart", "args": {"id": ch, "type": "bar", "categories": ["x", "y", "z"], "series": [{"name": "S", "values": [5, 6, 7]}], "title": "New title"}},
+            {"command": "text.set", "params": {"id": tbl, "cell": [1, 1], "text": "99"}},
+            {"command": "table.insertRowBelow", "params": {"id": tbl, "row": 1}},
+            {"slide": 1, "command": "slide.layout", "params": {"layout": "twoContent"}}
+        ]}),
+    );
+    assert_eq!(r["isError"], false, "{r}");
+    let edited = shapes(&mut m, new_slide);
+    let by = |id: &Value| edited.iter().find(|s| &s["id"] == id).unwrap().clone();
+    assert_eq!(by(&tb)["text"], "Edited text");
+    assert_eq!(by(&a)["box"], json!([50.0, 130.0, 140.0, 70.0]));
+    assert_eq!(by(&a)["fill"], "#00B050");
+    assert_eq!(by(&ch)["chart"]["categories"], json!(["x", "y", "z"]));
+    assert_eq!(by(&ch)["chart"]["title"], "New title");
+    assert!(by(&ch)["chart"]["type"].as_str().unwrap().to_lowercase().contains("bar"), "{}", by(&ch));
+    assert_eq!(by(&tbl)["table"]["rows"], 3);
+    assert_eq!(by(&tbl)["table"]["cells"][1][1], "99");
+    m.ok("go_to_slide", json!({"index": new_slide}));
+    let a_full = m.ok("run_command", json!({"command": "shape.inspect", "params": {"id": a}}));
+    let a_json = serde_json::to_string(&a_full).unwrap();
+    assert!(a_json.contains("\"bold\":true") && a_json.contains("\"size\":20"), "{a_json}");
+    let c_full = serde_json::to_string(&m.ok("run_command", json!({"command": "shape.inspect", "params": {"id": conn}}))).unwrap();
+    assert!(c_full.contains("triangle") && c_full.to_lowercase().contains("dash"), "{c_full}");
+    assert_eq!(m.ok("inspect_document", json!({}))["slides"][1]["layout"], "Two Content");
+
+    // SEARCH: find text across slides (slide + shape), then find and replace.
+    let f = m.ok("find_text", json!({"text": "Crane"}));
+    assert!(f["count"].as_u64().unwrap() >= 2, "{f}");
+    let hits: Vec<(u64, bool)> = f["matches"].as_array().unwrap().iter().map(|h| (h["slide"].as_u64().unwrap(), h["shape"].is_u64())).collect();
+    assert!(hits.contains(&(1, true)) && hits.contains(&(2, true)), "{f}");
+    assert!(f["matches"].as_array().unwrap().iter().any(|h| h["paragraph"] == "Crane"), "{f}");
+    let notes_hit = m.ok("find_text", json!({"text": "created notes"}));
+    assert_eq!(notes_hit["matches"][0]["slide"], 5);
+    assert!(notes_hit["matches"][0]["shape"].is_null(), "a notes match has no shape");
+    let rep = m.ok("replace_text", json!({"text": "Crane", "with": "Tower crane"}));
+    assert!(rep["replaced"].as_u64().unwrap() >= 2, "{rep}");
+    assert_eq!(m.ok("find_text", json!({"text": "Tower crane"}))["count"], rep["replaced"]);
+
+    // DELETE: shapes (a table, a chart, a picture, a line), notes, slides.
+    m.ok("delete_shapes", json!({"ids": [tbl, ch, im, line], "slide": new_slide}));
+    let left = shapes(&mut m, new_slide);
+    for id in [&tbl, &ch, &im, &line] {
+        assert!(!left.iter().any(|s| &s["id"] == id), "{id} deleted");
+    }
+    m.ok("set_notes", json!({"text": "", "slide": new_slide}));
+    assert_eq!(m.ok("inspect_slide", json!({"index": new_slide}))["notes"], "");
+    m.ok("delete_slides", json!({"indices": [2, 3]}));
+    let after: Vec<String> =
+        m.ok("inspect_document", json!({}))["slides"].as_array().unwrap().iter().map(|s| s["title"].as_str().unwrap_or("").to_string()).collect();
+    assert_eq!(after, ["Coverage", "Scope", "Plan", "Created"]);
+
+    // And it all saves to a .pptx that opens again with the edits.
+    m.ok("save_presentation", json!({"path": "edited.pptx"}));
+    m.ok("close_presentation", json!({}));
+    m.ok("open_presentation", json!({"path": "edited.pptx"}));
+    let md = m.ok("export_markdown", json!({}))["markdown"].as_str().unwrap().to_string();
+    assert!(md.contains("Tower crane") && md.contains("Edited text") && !md.contains("| Jan |"), "{md}");
+    m.close();
+}

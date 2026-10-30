@@ -499,6 +499,7 @@ fn annotations_tell_reads_from_writes() {
         "job_status",
         "list_jobs",
         "roundtrip_check",
+        "find_text",
     ];
     let destructive = ["run_command", "batch", "save_presentation", "export", "set_text", "close_presentation", "key", "build_deck"];
     let idempotent = ["go_to_slide", "select", "set_text", "adopt_template", "cancel", "evict"];
@@ -527,7 +528,7 @@ fn annotations_tell_reads_from_writes() {
     assert_eq!(files("open_presentation"), json!({"read": ["path"], "opens": true}));
     assert_eq!(files("new_presentation"), json!({"read": [], "opens": true}));
     assert_eq!(files("build_deck"), json!({"read": ["template", "logo"], "opens": true}), "build_deck's `path` is written, not read");
-    for n in ["adopt_template", "roundtrip_check", "insert_picture"] {
+    for n in ["adopt_template", "roundtrip_check", "insert_picture", "render_preview", "export_markdown"] {
         assert_eq!(files(n), json!({"read": ["path"], "opens": false}), "{n}");
     }
     assert!(files("save_presentation").is_null() && files("export").is_null(), "a save's path is written, not read");
