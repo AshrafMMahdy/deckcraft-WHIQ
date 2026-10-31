@@ -543,6 +543,48 @@ rewritten (each part gets an override, so no type is lost). The test deck is Dec
 parts rewritten, not the python-pptx fixture: AGENTS.md §1.1 forbids committing files produced by
 PowerPoint, and python-pptx's default template is one.
 
+## Corpus gate D1–D3: SmartArt, theme overrides, legacy drawings kept as written (2026-10-31, whiq-v0.7.6)
+
+The platform's engines corpus check (`docs/engines-corpus/README.md`, run 2026-10-31) found three
+losses on open → save with no edit, on public files (`poi-SmartArt.pptx`, `poi-aascu-5864.pptx`,
+`poi-alterman_security.pptx`). The rule is v0.7.5's: what the edit did not touch is kept as written.
+
+| # | Loss | Change | Where | Tested by (`mcp_deck`) |
+|---|---|---|---|---|
+| D1 | A SmartArt graphic's data model was rebuilt from the outline DeckCraft reads: the transition and presentation points and their connections were lost (26 points → 16, 20 connections → 5), the drawing was redrawn, the parts renumbered. | The reader keeps the graphic's five parts (data model, layout, quick style, colours, drawing), each with its relationships (pictures as media items, external links) and the slide's ids for them, and the graphic as read (`Diagram::kept`, `source::DiagramSource`; never saved in `.deckcraft`, never part of comparing). On save the parts keep their names and slide ids; while the diagram is the same as read the data model, layout, style and colours are written as they were (the data model's `dataModelExt@relId` renamed only if the drawing's id had to change), while its shapes are too the drawing is. An outline edit regenerates the graphic as before. Fresh SmartArt part names never take a kept one. | `crates/model/src/source.rs`, `lib.rs`; `crates/pptx/src/read/shapes.rs` (`diagram_source`), `read/source.rs` (`diagrams_as_read`: the reader's later passes and the repair are not edits); `write/shapes.rs` (`diagram`, `kept_part`), `write/keep.rs` (`Namer`) | `a_smartart_graphic_keeps_its_whole_data_model_and_parts_on_save` |
+| D2 | A chart's `themeOverride` part and its relationship were dropped (the chart's colours could change): only the embeddings, charts, drawings and media folders were chart sidecars. | `ppt/theme/themeOverride*.xml` (and its relationships) is a chart sidecar; a master's theme never is. It keeps its name (a renamed one stays `themeOverrideKeptN.xml`). | `crates/pptx/src/opc.rs` (`sidecar_part`), `write/chart.rs` | `a_chart_keeps_its_theme_override_on_save`; `opc::tests::sidecar_parts_stay_inside_chart_folders` |
+| D3 | An old-style embedded object lost its legacy VML drawing and the preview picture in it; the object's `spid` was stripped for a fallback picture, and the embedding moved to `ppt/media/mediaN.*`. | Slides keep their VML drawing with what it links (it was on the "modelled" list but nothing wrote it); masters and layouts keep theirs too (`Master::kept_parts`, `Layout::kept_parts`, read by `legacy_drawings`). A part that keeps its legacy drawing keeps the object's `spid`. Media read from a file keep their part names (`PackageNames::media`: pictures, media, and embeddings under `ppt/embeddings/`); a kept part of that name is the same part, written once; fresh names never take a kept one. The VML preview lookup also matches `o:spid` (PowerPoint 2007 gives the shape an `id` of its own). | `crates/pptx/src/read/mod.rs`, `read/shapes.rs` (`vml_index`), `write/mod.rs` (`media_part`, masters and layouts), `write/shapes.rs` (`ole_fallback`); `crates/model/src/lib.rs`, `defaults.rs`; `crates/engine/src/cmd/design.rs` | `an_ole_object_keeps_its_legacy_drawing_and_preview_on_save` (a slide object in the 2007 form, a master object in the `mc:AlternateContent` form, then an edit elsewhere on the slide) |
+
+With these, the slide (or master) holding the graphic, chart or object is itself written byte for
+byte on a save without an edit (v0.7.5's pass-through: every part it points at now has its own name
+and bytes). The test decks are DeckCraft's own with hand-written parts (our own layout, style and
+colour definitions, fake object bytes), not the corpus files (AGENTS.md §1.1).
+
+On the corpus files, open → save over MCP stdio with the release binary: `poi-SmartArt.pptx` keeps
+26 points and 20 connections, its five diagram parts byte for byte, `roundtrip_check` lossless (was
+not); `poi-aascu-5864.pptx` keeps `themeOverride1.xml` linked from chart 3, `vmlDrawing1.vml` linked
+from slide 10 with `image5.emf`, and its embeddings under their names; `poi-alterman_security.pptx`
+keeps both VML drawings (master and layout 1) with their pictures and embeddings, `roundtrip_check`
+lossless (was not). Still lossy on `poi-aascu-5864.pptx`, outside D1–D3: its four empty notes pages
+are dropped (D5), so slides 6, 10, 11 and 18 are written from the model, as are slides 24 and 25 (the
+writer remakes their tags parts); those lose an empty `p:timing` tree, `a:spLocks` and, on slide 11,
+one animation and the transition.
+
+Test status (Linux x86_64, craft-fonts 4391305, 2026-10-31, a shared box at load 15–20): `cargo test
+-p deckcraft-model -p deckcraft-pptx -p deckcraft-format -p deckcraft-engine -p deckcraft-mcp -p
+deckcraft-cli`: 700 pass, 2 fail (`mcp_contract` `long_work_runs_as_a_job` and
+`a_running_call_stops_at_a_safe_point_when_cancelled`: a poll that came before the job's stage, a
+30,000-command batch that finished before the cancel reached it; neither touches a save). With the
+release build, `cargo test --release -p deckcraft-cli --test mcp_contract --test mcp_deck`: 25/25 and
+16/16; `python3 tests/mcp-contract/smoke.py` passes. The three new tests failed before the change
+(D1: 10 points and 3 connections of 14 and 10; D2 and D3: the parts missing). `cargo clippy --no-deps
+-D warnings --all-targets` on the pptx, engine, mcp and CLI crates and `cargo fmt --check` pass
+(model: only the upstream `trendline.rs:468` lint).
+
+Not done: a SmartArt graphic whose drawing part is missing still becomes a kept object (as before);
+one whose outline is empty is still written as a plain group. A slide edited elsewhere writes its
+SmartArt and objects whole but itself from the model, as in v0.7.5.
+
 ## Not done / known limits
 
 - By design, not a gap: busy is per process — one worker serves calls in order (one process per

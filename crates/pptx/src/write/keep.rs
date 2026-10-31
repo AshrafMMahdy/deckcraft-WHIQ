@@ -53,8 +53,61 @@ impl Namer {
                 reserved.insert(part.to_ascii_lowercase());
                 reserved.extend(theme.as_ref().map(|t| t.to_ascii_lowercase()));
             }
+            // Media keep the names they had.
+            reserved.extend(n.media.values().map(|x| x.to_ascii_lowercase()));
+        }
+        // Kept parts (a legacy drawing, its pictures…) and SmartArt parts are written under their
+        // own names: nothing fresh takes one.
+        let mut kept = |parts: &[deckcraft_model::KeptPart]| reserved.extend(parts.iter().map(|k| k.name.to_ascii_lowercase()));
+        kept(&p.kept_parts);
+        for m in &p.masters {
+            kept(&m.kept_parts);
+            for l in &m.layouts {
+                kept(&l.kept_parts);
+            }
+        }
+        for s in &p.slides {
+            kept(&s.kept_parts);
+        }
+        let mut diagrams = |shapes: &[deckcraft_model::Shape]| {
+            deckcraft_model::walk(shapes, &mut |sh, _| {
+                if let Some(k) = sh.diagram.as_ref().and_then(|d| d.kept.get()) {
+                    for part in [&k.data, &k.layout, &k.style, &k.colors, &k.drawing].into_iter().flatten() {
+                        reserved.insert(part.name.to_ascii_lowercase());
+                    }
+                }
+            })
+        };
+        for m in &p.masters {
+            diagrams(&m.shapes);
+            for l in &m.layouts {
+                diagrams(&l.shapes);
+            }
+        }
+        for s in &p.slides {
+            diagrams(&s.shapes);
         }
         Namer { reserved, used: HashSet::new() }
+    }
+
+    /// `original` when it is free, else `{stem}{n}.{ext}` for the smallest free `n` that no part
+    /// written so far (`taken`) has either.
+    pub fn name_ext(&mut self, original: Option<&String>, stem: &str, ext: &str, taken: &dyn Fn(&str) -> bool) -> String {
+        if let Some(o) = original
+            && !taken(o)
+            && self.used.insert(o.to_ascii_lowercase())
+        {
+            return o.clone();
+        }
+        let mut n = 1u32;
+        loop {
+            let c = format!("{stem}{n}.{ext}");
+            let l = c.to_ascii_lowercase();
+            if !self.reserved.contains(&l) && !taken(&c) && self.used.insert(l) {
+                return c;
+            }
+            n += 1;
+        }
     }
 
     /// Take `name` when no part of the file's and no part written so far has it.

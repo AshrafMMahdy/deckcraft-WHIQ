@@ -1010,3 +1010,384 @@ fn editing_a_customer_deck_keeps_every_part_the_edit_did_not_touch() {
     }
     m.close();
 }
+
+// ------------------------------------------------------------------ corpus gate D1–D3 (whiq-v0.7.6)
+//
+// Open → save with no edit: whatever the edit did not touch is kept as it was written. The parts
+// below are hand-written to the ECMA-376 schemas (our own layout, style and colour definitions,
+// fake object bytes): AGENTS.md §1.1 keeps PowerPoint's own files out of the repository.
+
+const RT: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+
+/// A deck DeckCraft built (title slide, a bullet slide, a chart slide, a bullet slide), copied
+/// with `edit` applied to its parts and `extra` parts added, as another producer would write it.
+fn corpus_deck(m: &mut Mcp, dir: &Path, name: &str, edit: &dyn Fn(&str, String) -> String, extra: &[(&str, Vec<u8>)]) -> PathBuf {
+    m.ok(
+        "build_deck",
+        json!({
+            "title": "Corpus gate",
+            "slides": [
+                {"layout": "bullets", "title": "Team", "bullets": ["Design", "Build"]},
+                {"layout": "chart", "title": "Output", "table": [["Month", "Plan", "Actual"], ["Jan", "10", "8"], ["Feb", "20", "22"]]},
+                {"layout": "bullets", "title": "Object", "bullets": ["The workbook below"]}
+            ],
+            "path": "base.pptx",
+            "overwrite": true
+        }),
+    );
+    m.ok("close_presentation", json!({}));
+    let base = dir.join("base.pptx");
+    let out = dir.join(name);
+    let mut src = zip::ZipArchive::new(std::fs::File::open(&base).unwrap()).unwrap();
+    let mut z = zip::ZipWriter::new(std::fs::File::create(&out).unwrap());
+    for i in 0..src.len() {
+        let mut f = src.by_index(i).unwrap();
+        let part = f.name().to_string();
+        let mut data = vec![];
+        std::io::Read::read_to_end(&mut f, &mut data).unwrap();
+        let data = match String::from_utf8(data.clone()) {
+            Ok(t) if part.ends_with(".xml") || part.ends_with(".rels") => edit(&part, t).into_bytes(),
+            _ => data,
+        };
+        store(&mut z, &part, &data);
+    }
+    for (part, data) in extra {
+        store(&mut z, part, data);
+    }
+    z.finish().unwrap();
+    out
+}
+
+/// `rels` with `add` (relationship elements) appended, or a new relationships part holding them.
+fn with_rels(rels: Option<String>, add: &str) -> String {
+    match rels {
+        Some(r) => put_before(&r, "</Relationships>", add),
+        None => format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">{add}</Relationships>"
+        ),
+    }
+}
+
+/// Open `file`, save it under `saved` with no edit, and give the saved path.
+fn open_and_save(m: &mut Mcp, dir: &Path, file: &str, saved: &str) -> PathBuf {
+    m.ok("open_presentation", json!({"path": file}));
+    m.ok("save_presentation", json!({"path": saved}));
+    m.ok("close_presentation", json!({}));
+    dir.join(saved)
+}
+
+fn png_bytes(rgb: [u8; 3]) -> Vec<u8> {
+    let mut b = vec![];
+    image::RgbImage::from_pixel(4, 3, image::Rgb(rgb)).write_to(&mut std::io::Cursor::new(&mut b), image::ImageFormat::Png).unwrap();
+    b
+}
+
+fn count(xml: &str, needle: &str) -> usize {
+    xml.matches(needle).count()
+}
+
+/// D1 (corpus gate, `poi-SmartArt.pptx`: 26 points → 16, 20 connections → 5): a SmartArt graphic
+/// keeps its whole data model — the transition and presentation points and their connections, not
+/// only the outline DeckCraft reads — and its layout, quick style, colour and drawing parts.
+#[test]
+fn a_smartart_graphic_keeps_its_whole_data_model_and_parts_on_save() {
+    let dir = scratch("keep-smartart");
+    let mut m = start(&dir);
+    const DGM: &str = "http://schemas.openxmlformats.org/drawingml/2006/diagram";
+    const DSP: &str = "http://schemas.microsoft.com/office/drawing/2008/diagram";
+    let id = |kind: u32, n: u32| format!("{{0000{kind:04}-0000-4000-8000-{n:012}}}");
+    let t = |s: &str| format!("<dgm:t><a:bodyPr/><a:lstStyle/><a:p><a:r><a:rPr lang=\"en-GB\"/><a:t>{s}</a:t></a:r></a:p></dgm:t>");
+    let empty_t = "<dgm:t><a:bodyPr/><a:lstStyle/><a:p><a:endParaRPr lang=\"en-GB\"/></a:p></dgm:t>";
+    let names = ["Design", "Build", "Handover"];
+    let mut pts = format!(
+        "<dgm:pt modelId=\"{}\" type=\"doc\"><dgm:prSet loTypeId=\"urn:deckcraft:test/strip\" loCatId=\"list\" qsTypeId=\"urn:deckcraft:test/flat\" qsCatId=\"simple\" csTypeId=\"urn:deckcraft:test/accent1\" csCatId=\"accent1\" phldr=\"0\"/><dgm:spPr/>{empty_t}</dgm:pt>",
+        id(1, 0)
+    );
+    pts += &format!(
+        "<dgm:pt modelId=\"{}\" type=\"pres\"><dgm:prSet presAssocID=\"{}\" presName=\"diagram\" presStyleCnt=\"0\"><dgm:presLayoutVars><dgm:dir/><dgm:resizeHandles val=\"exact\"/></dgm:presLayoutVars></dgm:prSet><dgm:spPr/></dgm:pt>",
+        id(4, 0),
+        id(1, 0)
+    );
+    let mut cxns = format!(
+        "<dgm:cxn modelId=\"{}\" type=\"presOf\" srcId=\"{}\" destId=\"{}\" srcOrd=\"0\" destOrd=\"0\" presId=\"urn:deckcraft:test/strip\"/>",
+        id(5, 0),
+        id(1, 0),
+        id(4, 0)
+    );
+    for (i, n) in names.iter().enumerate() {
+        let i = i as u32 + 1;
+        pts += &format!("<dgm:pt modelId=\"{}\"><dgm:prSet phldrT=\"[Text]\"/><dgm:spPr/>{}</dgm:pt>", id(1, i), t(n));
+        pts += &format!("<dgm:pt modelId=\"{}\" type=\"parTrans\" cxnId=\"{}\"><dgm:prSet/><dgm:spPr/>{empty_t}</dgm:pt>", id(2, i), id(6, i));
+        pts += &format!("<dgm:pt modelId=\"{}\" type=\"sibTrans\" cxnId=\"{}\"><dgm:prSet/><dgm:spPr/>{empty_t}</dgm:pt>", id(3, i), id(6, i));
+        pts += &format!(
+            "<dgm:pt modelId=\"{}\" type=\"pres\"><dgm:prSet presAssocID=\"{}\" presName=\"text\" presStyleLbl=\"node1\" presStyleIdx=\"{}\" presStyleCnt=\"3\"><dgm:presLayoutVars><dgm:bulletEnabled val=\"1\"/></dgm:presLayoutVars></dgm:prSet><dgm:spPr/></dgm:pt>",
+            id(4, i),
+            id(1, i),
+            i - 1
+        );
+        cxns += &format!(
+            "<dgm:cxn modelId=\"{}\" srcId=\"{}\" destId=\"{}\" srcOrd=\"{}\" destOrd=\"0\" parTransId=\"{}\" sibTransId=\"{}\"/>",
+            id(6, i),
+            id(1, 0),
+            id(1, i),
+            i - 1,
+            id(2, i),
+            id(3, i)
+        );
+        cxns += &format!(
+            "<dgm:cxn modelId=\"{}\" type=\"presOf\" srcId=\"{}\" destId=\"{}\" srcOrd=\"0\" destOrd=\"0\" presId=\"urn:deckcraft:test/strip\"/>",
+            id(7, i),
+            id(1, i),
+            id(4, i)
+        );
+        cxns += &format!(
+            "<dgm:cxn modelId=\"{}\" type=\"presParOf\" srcId=\"{}\" destId=\"{}\" srcOrd=\"{}\" destOrd=\"0\" presId=\"urn:deckcraft:test/strip\"/>",
+            id(8, i),
+            id(4, 0),
+            id(4, i),
+            i - 1
+        );
+    }
+    let data = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<dgm:dataModel xmlns:dgm=\"{DGM}\" xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\"><dgm:ptLst>{pts}</dgm:ptLst><dgm:cxnLst>{cxns}</dgm:cxnLst><dgm:bg/><dgm:whole/><dgm:extLst><a:ext uri=\"http://schemas.microsoft.com/office/drawing/2008/diagram\"><dsp:dataModelExt xmlns:dsp=\"{DSP}\" relId=\"rId24\" minVer=\"http://schemas.openxmlformats.org/drawingml/2006/diagram\"/></a:ext></dgm:extLst></dgm:dataModel>"
+    );
+    let head = |root: &str, uid: &str, cat: &str| {
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<dgm:{root} xmlns:dgm=\"{DGM}\" xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" uniqueId=\"urn:deckcraft:test/{uid}\"><dgm:title val=\"\"/><dgm:desc val=\"\"/><dgm:catLst><dgm:cat type=\"{cat}\" pri=\"500\"/></dgm:catLst>"
+        )
+    };
+    let layout = head("layoutDef", "strip", "list")
+        + "<dgm:layoutNode name=\"diagram\"><dgm:varLst><dgm:dir/><dgm:resizeHandles val=\"exact\"/></dgm:varLst><dgm:alg type=\"lin\"/><dgm:shape><dgm:adjLst/></dgm:shape><dgm:presOf/><dgm:constrLst><dgm:constr type=\"w\" for=\"ch\" forName=\"text\" refType=\"w\"/></dgm:constrLst><dgm:forEach name=\"nodes\" axis=\"ch\" ptType=\"node\"><dgm:layoutNode name=\"text\" styleLbl=\"node1\"><dgm:varLst><dgm:bulletEnabled val=\"1\"/></dgm:varLst><dgm:alg type=\"tx\"/><dgm:shape type=\"rect\"><dgm:adjLst/></dgm:shape><dgm:presOf axis=\"desOrSelf\" ptType=\"node\"/></dgm:layoutNode></dgm:forEach></dgm:layoutNode></dgm:layoutDef>";
+    let style = head("styleDef", "flat", "simple")
+        + "<dgm:scene3d><a:camera prst=\"orthographicFront\"/><a:lightRig rig=\"threePt\" dir=\"t\"/></dgm:scene3d><dgm:styleLbl name=\"node1\"><dgm:scene3d><a:camera prst=\"orthographicFront\"/><a:lightRig rig=\"threePt\" dir=\"t\"/></dgm:scene3d><dgm:sp3d/><dgm:txPr/><dgm:style><a:lnRef idx=\"2\"><a:scrgbClr r=\"0\" g=\"0\" b=\"0\"/></a:lnRef><a:fillRef idx=\"1\"><a:scrgbClr r=\"0\" g=\"0\" b=\"0\"/></a:fillRef><a:effectRef idx=\"0\"><a:scrgbClr r=\"0\" g=\"0\" b=\"0\"/></a:effectRef><a:fontRef idx=\"minor\"><a:schemeClr val=\"lt1\"/></a:fontRef></dgm:style></dgm:styleLbl></dgm:styleDef>";
+    let colors = head("colorsDef", "accent1", "accent1")
+        + "<dgm:styleLbl name=\"node1\"><dgm:fillClrLst meth=\"repeat\"><a:schemeClr val=\"accent1\"/></dgm:fillClrLst><dgm:linClrLst meth=\"repeat\"><a:schemeClr val=\"lt1\"/></dgm:linClrLst><dgm:effectClrLst/><dgm:txLinClrLst/><dgm:txFillClrLst meth=\"repeat\"><a:schemeClr val=\"lt1\"/></dgm:txFillClrLst><dgm:txEffectClrLst/></dgm:styleLbl></dgm:colorsDef>";
+    let mut sps = String::new();
+    for (i, n) in names.iter().enumerate() {
+        let x = i * 2_000_000;
+        sps += &format!(
+            "<dsp:sp modelId=\"{}\"><dsp:nvSpPr><dsp:cNvPr id=\"0\" name=\"\"/><dsp:cNvSpPr/></dsp:nvSpPr><dsp:spPr><a:xfrm><a:off x=\"{x}\" y=\"0\"/><a:ext cx=\"1800000\" cy=\"1000000\"/></a:xfrm><a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom><a:solidFill><a:srgbClr val=\"2E6DA4\"/></a:solidFill></dsp:spPr><dsp:txBody><a:bodyPr spcFirstLastPara=\"0\" vert=\"horz\" wrap=\"square\" anchor=\"ctr\"/><a:lstStyle/><a:p><a:r><a:rPr lang=\"en-GB\"/><a:t>{n}</a:t></a:r></a:p></dsp:txBody><dsp:txXfrm><a:off x=\"{x}\" y=\"0\"/><a:ext cx=\"1800000\" cy=\"1000000\"/></dsp:txXfrm></dsp:sp>",
+            id(4, i as u32 + 1)
+        );
+    }
+    let drawing = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<dsp:drawing xmlns:dgm=\"{DGM}\" xmlns:dsp=\"{DSP}\" xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\"><dsp:spTree><dsp:nvGrpSpPr><dsp:cNvPr id=\"0\" name=\"\"/><dsp:cNvGrpSpPr/></dsp:nvGrpSpPr><dsp:grpSpPr/>{sps}</dsp:spTree></dsp:drawing>"
+    );
+    let frame = format!(
+        "<p:graphicFrame><p:nvGraphicFramePr><p:cNvPr id=\"40\" name=\"Diagram 1\"/><p:cNvGraphicFramePr/><p:nvPr/></p:nvGraphicFramePr><p:xfrm><a:off x=\"914400\" y=\"1828800\"/><a:ext cx=\"5800000\" cy=\"1000000\"/></p:xfrm><a:graphic><a:graphicData uri=\"{DGM}\"><dgm:relIds xmlns:dgm=\"{DGM}\" r:dm=\"rId20\" r:lo=\"rId21\" r:qs=\"rId22\" r:cs=\"rId23\"/></a:graphicData></a:graphic></p:graphicFrame>"
+    );
+    let rels: String = [
+        ("rId20", "diagramData", "data1"),
+        ("rId21", "diagramLayout", "layout1"),
+        ("rId22", "diagramQuickStyle", "quickStyle1"),
+        ("rId23", "diagramColors", "colors1"),
+    ]
+    .iter()
+    .map(|(id, kind, part)| format!("<Relationship Id=\"{id}\" Type=\"{RT}/{kind}\" Target=\"../diagrams/{part}.xml\"/>"))
+    .collect::<String>()
+        + "<Relationship Id=\"rId24\" Type=\"http://schemas.microsoft.com/office/2007/relationships/diagramDrawing\" Target=\"../diagrams/drawing1.xml\"/>";
+    let types = [("data1", "diagramData"), ("layout1", "diagramLayout"), ("quickStyle1", "diagramStyle"), ("colors1", "diagramColors")]
+        .iter()
+        .map(|(p, ct)| {
+            format!("<Override PartName=\"/ppt/diagrams/{p}.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.drawingml.{ct}+xml\"/>")
+        })
+        .collect::<String>()
+        + "<Override PartName=\"/ppt/diagrams/drawing1.xml\" ContentType=\"application/vnd.ms-office.drawingml.diagramDrawing+xml\"/>";
+    let edit = move |part: &str, t: String| match part {
+        "ppt/slides/slide2.xml" => put_before(&t, "</p:spTree>", &frame),
+        "ppt/slides/_rels/slide2.xml.rels" => with_rels(Some(t), &rels),
+        "[Content_Types].xml" => put_before(&t, "</Types>", &types),
+        _ => t,
+    };
+    let parts: Vec<(&str, Vec<u8>)> = vec![
+        ("ppt/diagrams/data1.xml", data.into_bytes()),
+        ("ppt/diagrams/layout1.xml", layout.into_bytes()),
+        ("ppt/diagrams/quickStyle1.xml", style.into_bytes()),
+        ("ppt/diagrams/colors1.xml", colors.into_bytes()),
+        ("ppt/diagrams/drawing1.xml", drawing.into_bytes()),
+    ];
+    let customer = corpus_deck(&mut m, &dir, "smartart.pptx", &edit, &parts);
+    // The reader sees the graphic (its outline), so this is DeckCraft's SmartArt, not a kept blob.
+    m.ok("open_presentation", json!({"path": "smartart.pptx"}));
+    let frame = shapes(&mut m, 1).into_iter().find(|s| s["name"] == "Diagram 1").unwrap();
+    assert_eq!(frame["kind"], "group", "{frame}");
+    m.ok("close_presentation", json!({}));
+
+    let saved = open_and_save(&mut m, &dir, "smartart.pptx", "smartart-saved.pptx");
+    let data = zip_text(&saved, "ppt/diagrams/data1.xml");
+    assert_eq!((count(&data, "<dgm:pt "), count(&data, "<dgm:cxn ")), (14, 10), "every point and connection: {data}");
+    for (part, _) in &parts {
+        assert_eq!(zip_bytes(&saved, part), zip_bytes(&customer, part), "{part} as it was written");
+    }
+    for part in ["ppt/slides/slide2.xml", "ppt/slides/_rels/slide2.xml.rels"] {
+        assert_eq!(zip_bytes(&saved, part), zip_bytes(&customer, part), "{part}: the slide holding it is untouched too");
+    }
+    let rc = m.ok("roundtrip_check", json!({"path": "smartart.pptx"}));
+    assert_eq!(rc["lossless"], true, "{rc}");
+
+    // An edit of the outline still regenerates the graphic from it (DeckCraft's own data model).
+    m.ok("open_presentation", json!({"path": "smartart.pptx"}));
+    let id = shapes(&mut m, 1).into_iter().find(|s| s["name"] == "Diagram 1").unwrap()["id"].clone();
+    m.ok("go_to_slide", json!({"index": 1}));
+    m.ok("run_command", json!({"command": "smartArt.addNode", "params": {"id": id, "text": "Operate"}}));
+    m.ok("save_presentation", json!({"path": "smartart-edited.pptx"}));
+    let edited = dir.join("smartart-edited.pptx");
+    let data = zip_text(&edited, "ppt/diagrams/data1.xml");
+    assert!(data.contains("Operate"), "{data}");
+    m.close();
+}
+
+/// D2 (corpus gate, `poi-aascu-5864.pptx` chart3): a chart keeps its theme override part and the
+/// relationship to it, so its colours stay the ones it was drawn with.
+#[test]
+fn a_chart_keeps_its_theme_override_on_save() {
+    let dir = scratch("keep-theme-override");
+    let mut m = start(&dir);
+    // The override: the deck's own theme, with another accent 1.
+    let theme = {
+        m.ok("new_presentation", json!({}));
+        m.ok("save_presentation", json!({"path": "theme-source.pptx"}));
+        m.ok("close_presentation", json!({}));
+        zip_text(&dir.join("theme-source.pptx"), "ppt/theme/theme1.xml")
+    };
+    let inner = |tag: &str| {
+        let a = theme.find(&format!("<a:{tag}")).unwrap();
+        let close = format!("</a:{tag}>");
+        let b = theme.find(&close).unwrap() + close.len();
+        theme[a..b].to_string()
+    };
+    let clr = inner("clrScheme");
+    let at = clr.find("<a:accent1>").unwrap();
+    let end = clr.find("</a:accent1>").unwrap();
+    let clr = format!("{}<a:accent1><a:srgbClr val=\"C0504D\"/>{}", &clr[..at], &clr[end..]);
+    let ovr = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<a:themeOverride xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\">{clr}{}{}</a:themeOverride>",
+        inner("fontScheme"),
+        inner("fmtScheme")
+    );
+    // DeckCraft's chart has no workbook, so the override is its only relationship.
+    let (chart, rels) = ("ppt/charts/chart1.xml", "ppt/charts/_rels/chart1.xml.rels");
+    let edit = |part: &str, t: String| {
+        assert_ne!(part, rels, "the built chart has no relationships of its own");
+        if part == "[Content_Types].xml" {
+            return put_before(
+                &t,
+                "</Types>",
+                "<Override PartName=\"/ppt/theme/themeOverride1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.themeOverride+xml\"/>",
+            );
+        }
+        t
+    };
+    let chart_rels = with_rels(None, &format!("<Relationship Id=\"rId9\" Type=\"{RT}/themeOverride\" Target=\"../theme/themeOverride1.xml\"/>"));
+    let customer = corpus_deck(
+        &mut m,
+        &dir,
+        "override.pptx",
+        &edit,
+        &[("ppt/theme/themeOverride1.xml", ovr.clone().into_bytes()), (rels, chart_rels.into_bytes())],
+    );
+    assert!(zip_names(&customer).iter().any(|n| n == chart), "the built deck has its chart");
+
+    let saved = open_and_save(&mut m, &dir, "override.pptx", "override-saved.pptx");
+    assert_eq!(zip_text(&saved, "ppt/theme/themeOverride1.xml"), ovr, "the override as it was written");
+    let r = zip_text(&saved, rels);
+    assert!(r.contains("relationships/themeOverride\" Target=\"../theme/themeOverride1.xml\""), "the chart still points at it: {r}");
+    assert!(
+        zip_text(&saved, "[Content_Types].xml")
+            .contains("/ppt/theme/themeOverride1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.themeOverride+xml\"")
+    );
+    for part in [chart, rels] {
+        assert_eq!(zip_bytes(&saved, part), zip_bytes(&customer, part), "{part}: the chart is untouched");
+    }
+    let rc = m.ok("roundtrip_check", json!({"path": "override.pptx"}));
+    assert_eq!(rc["lossless"], true, "{rc}");
+    m.close();
+}
+
+/// D3 (corpus gate, `poi-aascu-5864.pptx` slide 10 and `poi-alterman_security.pptx`'s master and
+/// layout): an old-style embedded object keeps the legacy VML drawing that holds its preview
+/// picture (found by `spid`), with the picture, on a slide and on a master.
+#[test]
+fn an_ole_object_keeps_its_legacy_drawing_and_preview_on_save() {
+    let dir = scratch("keep-ole-vml");
+    let mut m = start(&dir);
+    let vml = |id: &str, spid: &str, n: u32| {
+        format!(
+            "<xml xmlns:v=\"urn:schemas-microsoft-com:vml\"\n xmlns:o=\"urn:schemas-microsoft-com:office:office\"\n xmlns:p=\"urn:schemas-microsoft-com:office:powerpoint\">\n <o:shapelayout v:ext=\"edit\">\n  <o:idmap v:ext=\"edit\" data=\"{n}\"/>\n </o:shapelayout><v:shapetype id=\"_x0000_t75\" coordsize=\"21600,21600\" o:spt=\"75\"\n  o:preferrelative=\"t\" path=\"m@4@5l@4@11@9@11@9@5xe\" filled=\"f\" stroked=\"f\">\n  <v:stroke joinstyle=\"miter\"/>\n  <v:path o:extrusionok=\"f\" gradientshapeok=\"t\" o:connecttype=\"rect\"/>\n  <o:lock v:ext=\"edit\" aspectratio=\"t\"/>\n </v:shapetype><v:shape id=\"{id}\"{spid}\n  type=\"#_x0000_t75\" style='position:absolute;left:54pt;top:90pt;width:315pt;height:157.5pt'>\n  <v:imagedata o:relid=\"rId1\" o:title=\"\"/>\n </v:shape></xml>"
+        )
+    };
+    let image_rel = |n: u32| {
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"{RT}/image\" Target=\"../media/image{n}.png\"/></Relationships>"
+        )
+    };
+    // On slide 4, PowerPoint 2007's form: the object names its VML shape by `o:spid`, the shape has
+    // an id of its own.
+    let slide_frame = "<p:graphicFrame><p:nvGraphicFramePr><p:cNvPr id=\"50\" name=\"Worksheet 1\"/><p:cNvGraphicFramePr><a:graphicFrameLocks noGrp=\"1\"/></p:cNvGraphicFramePr><p:nvPr/></p:nvGraphicFramePr><p:xfrm><a:off x=\"685800\" y=\"1143000\"/><a:ext cx=\"4000500\" cy=\"2000250\"/></p:xfrm><a:graphic><a:graphicData uri=\"http://schemas.openxmlformats.org/presentationml/2006/ole\"><p:oleObj spid=\"_x0000_s1026\" name=\"Worksheet\" r:id=\"rId31\" imgW=\"4000500\" imgH=\"2000250\" progId=\"Acme.Sheet.1\"><p:embed/></p:oleObj></a:graphicData></a:graphic></p:graphicFrame>";
+    // On the master, the later form: a VML choice and a fallback picture.
+    let master_frame = "<p:graphicFrame><p:nvGraphicFramePr><p:cNvPr id=\"60\" name=\"Object 2\"/><p:cNvGraphicFramePr><a:graphicFrameLocks noChangeAspect=\"1\"/></p:cNvGraphicFramePr><p:nvPr/></p:nvGraphicFramePr><p:xfrm><a:off x=\"7000000\" y=\"100000\"/><a:ext cx=\"1000000\" cy=\"500000\"/></p:xfrm><a:graphic><a:graphicData uri=\"http://schemas.openxmlformats.org/presentationml/2006/ole\"><mc:AlternateContent xmlns:mc=\"http://schemas.openxmlformats.org/markup-compatibility/2006\"><mc:Choice xmlns:v=\"urn:schemas-microsoft-com:vml\" Requires=\"v\"><p:oleObj spid=\"_x0000_s2049\" name=\"Image\" r:id=\"rId41\" imgW=\"1000000\" imgH=\"500000\" progId=\"Acme.Image.1\"><p:embed/></p:oleObj></mc:Choice><mc:Fallback><p:oleObj name=\"Image\" r:id=\"rId41\" imgW=\"1000000\" imgH=\"500000\" progId=\"Acme.Image.1\"><p:embed/><p:pic><p:nvPicPr><p:cNvPr id=\"0\" name=\"Object 2\"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr><p:blipFill><a:blip r:embed=\"rId42\"/><a:stretch><a:fillRect/></a:stretch></p:blipFill><p:spPr><a:xfrm><a:off x=\"7000000\" y=\"100000\"/><a:ext cx=\"1000000\" cy=\"500000\"/></a:xfrm><a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom></p:spPr></p:pic></p:oleObj></mc:Fallback></mc:AlternateContent></a:graphicData></a:graphic></p:graphicFrame>";
+    let edit = move |part: &str, t: String| match part {
+        "ppt/slides/slide4.xml" => put_before(&t, "</p:spTree>", slide_frame),
+        "ppt/slides/_rels/slide4.xml.rels" => with_rels(
+            Some(t),
+            &format!(
+                "<Relationship Id=\"rId30\" Type=\"{RT}/vmlDrawing\" Target=\"../drawings/vmlDrawing1.vml\"/><Relationship Id=\"rId31\" Type=\"{RT}/oleObject\" Target=\"../embeddings/oleObject1.bin\"/>"
+            ),
+        ),
+        "ppt/slideMasters/slideMaster1.xml" => put_before(&t, "</p:spTree>", master_frame),
+        "ppt/slideMasters/_rels/slideMaster1.xml.rels" => with_rels(
+            Some(t),
+            &format!(
+                "<Relationship Id=\"rId40\" Type=\"{RT}/vmlDrawing\" Target=\"../drawings/vmlDrawing2.vml\"/><Relationship Id=\"rId41\" Type=\"{RT}/oleObject\" Target=\"../embeddings/oleObject2.bin\"/><Relationship Id=\"rId42\" Type=\"{RT}/image\" Target=\"../media/image10.png\"/>"
+            ),
+        ),
+        "[Content_Types].xml" => put_before(
+            &t,
+            "</Types>",
+            "<Override PartName=\"/ppt/drawings/vmlDrawing1.vml\" ContentType=\"application/vnd.openxmlformats-officedocument.vmlDrawing\"/><Override PartName=\"/ppt/drawings/vmlDrawing2.vml\" ContentType=\"application/vnd.openxmlformats-officedocument.vmlDrawing\"/><Override PartName=\"/ppt/embeddings/oleObject1.bin\" ContentType=\"application/vnd.openxmlformats-officedocument.oleObject\"/><Override PartName=\"/ppt/embeddings/oleObject2.bin\" ContentType=\"application/vnd.openxmlformats-officedocument.oleObject\"/><Override PartName=\"/ppt/media/image9.png\" ContentType=\"image/png\"/><Override PartName=\"/ppt/media/image10.png\" ContentType=\"image/png\"/>",
+        ),
+        _ => t,
+    };
+    let parts: Vec<(&str, Vec<u8>)> = vec![
+        ("ppt/drawings/vmlDrawing1.vml", vml("Worksheet_x0020_1", " o:spid=\"_x0000_s1026\"", 1).into_bytes()),
+        ("ppt/drawings/_rels/vmlDrawing1.vml.rels", image_rel(9).into_bytes()),
+        ("ppt/drawings/vmlDrawing2.vml", vml("_x0000_s2049", "", 2).into_bytes()),
+        ("ppt/drawings/_rels/vmlDrawing2.vml.rels", image_rel(10).into_bytes()),
+        ("ppt/media/image9.png", png_bytes([200, 40, 40])),
+        ("ppt/media/image10.png", png_bytes([40, 160, 60])),
+        ("ppt/embeddings/oleObject1.bin", b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1 an embedded workbook (test bytes)".to_vec()),
+        ("ppt/embeddings/oleObject2.bin", b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1 an embedded picture (test bytes)".to_vec()),
+    ];
+    let customer = corpus_deck(&mut m, &dir, "ole.pptx", &edit, &parts);
+
+    let saved = open_and_save(&mut m, &dir, "ole.pptx", "ole-saved.pptx");
+    for (part, _) in &parts {
+        assert_eq!(zip_bytes(&saved, part), zip_bytes(&customer, part), "{part} as it was written");
+    }
+    for part in [
+        "ppt/slides/slide4.xml",
+        "ppt/slides/_rels/slide4.xml.rels",
+        "ppt/slideMasters/slideMaster1.xml",
+        "ppt/slideMasters/_rels/slideMaster1.xml.rels",
+    ] {
+        assert_eq!(zip_bytes(&saved, part), zip_bytes(&customer, part), "{part}: the part holding the object is untouched");
+    }
+    let rc = m.ok("roundtrip_check", json!({"path": "ole.pptx"}));
+    assert_eq!(rc["lossless"], true, "{rc}");
+
+    // Edited elsewhere on the slide, the slide is written from the model: the object still names
+    // its VML shape and the slide still links the drawing.
+    m.ok("open_presentation", json!({"path": "ole.pptx"}));
+    m.ok("go_to_slide", json!({"index": 3}));
+    m.ok("add_text_box", json!({"x": 80, "y": 400, "w": 300, "text": "Added"}));
+    m.ok("save_presentation", json!({"path": "ole-edited.pptx"}));
+    let edited = dir.join("ole-edited.pptx");
+    let slide = zip_text(&edited, "ppt/slides/slide4.xml");
+    assert!(slide.contains("Added") && slide.contains("spid=\"_x0000_s1026\""), "{slide}");
+    let rels = zip_text(&edited, "ppt/slides/_rels/slide4.xml.rels");
+    assert!(rels.contains("relationships/vmlDrawing\" Target=\"../drawings/vmlDrawing1.vml\""), "{rels}");
+    assert!(rels.contains("Target=\"../embeddings/oleObject1.bin\""), "{rels}");
+    assert_eq!(zip_bytes(&edited, "ppt/drawings/vmlDrawing1.vml"), zip_bytes(&customer, "ppt/drawings/vmlDrawing1.vml"));
+    assert_eq!(zip_bytes(&edited, "ppt/media/image9.png"), zip_bytes(&customer, "ppt/media/image9.png"));
+    m.close();
+}

@@ -493,14 +493,15 @@ fn vml_index(pkg: &crate::opc::Package, vml: &str) -> std::collections::HashMap<
     let mut shapes = vec![];
     doc.root.find_all("shape", &mut shapes);
     for s in shapes {
-        let Some(id) = s.attr("id") else { continue };
-        if out.contains_key(id) {
-            continue; // the first shape with an id wins, as the old lookup did
-        }
         let Some(img) = s.find("imagedata") else { continue };
         let Some(rid) = img.attr("o:relid").or(img.attr("r:id")) else { continue };
-        if let Some(r) = rels.get(rid).filter(|r| !r.external) {
-            out.insert(id.to_string(), r.target.clone());
+        let Some(r) = rels.get(rid).filter(|r| !r.external) else { continue };
+        // WHIQ: `p:oleObj@spid` names the shape by `o:spid` when the shape has an `id` of its own
+        // (`id="Content Placeholder 3" o:spid="_x0000_s1026"`), else by `id`.
+        let ids = [s.attr("id"), s.attrs.iter().find(|(k, _)| k.ends_with(":spid")).map(|(_, v)| v.as_str())];
+        for id in ids.into_iter().flatten() {
+            // The first shape with an id wins, as the old lookup did.
+            out.entry(id.to_string()).or_insert_with(|| r.target.clone());
         }
     }
     out
@@ -566,7 +567,61 @@ fn smartart(imp: &mut Imp, part: &Part, gd: &El, frame: &Shape, depth: usize) ->
             }
         }
     }
+    // WHIQ: the graphic's own parts as they were, written back while it is unchanged.
+    let drawing_ref = data.root.find("dataModelExt").and_then(|x| x.attr("relId")).unwrap_or("").to_string();
+    let kept = diagram_source(imp, part, rel_ids, &drawing_ref, &g);
+    if let Some(d) = &mut g.diagram {
+        d.kept = kept;
+    }
     Some(g)
+}
+
+/// WHIQ: a SmartArt graphic's parts (data model, layout, quick style, colours, drawing) as the
+/// file had them, each with its own relationships, and the graphic as read
+/// ([`deckcraft_model::source::DiagramSource`]). A part whose relationships reach anything but
+/// pictures or external targets is left out (it is then written from the model).
+fn diagram_source(imp: &mut Imp, part: &Part, rel_ids: &El, drawing_ref: &str, g: &Shape) -> deckcraft_model::source::DiagramKept {
+    use deckcraft_model::source::{DiagramKept, DiagramPart, DiagramRel, DiagramSource};
+    let mut one = |id: &str| -> Option<DiagramPart> {
+        let rel = part.rels.get(id).filter(|r| !r.external)?;
+        let bytes = imp.pkg.get(&rel.target)?;
+        if bytes.len() > 64 << 20 {
+            return None;
+        }
+        let bytes = std::sync::Arc::new(bytes.to_vec());
+        let mut rels = vec![];
+        for r in imp.pkg.rels(&rel.target).items {
+            if r.external {
+                rels.push(DiagramRel { id: r.id, rel_type: r.ty, media: None, external: Some(r.target_raw) });
+            } else {
+                let m = imp.media_for(&r.target)?;
+                rels.push(DiagramRel { id: r.id, rel_type: r.ty, media: Some(m), external: None });
+            }
+        }
+        let name = imp.pkg.original_name(&rel.target).unwrap_or(&rel.target).trim_start_matches('/').to_string();
+        Some(DiagramPart { name, rel_id: id.to_string(), bytes, rels })
+    };
+    let attr = |a: &str| rel_ids.attr(a).unwrap_or("");
+    let data = one(attr("r:dm"));
+    if data.is_none() {
+        return DiagramKept(None);
+    }
+    let (layout, style, colors) = (one(attr("r:lo")), one(attr("r:qs")), one(attr("r:cs")));
+    let drawing = one(drawing_ref);
+    let mut src = DiagramSource { data, layout, style, colors, drawing, drawing_ref: drawing_ref.to_string(), ..Default::default() };
+    as_read(&mut src, g);
+    DiagramKept(Some(std::sync::Arc::new(src)))
+}
+
+/// WHIQ: take `g` (a SmartArt group) as the graphic "as read" of its source.
+pub(crate) fn as_read(src: &mut deckcraft_model::source::DiagramSource, g: &Shape) {
+    if let (ShapeKind::Group { children, child }, Some(d)) = (&g.kind, &g.diagram) {
+        src.diagram = d.clone();
+        src.diagram.kept = Default::default();
+        src.children = children.clone();
+        src.child = *child;
+        src.frame = g.xfrm;
+    }
 }
 
 /// A SmartArt drawing shape (`dsp:sp`) keeps its text rectangle in `dsp:txXfrm`, apart from the
@@ -716,6 +771,7 @@ fn diagram_outline(imp: &Imp, part: &Part, rel_ids: &El, data: &El) -> Option<de
         layout_xml,
         style_xml: raw("r:qs"),
         colors_xml: raw("r:cs"),
+        kept: Default::default(),
     })
 }
 

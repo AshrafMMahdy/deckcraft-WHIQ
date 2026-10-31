@@ -54,10 +54,7 @@ pub struct Exp<'a> {
     pub p: &'a Presentation,
     pub pkg: PackageOut,
     media_parts: HashMap<MediaId, String>,
-    n_image: u32,
-    n_media: u32,
     n_chart: u32,
-    n_diagram: u32,
     n_tags: u32,
     n_chartex: u32,
     /// Parts kept from an unchanged chart (`ppt/…/keptN.ext`).
@@ -139,13 +136,20 @@ impl Exp<'_> {
         } else {
             m.content_type.clone()
         };
-        let name = if ct.starts_with("image/") {
-            self.n_image += 1;
-            format!("ppt/media/image{}.{ext}", self.n_image)
-        } else {
-            self.n_media += 1;
-            format!("ppt/media/media{}.{ext}", self.n_media)
-        };
+        // WHIQ: a media item read from a file keeps the name it had there (pictures and media under
+        // `ppt/media/`, embedded objects under `ppt/embeddings/`); a part kept with a slide, layout
+        // or master (a legacy drawing's picture) that has the name is this same part.
+        let original = self.p.source.get().and_then(|s| s.names.media.get(&id)).filter(|n| media_name_ok(n)).cloned();
+        if let Some(o) = &original
+            && self.kept_written.contains(&o.to_ascii_lowercase())
+            && self.pkg.has(o)
+        {
+            self.media_parts.insert(id, o.clone());
+            return Some(o.clone());
+        }
+        let stem = if ct.starts_with("image/") { "ppt/media/image" } else { "ppt/media/media" };
+        let pkg = &self.pkg;
+        let name = self.namer.name_ext(original.as_ref(), stem, &ext, &|n| pkg.has(n));
         // WHIQ: the model's bytes are shared, not copied; a spilled part streams from disk.
         let data = match &m.spill {
             Some(sp) if m.data.is_empty() => opc::PartData::Disk(Arc::clone(sp)),
@@ -178,19 +182,14 @@ impl Exp<'_> {
         let part = match &self.placeholder {
             Some(p) => p.clone(),
             None => {
-                self.n_image += 1;
-                let name = format!("ppt/media/image{}.png", self.n_image);
+                let pkg = &self.pkg;
+                let name = self.namer.name_ext(None, "ppt/media/image", "png", &|n| pkg.has(n));
                 self.pkg.binary(&name, "image/png", crate::png::transparent_1x1());
                 self.placeholder = Some(name.clone());
                 name
             }
         };
         o.rels.add("image", &opc::relative(&o.name, &part), false)
-    }
-    /// The number of the next SmartArt graphic's parts.
-    pub fn next_diagram(&mut self) -> u32 {
-        self.n_diagram += 1;
-        self.n_diagram
     }
     /// A new `ppt/tags/tagN.xml` part holding `tags`, related from `o`.
     pub fn tags_rel(&mut self, o: &mut Out, tags: &Tags) -> String {
@@ -601,10 +600,7 @@ fn build_written(p: &Presentation, main_ct: &str, on: &mut dyn FnMut(&'static st
         p,
         pkg: PackageOut::default(),
         media_parts: HashMap::new(),
-        n_image: 0,
-        n_media: 0,
         n_chart: 0,
-        n_diagram: 0,
         n_tags: 0,
         n_chartex: 0,
         n_kept: 0,
@@ -654,6 +650,12 @@ fn build_written(p: &Presentation, main_ct: &str, on: &mut dyn FnMut(&'static st
         let mname = master_names.get(mi).cloned().unwrap_or_else(|| format!("ppt/slideMasters/slideMaster{}.xml", mi + 1));
         let tname = theme_names.get(mi).cloned().unwrap_or_else(|| format!("ppt/theme/theme{}.xml", mi + 1));
         let mut mo = Out::new(&mname);
+        // WHIQ: a master's and a layout's legacy drawing comes along under its own id, like a
+        // slide's kept parts (nothing in the XML names it by id: its objects find it by `spid`).
+        link_kept(&mut mo.rels, &mname, &m.kept_parts);
+        for k in m.kept_parts.iter().filter(|k| kept_name_ok(&k.name)) {
+            write_kept(&mut x.pkg, &mut x.kept_written, k);
+        }
         let mut lrids = vec![];
         for l in &m.layouts {
             let lname = layout_names.get(&l.id).cloned().unwrap_or_else(|| x.namer.name(None, "ppt/slideLayouts/slideLayout"));
@@ -661,6 +663,10 @@ fn build_written(p: &Presentation, main_ct: &str, on: &mut dyn FnMut(&'static st
             let rid = mo.rels.add("slideLayout", &opc::relative(&mname, &lname), false);
             lrids.push(rid);
             let mut lo = Out::new(&lname);
+            link_kept(&mut lo.rels, &lname, &l.kept_parts);
+            for k in l.kept_parts.iter().filter(|k| kept_name_ok(&k.name)) {
+                write_kept(&mut x.pkg, &mut x.kept_written, k);
+            }
             lo.rels.add("slideMaster", &opc::relative(&lname, &mname), false);
             let xml = layout_xml(&mut x, &mut lo, l);
             x.pkg.xml_part(&lname, CT_LAYOUT, xml);
@@ -883,6 +889,17 @@ fn build_written(p: &Presentation, main_ct: &str, on: &mut dyn FnMut(&'static st
     }
     x.pkg.rels("", &root);
     Ok(x.pkg)
+}
+
+/// WHIQ: a media item may keep the name it had in its file: a picture, media or embedded object
+/// part (`ppt/media/…`, `ppt/embeddings/…`), never a name the writer gives other parts.
+fn media_name_ok(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    (n.starts_with("ppt/media/") || n.starts_with("ppt/embeddings/"))
+        && !n.contains("..")
+        && !n.ends_with(".rels")
+        && !n.contains("/_rels/")
+        && n.rsplit('/').next().is_some_and(|f| !f.is_empty())
 }
 
 /// A kept part may be written at this name: inside the package, not one the writer always makes.

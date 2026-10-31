@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::{LayoutId, MasterId, Presentation, SlideId};
+use crate::{Diagram, LayoutId, MasterId, MediaId, Presentation, Shape, SlideId, Xfrm};
 
 /// Where the presentation's parts came from.
 #[derive(Debug, Default)]
@@ -33,6 +33,9 @@ pub struct PackageNames {
     pub parts: HashMap<String, Arc<Vec<u8>>>,
     /// CRC-32 and size of every entry of the original package, by lower-case name.
     pub entries: HashMap<String, (u32, u64)>,
+    /// The part each media item (picture, video, embedded object…) was read from: a save names
+    /// it so again.
+    pub media: HashMap<MediaId, String>,
     /// The package's thumbnail: part name, content type, bytes.
     pub thumbnail: Option<(String, String, Arc<Vec<u8>>)>,
     /// `docProps/core.xml` and `docProps/app.xml` as they were (part name, bytes).
@@ -80,6 +83,7 @@ impl Source {
             presentation: n.presentation.clone(),
             parts: n.parts.clone(),
             entries: n.entries.clone(),
+            media: n.media.clone(),
             thumbnail: None,
             core: None,
             app: None,
@@ -92,4 +96,63 @@ impl Source {
         });
         Source(Some(Arc::new(PackageSource { names, pristine })))
     }
+}
+
+/// [`Diagram::kept`]: a SmartArt graphic's own parts as the file had them. `None` for a diagram
+/// that was not read from a package. It never takes part in comparing diagrams and is not saved
+/// in `.deckcraft` files.
+#[derive(Clone, Debug, Default)]
+pub struct DiagramKept(pub Option<Arc<DiagramSource>>);
+
+impl PartialEq for DiagramKept {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl DiagramKept {
+    pub fn get(&self) -> Option<&DiagramSource> {
+        self.0.as_deref()
+    }
+}
+
+/// A SmartArt graphic as it was read: its parts, and the model they were read into. While the
+/// diagram is the same as read, its data model, layout, quick style and colour parts are written
+/// as they were; while its shapes are too, its drawing is.
+#[derive(Debug, Default)]
+pub struct DiagramSource {
+    /// The diagram as read (its own `kept` empty).
+    pub diagram: Diagram,
+    /// The graphic's shapes (the drawing), their child space and the frame, as read.
+    pub children: Vec<Shape>,
+    pub child: Xfrm,
+    pub frame: Option<Xfrm>,
+    pub data: Option<DiagramPart>,
+    pub layout: Option<DiagramPart>,
+    pub style: Option<DiagramPart>,
+    pub colors: Option<DiagramPart>,
+    pub drawing: Option<DiagramPart>,
+    /// The relationship id the data model names its drawing by (`dsp:dataModelExt@relId`).
+    pub drawing_ref: String,
+}
+
+/// One part of a SmartArt graphic: its name, the relationship id the graphic named it by, its
+/// bytes, and its own relationships.
+#[derive(Clone, Debug, Default)]
+pub struct DiagramPart {
+    pub name: String,
+    pub rel_id: String,
+    pub bytes: Arc<Vec<u8>>,
+    pub rels: Vec<DiagramRel>,
+}
+
+/// A relationship of a SmartArt part: to a picture (the media item read from it) or an external
+/// target (a hyperlink).
+#[derive(Clone, Debug, Default)]
+pub struct DiagramRel {
+    pub id: String,
+    pub rel_type: String,
+    pub media: Option<MediaId>,
+    /// The target of an external relationship.
+    pub external: Option<String>,
 }

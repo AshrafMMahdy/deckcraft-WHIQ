@@ -418,10 +418,15 @@ pub fn sidecar_part(name: &str) -> bool {
         return false;
     }
     let (Some(root), Some(area)) = (segs.first().copied(), segs.get(1).copied()) else { return false };
+    let file = segs.last().copied().unwrap_or("");
+    // WHIQ: a chart's theme override (`ppt/theme/themeOverrideN.xml`, and its relationships) is
+    // its own part; the themes of masters, notes and handouts beside it never are.
+    if root == "ppt" && area == "theme" {
+        return segs.len() <= 4 && file.starts_with("themeoverride");
+    }
     if root != "ppt" || !matches!(area, "embeddings" | "charts" | "drawings" | "media") {
         return false;
     }
-    let file = segs.last().copied().unwrap_or("");
     let stem = file.strip_prefix("chart").unwrap_or("");
     let num = stem.strip_suffix(".xml.rels").or_else(|| stem.strip_suffix(".xml")).unwrap_or("");
     if stem != file && !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()) {
@@ -795,6 +800,10 @@ mod tests {
         assert!(sidecar_part("ppt/charts/style1.xml"));
         assert!(sidecar_part("ppt/drawings/chartDrawing1.xml"));
         assert!(sidecar_part("ppt/media/image1.png"));
+        assert!(sidecar_part("ppt/theme/themeOverride1.xml"));
+        assert!(sidecar_part("ppt/theme/_rels/themeOverride1.xml.rels"));
+        assert!(!sidecar_part("ppt/theme/theme1.xml"));
+        assert!(!sidecar_part("ppt/theme/_rels/theme1.xml.rels"));
         assert!(!sidecar_part("ppt/charts/chart1.xml"));
         assert!(!sidecar_part("ppt/charts/_rels/chart1.xml.rels"));
         assert!(!sidecar_part("ppt/slides/slide1.xml"));

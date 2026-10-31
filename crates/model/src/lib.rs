@@ -392,6 +392,11 @@ pub struct Diagram {
     pub style_xml: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub colors_xml: Option<String>,
+    /// WHIQ: the diagram's own parts as the file had them (data model, layout, quick style,
+    /// colours, drawing), written back as they were while the diagram is unchanged. Never saved
+    /// in `.deckcraft` files, never part of comparing diagrams.
+    #[serde(skip)]
+    pub kept: source::DiagramKept,
 }
 
 /// One line of the Text Pane: its text and outline level (0 = top level).
@@ -750,6 +755,10 @@ pub struct Layout {
     pub color_map: Option<Vec<(String, String)>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_ext: Option<String>,
+    /// WHIQ: parts the layout linked that DeckCraft doesn't model (its legacy VML drawing, which
+    /// holds the preview pictures of its old-style embedded objects), written back as they were.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kept_parts: Vec<KeptPart>,
 }
 
 /// Which placeholders slides show in the footer row (Header & Footer dialog).
@@ -785,6 +794,10 @@ pub struct Master {
     pub preserve: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_ext: Option<String>,
+    /// WHIQ: parts the master linked that DeckCraft doesn't model (its legacy VML drawing),
+    /// written back as they were.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kept_parts: Vec<KeptPart>,
 }
 
 impl Master {

@@ -245,6 +245,7 @@ pub fn build_master(size: Size, theme: Theme, first_id: u32) -> (Master, u32) {
             preserve: true,
             color_map: None,
             raw_ext: None,
+            kept_parts: vec![],
         });
     };
 
@@ -476,6 +477,7 @@ pub fn build_master(size: Size, theme: Theme, first_id: u32) -> (Master, u32) {
         color_map: vec![],
         preserve: false,
         raw_ext: None,
+        kept_parts: vec![],
     };
     (master, b.next + 1)
 }

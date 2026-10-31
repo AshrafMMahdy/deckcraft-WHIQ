@@ -118,7 +118,65 @@ fn name_of(pkg: &Package, part: &str) -> String {
 /// again after a repair of the model, so a repair alone does not count as an edit.
 pub fn snapshot(p: &mut Presentation) {
     let Some(names) = p.source.get().map(|s| s.names.clone()) else { return };
+    diagrams_as_read(p);
     let mut pristine = p.clone();
     pristine.source = Source(Some(Arc::new(PackageSource { names: names.clone(), pristine: None })));
     p.source = Source(Some(Arc::new(PackageSource { names, pristine: Some(Arc::new(pristine)) })));
+}
+
+/// Every SmartArt graphic read from the file takes its shapes as they are now as its shapes "as
+/// read" (the reader's later passes and the repair adjust them; neither is an edit).
+fn diagrams_as_read(p: &mut Presentation) {
+    use deckcraft_model::{Shape, ShapeKind};
+    fn stale(shapes: &[Shape], depth: usize) -> bool {
+        depth < 32
+            && shapes.iter().any(|s| match (&s.kind, &s.diagram) {
+                (ShapeKind::Group { children, child }, Some(d)) => d.kept.get().is_some_and(|k| {
+                    let mut now = d.clone();
+                    now.kept = Default::default();
+                    k.diagram != now || k.children != *children || k.child != *child || k.frame != s.xfrm
+                }),
+                (ShapeKind::Group { children, .. }, None) => stale(children, depth + 1),
+                _ => false,
+            })
+    }
+    fn refresh(shapes: &mut [Shape], depth: usize) {
+        if depth >= 32 {
+            return;
+        }
+        for s in shapes {
+            if let ShapeKind::Group { children, .. } = &mut s.kind
+                && s.diagram.is_none()
+            {
+                refresh(children, depth + 1);
+                continue;
+            }
+            let Some(k) = s.diagram.as_ref().and_then(|d| d.kept.get()) else { continue };
+            let mut fresh = deckcraft_model::source::DiagramSource {
+                data: k.data.clone(),
+                layout: k.layout.clone(),
+                style: k.style.clone(),
+                colors: k.colors.clone(),
+                drawing: k.drawing.clone(),
+                drawing_ref: k.drawing_ref.clone(),
+                ..Default::default()
+            };
+            crate::read::shapes::as_read(&mut fresh, s);
+            if let Some(d) = &mut s.diagram {
+                d.kept = deckcraft_model::source::DiagramKept(Some(Arc::new(fresh)));
+            }
+        }
+    }
+    for s in p.slides.iter_mut().filter(|s| stale(&s.shapes, 0)) {
+        refresh(&mut Arc::make_mut(s).shapes, 0);
+    }
+    for m in p.masters.iter_mut() {
+        if stale(&m.shapes, 0) || m.layouts.iter().any(|l| stale(&l.shapes, 0)) {
+            let m = Arc::make_mut(m);
+            refresh(&mut m.shapes, 0);
+            for l in &mut m.layouts {
+                refresh(&mut l.shapes, 0);
+            }
+        }
+    }
 }

@@ -703,13 +703,17 @@ fn drop_unkept_refs(root: &mut crate::xml::El, c: &Chart) {
 fn kept_name(original: &str, n: u32) -> String {
     let norm = crate::opc::norm(original);
     let area = norm.split('/').nth(1).unwrap_or("embeddings");
-    let area = if matches!(area, "embeddings" | "charts" | "drawings" | "media") { area } else { "embeddings" };
+    let area = if matches!(area, "embeddings" | "charts" | "drawings" | "media" | "theme") { area } else { "embeddings" };
     let file = crate::opc::file_of(&norm);
     let ext = file
         .rsplit_once('.')
         .map(|(_, e)| e)
         .filter(|e| !e.is_empty() && e.len() <= 8 && e.chars().all(|c| c.is_ascii_alphanumeric()))
         .unwrap_or("bin");
+    // WHIQ: a theme override renamed stays one (`themeOverride…`, never a master's theme name).
+    if area == "theme" {
+        return format!("ppt/theme/themeOverrideKept{n}.{ext}");
+    }
     format!("ppt/{area}/kept{n}.{ext}")
 }
 
@@ -734,7 +738,7 @@ pub fn write_kept(pkg: &mut crate::opc::PackageOut, chart_name: &str, c: &Chart,
         }
         // WHIQ: a workbook or chart style part keeps its own name when nothing else has it.
         let own = norm(&p.name);
-        let mine = (own.starts_with("ppt/embeddings/") || own.starts_with("ppt/charts/"))
+        let mine = (own.starts_with("ppt/embeddings/") || own.starts_with("ppt/charts/") || own.starts_with("ppt/theme/themeoverride"))
             && !pkg.has(&own)
             && namer.as_deref_mut().is_some_and(|nm| nm.claim(&p.name));
         let new = if mine {

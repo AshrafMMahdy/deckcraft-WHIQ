@@ -324,7 +324,8 @@ const SLIDE_KNOWN_RELS: &[&str] = &[
     "oleObject",
     "package",
     "tags",
-    "vmlDrawing",
+    // WHIQ: not "vmlDrawing": the legacy drawing (the preview pictures of old-style embedded
+    // objects, found by `spid`) is kept with the slide, as it was.
     "slide",
     "model3d",
     "customXml",
@@ -340,6 +341,17 @@ const SLIDE_KNOWN_RELS: &[&str] = &[
 /// they link in turn, kept verbatim so a save writes them back (unknown add-in data, printer
 /// settings, revision info, extensions' parts). Bounded: 200 parts, 8 levels.
 pub fn foreign_parts(pkg: &Package, holder: &str, known: &[&str]) -> Vec<deckcraft_model::KeptPart> {
+    foreign_parts_by(pkg, holder, &|kind| !known.contains(&kind))
+}
+
+/// WHIQ: the legacy VML drawings a master or layout links (the preview pictures of its old-style
+/// embedded objects, which find them by `spid`), with what they link, kept as they were.
+pub fn legacy_drawings(pkg: &Package, holder: &str) -> Vec<deckcraft_model::KeptPart> {
+    foreign_parts_by(pkg, holder, &|kind| kind == "vmlDrawing")
+}
+
+/// [`foreign_parts`] for the relationship kinds `keep` takes.
+fn foreign_parts_by(pkg: &Package, holder: &str, keep: &dyn Fn(&str) -> bool) -> Vec<deckcraft_model::KeptPart> {
     use deckcraft_model::KeptPart;
     let mut out: Vec<KeptPart> = Vec::new();
     let kept = |name: &str, out: &mut Vec<KeptPart>| -> bool {
@@ -359,7 +371,7 @@ pub fn foreign_parts(pkg: &Package, holder: &str, known: &[&str]) -> Vec<deckcra
         out.push(KeptPart { name: name.to_string(), content_type, xml, bytes, ..Default::default() });
         true
     };
-    for r in pkg.rels(holder).items.iter().filter(|r| !r.external && !known.contains(&r.kind.as_str())) {
+    for r in pkg.rels(holder).items.iter().filter(|r| !r.external && keep(r.kind.as_str())) {
         if !kept(&r.target, &mut out) {
             continue;
         }
@@ -855,6 +867,8 @@ fn import_package(pkg: &Package, on_slide: &mut dyn FnMut(usize, usize) -> bool)
     p.header_footer = header_footer(&p);
     p.embedded_fonts = read_embedded_fonts(&mut imp, &pres_part, pres_el);
     p.media = std::mem::take(&mut imp.media);
+    // WHIQ: the part each media item came from, so a save names it so again.
+    src.names.media = imp.media_by_part.iter().map(|(k, id)| (*id, pkg.original_name(k).unwrap_or(k).trim_start_matches('/').to_string())).collect();
     p.next_id = imp.next;
     p.fix_next_id();
     src.finish(pkg, &pres_path, &mut p);
@@ -1234,6 +1248,7 @@ fn read_master(imp: &mut Imp, path: &str, doc: &Doc, docs: &HashMap<String, Doc>
     if let Some(ext) = root.child("extLst").filter(|e| !has_rel_refs(e)) {
         m.raw_ext = Some(ext.elements().map(|e| part.keep(e)).collect());
     }
+    m.kept_parts = legacy_drawings(pkg, path);
     m
 }
 
@@ -1258,6 +1273,7 @@ fn read_layout(imp: &mut Imp, part: &Part, doc: &Doc) -> Layout {
     if let Some(ext) = root.child("extLst").filter(|e| !has_rel_refs(e)) {
         l.raw_ext = Some(ext.elements().map(|e| part.keep(e)).collect());
     }
+    l.kept_parts = legacy_drawings(imp.pkg, &part.name);
     l
 }
 

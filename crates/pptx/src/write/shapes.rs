@@ -505,16 +505,94 @@ fn write_model(
 
 /// A SmartArt graphic: a graphic frame naming its data, layout, quick style and colour parts,
 /// with the group's shapes as the cached drawing PowerPoint shows until it lays the diagram out.
+///
+/// WHIQ: a graphic read from a file keeps its parts' names; while its diagram is the same as read,
+/// its data model (every point and connection, not only the outline DeckCraft reads), layout,
+/// quick style and colours are written as they were, and while its shapes are too, its drawing.
 #[allow(clippy::too_many_arguments)]
 fn diagram(w: &mut W, x: &mut Exp, o: &mut Out, cx: &mut Ctx, s: &Shape, d: &deckcraft_model::Diagram, children: &[Shape], child: &Xfrm) {
     use crate::dgm;
     let id = cx.id_for(s);
-    let n = x.next_diagram();
     let frame = s.xfrm.unwrap_or(*child);
-    let name = |kind: &str| format!("ppt/diagrams/{kind}{n}.xml");
+    let src = d.kept.get();
+    let same_data = src.is_some_and(|k| k.diagram == *d);
+    let same_drawing = same_data && src.is_some_and(|k| k.children == children && k.child == *child && k.frame == s.xfrm);
+    let original =
+        |pick: fn(&deckcraft_model::source::DiagramSource) -> &Option<deckcraft_model::source::DiagramPart>| src.and_then(|k| pick(k).as_ref());
+    let (data_src, layout_src, style_src, colors_src, drawing_src) =
+        (original(|k| &k.data), original(|k| &k.layout), original(|k| &k.style), original(|k| &k.colors), original(|k| &k.drawing));
+    let name = |x: &mut Exp, kind: &str, part: Option<&deckcraft_model::source::DiagramPart>| {
+        let pkg = &x.pkg;
+        x.namer.name_ext(part.map(|p| &p.name), &format!("ppt/diagrams/{kind}"), "xml", &|n| pkg.has(n))
+    };
     // The drawing: the group's shapes in the frame's own coordinates.
-    let dname = name("drawing");
+    let dname = name(x, "drawing", drawing_src);
     let mut dout = Out::new(&dname);
+    let kept_drawing = drawing_src.filter(|_| same_drawing).and_then(|p| kept_part(x, &mut dout, p));
+    let dxml = match kept_drawing {
+        Some(b) => b,
+        None => {
+            dout = Out::new(&dname);
+            drawing_xml(x, &mut dout, s, children, child, &frame)
+        }
+    };
+    x.pkg.xml_part(&dname, dgm::CT_DRAWING, dxml);
+    x.pkg.rels(&dname, &dout.rels);
+    let rel = |o: &mut Out, kind: &str, part: &str, was: Option<&deckcraft_model::source::DiagramPart>| match was {
+        Some(p) => o.rels.add_with_id(&p.rel_id, kind, &crate::opc::relative(&o.name, part)),
+        None => o.rels.add_new(kind, &crate::opc::relative(&o.name, part), false),
+    };
+    let drawing_rel = rel(o, dgm::RT_DRAWING, &dname, drawing_src);
+    let data = name(x, "data", data_src);
+    let mut mout = Out::new(&data);
+    let kept_data = data_src.filter(|_| same_data).and_then(|p| kept_part(x, &mut mout, p)).map(|b| {
+        let was = src.map(|k| k.drawing_ref.as_str()).unwrap_or("");
+        if was.is_empty() || was == drawing_rel { b } else { data_drawing_ref(&b, was, &drawing_rel) }
+    });
+    let data_xml = match kept_data {
+        Some(b) => b,
+        None => {
+            // Node pictures: on the data model's presentation points, through the data part's rels.
+            mout = Out::new(&data);
+            let pics: Vec<(usize, String)> =
+                d.nodes.iter().enumerate().filter_map(|(k, n)| n.picture.and_then(|m| x.media_rel(&mut mout, m, "image")).map(|r| (k, r))).collect();
+            dgm::data_xml(d, s.id.0, &drawing_rel, &pics)
+        }
+    };
+    x.pkg.xml_part(&data, dgm::CT_DATA, data_xml);
+    x.pkg.rels(&data, &mout.rels);
+    let dm = rel(o, "diagramData", &data, data_src);
+    // Layout, quick style and colours: the file's own parts while the diagram is unchanged.
+    let side = |x: &mut Exp, o: &mut Out, kind: &str, ct: &str, rt: &str, was: Option<&deckcraft_model::source::DiagramPart>, made: Vec<u8>| {
+        let part = name(x, kind, was);
+        let mut po = Out::new(&part);
+        let bytes = was.filter(|_| same_data).and_then(|p| kept_part(x, &mut po, p));
+        let bytes = bytes.unwrap_or_else(|| {
+            po = Out::new(&part);
+            made
+        });
+        x.pkg.xml_part(&part, ct, bytes);
+        x.pkg.rels(&part, &po.rels);
+        rel(o, rt, &part, was)
+    };
+    let lo_xml = d.layout_xml.clone().map(String::into_bytes).unwrap_or_else(|| dgm::layout_xml(&d.kind));
+    let lo = side(x, o, "layout", dgm::CT_LAYOUT, "diagramLayout", layout_src, lo_xml);
+    let qs_xml = d.style_xml.clone().map(String::into_bytes).unwrap_or_else(|| dgm::style_xml(&d.style));
+    let qs = side(x, o, "quickStyle", dgm::CT_STYLE, "diagramQuickStyle", style_src, qs_xml);
+    let cs_xml = d.colors_xml.clone().map(String::into_bytes).unwrap_or_else(|| dgm::colors_xml(&d.colors));
+    let cs = side(x, o, "colors", dgm::CT_COLORS, "diagramColors", colors_src, cs_xml);
+    let mut fs = s.clone();
+    fs.xfrm = Some(frame);
+    frame_open(w, x, o, id, &fs);
+    w.open("a:graphicData", A::new().a("uri", "http://schemas.openxmlformats.org/drawingml/2006/diagram"));
+    w.empty("dgm:relIds", A::new().a("xmlns:dgm", dgm::NS_DGM).a("r:dm", dm).a("r:lo", lo).a("r:qs", qs).a("r:cs", cs));
+    w.close("a:graphicData");
+    frame_close(w);
+}
+
+/// The drawing DeckCraft makes for a SmartArt group: its shapes in the frame's coordinates.
+fn drawing_xml(x: &mut Exp, dout: &mut Out, s: &Shape, children: &[Shape], child: &Xfrm, frame: &Xfrm) -> Vec<u8> {
+    use crate::dgm;
     let mut dw = W::new();
     dw.open(
         "dsp:drawing",
@@ -544,46 +622,58 @@ fn diagram(w: &mut W, x: &mut Exp, o: &mut Out, cx: &mut Ctx, s: &Shape, d: &dec
         dw.empty("dsp:cNvPr", A::new().a("id", 0).a("name", ""));
         dw.empty0("dsp:cNvSpPr");
         dw.close("dsp:nvSpPr");
-        sp_pr_tag(&mut dw, x, &mut dout, &c, true, "dsp:spPr");
+        sp_pr_tag(&mut dw, x, dout, &c, true, "dsp:spPr");
         if let Some(st) = &c.style {
             style_tag(&mut dw, st, "dsp:style");
         }
         if let Some(tb) = &c.text {
-            dml::text_body(&mut dw, x, &mut dout, "dsp:txBody", tb, false);
+            dml::text_body(&mut dw, x, dout, "dsp:txBody", tb, false);
         }
         dw.close("dsp:sp");
     }
     dw.close("dsp:spTree");
     dw.close("dsp:drawing");
-    x.pkg.xml_part(&dname, dgm::CT_DRAWING, dw.finish());
-    x.pkg.rels(&dname, &dout.rels);
-    let rel = |o: &mut Out, kind: &str, part: &str| o.rels.add_new(kind, &crate::opc::relative(&o.name, part), false);
-    let drawing_rel = rel(o, dgm::RT_DRAWING, &dname);
-    let data = name("data");
-    // Node pictures: on the data model's presentation points, through the data part's rels.
-    let mut mout = Out::new(&data);
-    let pics: Vec<(usize, String)> =
-        d.nodes.iter().enumerate().filter_map(|(k, n)| n.picture.and_then(|m| x.media_rel(&mut mout, m, "image")).map(|r| (k, r))).collect();
-    x.pkg.xml_part(&data, dgm::CT_DATA, dgm::data_xml(d, s.id.0, &drawing_rel, &pics));
-    x.pkg.rels(&data, &mout.rels);
-    let dm = rel(o, "diagramData", &data);
-    let layout = name("layout");
-    let lo_xml = d.layout_xml.clone().map(String::into_bytes).unwrap_or_else(|| dgm::layout_xml(&d.kind));
-    x.pkg.xml_part(&layout, dgm::CT_LAYOUT, lo_xml);
-    let lo = rel(o, "diagramLayout", &layout);
-    let style = name("quickStyle");
-    x.pkg.xml_part(&style, dgm::CT_STYLE, d.style_xml.clone().map(String::into_bytes).unwrap_or_else(|| dgm::style_xml(&d.style)));
-    let qs = rel(o, "diagramQuickStyle", &style);
-    let colors = name("colors");
-    x.pkg.xml_part(&colors, dgm::CT_COLORS, d.colors_xml.clone().map(String::into_bytes).unwrap_or_else(|| dgm::colors_xml(&d.colors)));
-    let cs = rel(o, "diagramColors", &colors);
-    let mut fs = s.clone();
-    fs.xfrm = Some(frame);
-    frame_open(w, x, o, id, &fs);
-    w.open("a:graphicData", A::new().a("uri", "http://schemas.openxmlformats.org/drawingml/2006/diagram"));
-    w.empty("dgm:relIds", A::new().a("xmlns:dgm", dgm::NS_DGM).a("r:dm", dm).a("r:lo", lo).a("r:qs", qs).a("r:cs", cs));
-    w.close("a:graphicData");
-    frame_close(w);
+    dw.finish()
+}
+
+/// WHIQ: a SmartArt part as the file had it: its bytes, and its relationships (to pictures, now
+/// under the names this save gives them, or external) under their own ids in `po`. `None` when a
+/// picture it points at has no bytes to write.
+fn kept_part(x: &mut Exp, po: &mut Out, p: &deckcraft_model::source::DiagramPart) -> Option<Vec<u8>> {
+    for r in &p.rels {
+        match (&r.media, &r.external) {
+            (Some(m), _) => {
+                let part = x.media_part(*m)?;
+                let target = crate::opc::relative(&po.name, &part);
+                if po.rels.add_with_id(&r.id, &r.rel_type, &target) != r.id {
+                    return None;
+                }
+            }
+            (None, Some(t)) => {
+                if po.rels.items.iter().any(|(i, ..)| *i == r.id) {
+                    return None;
+                }
+                po.rels.items.push((r.id.clone(), r.rel_type.clone(), t.clone(), true));
+            }
+            (None, None) => return None,
+        }
+    }
+    Some(p.bytes.to_vec())
+}
+
+/// WHIQ: a kept data model that names its drawing by `was` (`dsp:dataModelExt@relId`), naming it
+/// by `now` instead.
+fn data_drawing_ref(data: &[u8], was: &str, now: &str) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(data) else { return data.to_vec() };
+    let Some(ext) = text.find("dataModelExt") else { return data.to_vec() };
+    let needle = format!("relId=\"{was}\"");
+    match text.get(ext..).and_then(|t| t.find(&needle)) {
+        Some(i) => {
+            let at = ext + i;
+            format!("{}relId=\"{now}\"{}", &text[..at], &text[at + needle.len()..]).into_bytes()
+        }
+        None => data.to_vec(),
+    }
 }
 
 fn ink_shape(st: &deckcraft_model::InkStroke, i: usize) -> Option<Shape> {
@@ -929,6 +1019,11 @@ fn ole_fallback(root: &mut crate::xml::El, x: &mut Exp, o: &mut Out, preview: Op
         return;
     };
     if ole.child("pic").is_some() || ole.attr("spid").is_none() {
+        return;
+    }
+    // WHIQ: the part being written keeps its legacy drawing (a slide, layout or master read from
+    // a file): the object finds its preview there, as it was written.
+    if o.rels.items.iter().any(|(_, ty, _, external)| !*external && ty.ends_with("/vmlDrawing")) {
         return;
     }
     ole.attrs.retain(|(k, _)| k != "spid");
