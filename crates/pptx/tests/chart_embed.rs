@@ -99,15 +99,17 @@ fn an_unchanged_chart_keeps_its_embedded_workbook() {
 
     let saved = deckcraft_pptx::export(&deckcraft_pptx::import(&src).expect("import")).expect("export");
     let saved_parts = parts(&saved);
-    // Kept parts are written under fresh names, so they can't land on a part the writer makes.
-    let workbook = saved_parts.iter().find(|(n, _)| n == "ppt/embeddings/kept1.xlsx").map(|(_, d)| d.as_slice());
+    // WHIQ: an unchanged chart's workbook keeps its own name (nothing the writer makes is named
+    // in ppt/embeddings/); other kept parts are written under fresh names.
+    let workbook = saved_parts.iter().find(|(n, _)| n == EMBED).map(|(_, d)| d.as_slice());
     assert_eq!(workbook, Some(WORKBOOK), "the embedding part is dropped on save");
     let rels = saved_parts
         .iter()
         .find(|(n, _)| n.starts_with("ppt/charts/_rels/chart") && n.ends_with(".xml.rels"))
         .map(|(_, d)| String::from_utf8_lossy(d).into_owned())
         .expect("chart relationships");
-    assert!(rels.contains(r#"Id="rId1""#) && rels.contains("../embeddings/kept1.xlsx"), "{rels}");
+    let embed_file = EMBED.rsplit('/').next().unwrap_or(EMBED);
+    assert!(rels.contains(r#"Id="rId1""#) && rels.contains(&format!("../embeddings/{embed_file}")), "{rels}");
     assert!(!rels.contains("slide1.xml"), "a chart relationship must not replace the slide: {rels}");
     let slide = saved_parts.iter().find(|(n, _)| n == "ppt/slides/slide1.xml").map(|(_, d)| String::from_utf8_lossy(d).into_owned()).expect("slide");
     assert!(slide.contains("sld"), "{slide}");
@@ -245,7 +247,11 @@ fn kept_chart_parts_never_collide_with_written_parts() {
 
     // The chart's relationships point at the renamed parts, which hold the kept bytes.
     let rels = text_of(&saved, "ppt/charts/_rels/chart1.xml.rels");
-    assert!(!rels.contains("image1.png") && !rels.contains("drawing1.xml") && !rels.contains("Worksheet1"), "{rels}");
+    // (WHIQ: the workbook keeps its own name: nothing the writer makes lives in ppt/embeddings/.)
+    assert!(
+        !rels.contains("image1.png") && !rels.contains("drawing1.xml") && rels.contains("../embeddings/Microsoft_Excel_Worksheet1.xlsx"),
+        "{rels}"
+    );
     let target = |rels: &str, id: &str| -> String {
         let at = rels.find(&format!(r#"Id="{id}""#)).unwrap_or_else(|| panic!("{id} in {rels}"));
         let rest = &rels[at..];

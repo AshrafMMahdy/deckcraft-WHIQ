@@ -70,6 +70,8 @@ pub fn import_with(bytes: &[u8], on_slide: &mut dyn FnMut(usize, usize) -> bool)
 
 /// WHIQ: what an import could not keep ([`import_reader`]).
 pub use read::ImportReport;
+/// WHIQ: take the presentation as it is now as the one read from its file (after a repair).
+pub use read::source::snapshot as snapshot_source;
 
 /// WHIQ: read a package from `r` (an open file): the file is never read whole into memory, large
 /// media is inflated into spill files on disk, and everything that could not be kept is in the

@@ -827,3 +827,186 @@ fn an_agent_reads_creates_edits_deletes_and_searches_a_real_deck() {
     assert!(md.contains("Tower crane") && md.contains("Edited text") && !md.contains("| Jan |"), "{md}");
     m.close();
 }
+
+/// `xml` with `add` put just before its first `before` (or before its last `</…>` end tag).
+fn put_before(xml: &str, before: &str, add: &str) -> String {
+    let at = xml.find(before).unwrap_or_else(|| xml.rfind("</").unwrap());
+    format!("{}{add}{}", &xml[..at], &xml[at..])
+}
+
+/// A customer's deck made by another producer: the parts and elements DeckCraft does not write
+/// itself (the document properties a producer fills in, a thumbnail, a notes page with a slide
+/// image and a slide-number placeholder, layout paragraph properties and extension lists, a theme
+/// colour from the system, presentation and view property extensions). Built from a DeckCraft deck
+/// whose parts are rewritten, so nothing in it comes from another application.
+fn customer_deck(m: &mut Mcp, dir: &Path) -> (PathBuf, Vec<u8>) {
+    m.ok("new_presentation", json!({}));
+    m.ok("add_slide", json!({"layout": "titleAndContent", "title": "Board update", "body": "Cost and programme"}));
+    m.ok("set_notes", json!({"text": "Say the cost first."}));
+    m.ok("add_slide", json!({"layout": "titleOnly", "title": "Approval route"}));
+    m.ok("add_text_box", json!({"x": 80, "y": 200, "w": 300, "text": "Package manager"}));
+    m.ok("set_notes", json!({"text": "Every change goes past the director."}));
+    m.ok("save_presentation", json!({"path": "made.pptx"}));
+    m.ok("close_presentation", json!({}));
+    let mut thumb = vec![];
+    image::RgbImage::from_pixel(8, 6, image::Rgb([30, 90, 160]))
+        .write_with_encoder(image::codecs::jpeg::JpegEncoder::new_with_quality(&mut thumb, 80))
+        .unwrap();
+    let base = dir.join("made.pptx");
+    let customer = dir.join("customer.pptx");
+    let mut src = zip::ZipArchive::new(std::fs::File::open(&base).unwrap()).unwrap();
+    let mut z = zip::ZipWriter::new(std::fs::File::create(&customer).unwrap());
+    let creation = |n: usize| {
+        format!(
+            "<p:extLst><p:ext uri=\"{{BB962C8B-B14F-4D97-AF65-F5344CB8AC3E}}\"><p14:creationId xmlns:p14=\"http://schemas.microsoft.com/office/powerpoint/2010/main\" val=\"{}\"/></p:ext></p:extLst>",
+            1000 + n
+        )
+    };
+    for i in 0..src.len() {
+        let mut f = src.by_index(i).unwrap();
+        let name = f.name().to_string();
+        let mut data = vec![];
+        std::io::Read::read_to_end(&mut f, &mut data).unwrap();
+        let text = String::from_utf8(data.clone()).unwrap_or_default();
+        let data = if name == "[Content_Types].xml" {
+            put_before(&text, "</Types>", "<Default Extension=\"jpeg\" ContentType=\"image/jpeg\"/>").into_bytes()
+        } else if name == "_rels/.rels" {
+            put_before(&text, "</Relationships>", "<Relationship Id=\"rIdThumb\" Type=\"http://schemas.openxmlformats.org/package/2006/relationships/metadata/thumbnail\" Target=\"docProps/thumbnail.jpeg\"/>").into_bytes()
+        } else if name == "docProps/core.xml" {
+            br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/" xmlns:dcmitype="http://purl.org/dc/dcmitype/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"><dc:title>Aurora Tower board update</dc:title><dc:subject>Period 14</dc:subject><dc:creator>Ann Customer</dc:creator><cp:keywords>cost; programme</cp:keywords><dc:description>Made by the customer's own tool</dc:description><cp:lastModifiedBy>Ann Customer</cp:lastModifiedBy><cp:revision>7</cp:revision><dcterms:created xsi:type="dcterms:W3CDTF">2013-01-27T09:14:16Z</dcterms:created><dcterms:modified xsi:type="dcterms:W3CDTF">2013-01-27T09:15:58Z</dcterms:modified><cp:category>Board</cp:category><cp:contentStatus>Draft</cp:contentStatus></cp:coreProperties>"#.to_vec()
+        } else if name == "docProps/app.xml" {
+            br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"><TotalTime>12</TotalTime><Words>20</Words><Application>Acme Slides</Application><PresentationFormat>Widescreen</PresentationFormat><Paragraphs>6</Paragraphs><Slides>3</Slides><Notes>2</Notes><HiddenSlides>0</HiddenSlides><MMClips>0</MMClips><ScaleCrop>false</ScaleCrop><HeadingPairs><vt:vector size="2" baseType="variant"><vt:variant><vt:lpstr>Slide Titles</vt:lpstr></vt:variant><vt:variant><vt:i4>3</vt:i4></vt:variant></vt:vector></HeadingPairs><TitlesOfParts><vt:vector size="3" baseType="lpstr"><vt:lpstr>Title</vt:lpstr><vt:lpstr>Board update</vt:lpstr><vt:lpstr>Approval route</vt:lpstr></vt:vector></TitlesOfParts><Manager>M. Manager</Manager><Company>Acme Build</Company><LinksUpToDate>false</LinksUpToDate><SharedDoc>false</SharedDoc><HyperlinksChanged>false</HyperlinksChanged><AppVersion>16.0000</AppVersion></Properties>"#.to_vec()
+        } else if name.starts_with("ppt/slideLayouts/slideLayout") && !name.contains("_rels") {
+            let n: usize = name.trim_start_matches("ppt/slideLayouts/slideLayout").trim_end_matches(".xml").parse().unwrap();
+            // A paragraph with properties DeckCraft does not model, and the layout's creation id.
+            let t = text.replacen(
+                "<a:p>",
+                "<a:p><a:pPr marL=\"0\" indent=\"0\" eaLnBrk=\"0\" latinLnBrk=\"1\" hangingPunct=\"0\"><a:buNone/></a:pPr>",
+                1,
+            );
+            let t = if t.contains("<a:p><a:pPr marL=\"0\"") {
+                t
+            } else {
+                t.replacen(
+                    "<a:p/>",
+                    "<a:p><a:pPr marL=\"0\" indent=\"0\" eaLnBrk=\"0\" latinLnBrk=\"1\" hangingPunct=\"0\"><a:buNone/></a:pPr></a:p>",
+                    1,
+                )
+            };
+            if t.contains("<p:extLst>") { t.into_bytes() } else { put_before(&t, "</p:sldLayout>", &creation(n)).into_bytes() }
+        } else if name == "ppt/slideMasters/slideMaster1.xml" && !text.contains("<p:extLst>") {
+            put_before(&text, "</p:sldMaster>", &creation(0)).into_bytes()
+        } else if name.starts_with("ppt/theme/theme") && !name.contains("_rels") {
+            let a = text.find("<a:dk1>").unwrap();
+            let b = text.find("</a:dk1>").unwrap();
+            format!("{}<a:dk1><a:sysClr val=\"windowText\" lastClr=\"000000\"/>{}", &text[..a], &text[b..]).into_bytes()
+        } else if name == "ppt/presProps.xml" {
+            put_before(&text, "</p:presentationPr>", "<p:extLst><p:ext uri=\"{E76CE94A-603C-4142-B9EB-6D1370010A27}\"><p14:discardImageEditData xmlns:p14=\"http://schemas.microsoft.com/office/powerpoint/2010/main\" val=\"0\"/></p:ext></p:extLst>").into_bytes()
+        } else if name.starts_with("ppt/notesSlides/notesSlide") && !name.contains("_rels") {
+            // The slide image and the slide number, beside the notes body.
+            let img = "<p:sp><p:nvSpPr><p:cNvPr id=\"90\" name=\"Slide Image Placeholder 1\"/><p:cNvSpPr><a:spLocks noGrp=\"1\" noRot=\"1\" noChangeAspect=\"1\"/></p:cNvSpPr><p:nvPr><p:ph type=\"sldImg\"/></p:nvPr></p:nvSpPr><p:spPr/></p:sp>";
+            let num = "<p:sp><p:nvSpPr><p:cNvPr id=\"91\" name=\"Slide Number Placeholder 3\"/><p:cNvSpPr><a:spLocks noGrp=\"1\"/></p:cNvSpPr><p:nvPr><p:ph type=\"sldNum\" sz=\"quarter\" idx=\"5\"/></p:nvPr></p:nvSpPr><p:spPr/><p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:fld id=\"{5E1C0B4F-1D2A-4C3B-9E8F-0A1B2C3D4E5F}\" type=\"slidenum\"><a:rPr lang=\"en-US\"/><a:t>2</a:t></a:fld><a:endParaRPr lang=\"en-US\"/></a:p></p:txBody></p:sp>";
+            let at = text.find("<p:sp>").unwrap();
+            put_before(&format!("{}{img}{}", &text[..at], &text[at..]), "</p:spTree>", num).into_bytes()
+        } else {
+            data
+        };
+        store(&mut z, &name, &data);
+    }
+    store(&mut z, "docProps/thumbnail.jpeg", &thumb);
+    z.finish().unwrap();
+    (customer, thumb)
+}
+
+/// The owner's rule: editing a customer's file must not lose anything it holds. Open a deck made
+/// by another producer, edit one text box, save, and compare every part.
+#[test]
+fn editing_a_customer_deck_keeps_every_part_the_edit_did_not_touch() {
+    let dir = scratch("keep-untouched");
+    let mut m = start(&dir);
+    let (customer, thumb) = customer_deck(&mut m, &dir);
+
+    // Nothing a save would change.
+    let rc = m.ok("roundtrip_check", json!({"path": "customer.pptx"}));
+    assert_eq!(rc["lossless"], true, "{rc}");
+
+    // One text box edited.
+    m.ok("open_presentation", json!({"path": "customer.pptx"}));
+    let box_id = shapes(&mut m, 2).into_iter().find(|s| s["text"] == "Package manager").unwrap()["id"].clone();
+    m.ok("go_to_slide", json!({"index": 2}));
+    m.ok("set_text", json!({"id": box_id, "text": "Package manager (rev B)"}));
+    m.ok("save_presentation", json!({"path": "edited.pptx", "caller": "Agent Smith"}));
+    let edited = dir.join("edited.pptx");
+
+    let before = zip_names(&customer);
+    let after = zip_names(&edited);
+    assert_eq!(
+        before.iter().collect::<std::collections::BTreeSet<_>>(),
+        after.iter().collect::<std::collections::BTreeSet<_>>(),
+        "the same parts, under the same names"
+    );
+    // The edited slide is the only content part that changed.
+    let slide = zip_text(&edited, "ppt/_rels/presentation.xml.rels");
+    assert!(slide.contains("slides/slide3.xml"));
+    let allowed =
+        ["[Content_Types].xml", "_rels/.rels", "docProps/core.xml", "docProps/app.xml", "ppt/slides/slide3.xml", "ppt/slides/_rels/slide3.xml.rels"];
+    let changed: Vec<&String> = before.iter().filter(|n| zip_bytes(&customer, n) != zip_bytes(&edited, n)).collect();
+    for n in &changed {
+        assert!(allowed.contains(&n.as_str()), "{n} changed, but the edit did not touch it (changed: {changed:?})");
+    }
+    assert!(zip_text(&edited, "ppt/slides/slide3.xml").contains("Package manager (rev B)"));
+    // The thumbnail, byte for byte, still linked from the package.
+    assert_eq!(zip_bytes(&edited, "docProps/thumbnail.jpeg"), thumb);
+    assert!(zip_text(&edited, "_rels/.rels").contains("metadata/thumbnail\" Target=\"docProps/thumbnail.jpeg\""));
+    // The document properties as they were, with the save's own: modified now, by the caller.
+    let core = zip_text(&edited, "docProps/core.xml");
+    for kept in [
+        "<dc:title>Aurora Tower board update</dc:title>",
+        "<dc:subject>Period 14</dc:subject>",
+        "<dc:creator>Ann Customer</dc:creator>",
+        "<cp:keywords>cost; programme</cp:keywords>",
+        "<dc:description>Made by the customer's own tool</dc:description>",
+        "<cp:category>Board</cp:category>",
+        "<cp:contentStatus>Draft</cp:contentStatus>",
+        "<cp:revision>7</cp:revision>",
+        "2013-01-27T09:14:16Z",
+    ] {
+        assert!(core.contains(kept), "{kept} kept: {core}");
+    }
+    assert!(core.contains("<cp:lastModifiedBy>Agent Smith</cp:lastModifiedBy>"), "{core}");
+    assert!(!core.contains("2013-01-27T09:15:58Z"), "modified is now: {core}");
+    let app = zip_text(&edited, "docProps/app.xml");
+    for kept in [
+        "<Company>Acme Build</Company>",
+        "<Manager>M. Manager</Manager>",
+        "<Application>Acme Slides</Application>",
+        "<TitlesOfParts>",
+        "<AppVersion>16.0000</AppVersion>",
+    ] {
+        assert!(app.contains(kept), "{kept} kept: {app}");
+    }
+    // Every notes page with its slide image and slide number; layouts with their paragraph
+    // properties and creation ids; the theme's system colour.
+    for n in before.iter().filter(|n| n.starts_with("ppt/notesSlides/notesSlide")) {
+        assert_eq!(zip_bytes(&customer, n), zip_bytes(&edited, n), "{n}");
+    }
+    let layout = zip_text(&edited, "ppt/slideLayouts/slideLayout1.xml");
+    assert!(layout.contains("latinLnBrk=\"1\"") && layout.contains("p14:creationId"), "{layout}");
+    assert!(zip_text(&edited, "ppt/theme/theme1.xml").contains("<a:sysClr val=\"windowText\""));
+
+    // A notes page whose text is edited keeps its other placeholders.
+    m.ok("set_notes", json!({"slide": 1, "text": "Say the risk first."}));
+    m.ok("save_presentation", json!({"path": "edited2.pptx"}));
+    let e2 = dir.join("edited2.pptx");
+    let notes_rel = zip_text(&e2, "ppt/slides/_rels/slide2.xml.rels");
+    let notes_part = format!("ppt/notesSlides/{}", notes_rel.split("notesSlides/").nth(1).unwrap().split('"').next().unwrap());
+    let notes = zip_text(&e2, &notes_part);
+    assert!(notes.contains("Say the risk first.") && !notes.contains("Say the cost first."), "{notes}");
+    assert!(notes.contains("type=\"sldImg\"") && notes.contains("type=\"sldNum\"") && notes.contains("Slide Number Placeholder 3"), "{notes}");
+    for n in before.iter().filter(|n| n.starts_with("ppt/slideLayouts/") || n.starts_with("ppt/slideMasters/") || n.starts_with("ppt/theme/")) {
+        assert_eq!(zip_bytes(&customer, n), zip_bytes(&e2, n), "{n}");
+    }
+    m.close();
+}

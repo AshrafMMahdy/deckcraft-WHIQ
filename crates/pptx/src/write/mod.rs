@@ -2,6 +2,7 @@
 
 pub(crate) mod chart;
 pub(crate) mod dml;
+mod keep;
 mod shapes;
 mod theme;
 mod timing;
@@ -66,6 +67,8 @@ pub struct Exp<'a> {
     kept_written: std::collections::HashSet<String>,
     pub table_styles: Vec<String>,
     placeholder: Option<String>,
+    /// WHIQ: part names (the file's own for what it had).
+    namer: keep::Namer,
 }
 
 /// A part being written: its name and relationships.
@@ -209,7 +212,7 @@ impl Exp<'_> {
         let name = format!("ppt/charts/chartEx{}.xml", self.n_chartex);
         self.pkg.xml_part(&name, CT_CHARTEX, xml);
         if preserved {
-            chart::write_kept(&mut self.pkg, &name, c, &mut self.n_kept);
+            chart::write_kept(&mut self.pkg, &name, c, &mut self.n_kept, None);
         } else if !c.kept.parts.is_empty() {
             log::warn!("pptx: chart data changed; the embedded workbook was not written back");
         }
@@ -218,11 +221,13 @@ impl Exp<'_> {
 
     pub fn chart_rel(&mut self, o: &mut Out, c: &deckcraft_model::Chart) -> String {
         self.n_chart += 1;
-        let name = format!("ppt/charts/chart{}.xml", self.n_chart);
         let (xml, preserved) = chart::chart_xml(c);
+        // WHIQ: an unchanged chart keeps its part name.
+        let original = (preserved && !c.kept.part.is_empty()).then_some(&c.kept.part);
+        let name = self.namer.name(original, "ppt/charts/chart");
         self.pkg.xml_part(&name, CT_CHART, xml);
         if preserved {
-            chart::write_kept(&mut self.pkg, &name, c, &mut self.n_kept);
+            chart::write_kept(&mut self.pkg, &name, c, &mut self.n_kept, Some(&mut self.namer));
         } else if !c.kept.parts.is_empty() {
             log::warn!("pptx: chart data changed; the embedded workbook was not written back");
         }
@@ -554,7 +559,42 @@ pub fn export_into<O: std::io::Write + std::io::Seek>(
     build_package(p, main_ct, on)?.finish_into(out, on)
 }
 
+/// WHIQ: the package for `p`; a presentation read from a file keeps every part the edit did not
+/// touch as it was in that file (`keep.rs`).
 fn build_package(p: &Presentation, main_ct: &str, on: &mut dyn FnMut(&'static str, usize, usize) -> bool) -> Result<PackageOut, PptxError> {
+    let mut pkg = build_written(p, main_ct, on)?;
+    let Some(src) = p.source.get() else { return Ok(pkg) };
+    let Some(pristine) = src.pristine.as_ref() else { return Ok(pkg) };
+    let then = build_written(pristine, main_ct, &mut |stage, done, total| on(stage, done, total))?;
+    let names = &src.names;
+    let kept = keep::pass_through(&mut pkg, &then, names);
+    // A notes page whose text changed keeps its other shapes.
+    for (sid, nname) in &names.notes {
+        if kept.iter().any(|k| k.eq_ignore_ascii_case(nname)) || !p.slides.iter().any(|s| s.id == *sid && !s.notes.is_empty()) {
+            continue;
+        }
+        let (Some(orig), Some(fresh)) = (names.parts.get(nname), pkg.bytes_of(nname)) else { continue };
+        let Some(orig_rels) = names.parts.get(&opc::rels_path(nname)) else { continue };
+        let rels_ok = opc::rels_from_bytes(orig_rels, nname)
+            .items
+            .iter()
+            .filter(|r| !r.external)
+            .all(|r| pkg.names().any(|n| n.eq_ignore_ascii_case(&opc::norm(&r.target)) || opc::norm(n) == opc::norm(&r.target)));
+        if !rels_ok {
+            continue;
+        }
+        if let Some(spliced) = keep::splice_notes(orig, fresh) {
+            pkg.replace(nname, spliced);
+            pkg.replace(&opc::rels_path(nname), orig_rels.clone());
+        }
+    }
+    Ok(pkg)
+}
+
+fn build_written(p: &Presentation, main_ct: &str, on: &mut dyn FnMut(&'static str, usize, usize) -> bool) -> Result<PackageOut, PptxError> {
+    let source_names = p.source.get().map(|s| s.names.clone());
+    let src_names = source_names.as_deref();
+    let namer = keep::Namer::new(p);
     let p = sanitized(p);
     let p: &Presentation = &p;
     let mut x = Exp {
@@ -572,9 +612,25 @@ fn build_package(p: &Presentation, main_ct: &str, on: &mut dyn FnMut(&'static st
         kept_written: Default::default(),
         table_styles: vec![],
         placeholder: None,
+        namer,
     };
-    for (i, s) in p.slides.iter().enumerate() {
-        x.slide_parts.insert(s.id, format!("ppt/slides/slide{}.xml", i + 1));
+    // WHIQ: masters, layouts, slides and notes keep the part names they had in the file.
+    let mut master_names = vec![];
+    let mut theme_names = vec![];
+    let mut layout_names: HashMap<LayoutId, String> = HashMap::new();
+    for m in &p.masters {
+        master_names.push(x.namer.name(src_names.and_then(|n| n.masters.get(&m.id)), "ppt/slideMasters/slideMaster"));
+        theme_names.push(x.namer.name(src_names.and_then(|n| n.themes.get(&m.id)), "ppt/theme/theme"));
+        for l in &m.layouts {
+            layout_names.insert(l.id, x.namer.name(src_names.and_then(|n| n.layouts.get(&l.id)), "ppt/slideLayouts/slideLayout"));
+        }
+    }
+    for s in p.slides.iter() {
+        x.slide_parts.insert(s.id, x.namer.name(src_names.and_then(|n| n.slides.get(&s.id)), "ppt/slides/slide"));
+    }
+    let mut notes_names: HashMap<deckcraft_model::SlideId, String> = HashMap::new();
+    for s in p.slides.iter().filter(|s| !s.notes.is_empty()) {
+        notes_names.insert(s.id, x.namer.name(src_names.and_then(|n| n.notes.get(&s.id)), "ppt/notesSlides/notesSlide"));
     }
     let mut pres = Out::new("ppt/presentation.xml");
     // WHIQ: kept parts linked from the presentation take their own ids first (see the slides).
@@ -593,16 +649,14 @@ fn build_package(p: &Presentation, main_ct: &str, on: &mut dyn FnMut(&'static st
     // Masters, themes and layouts.
     let mut master_rids = vec![];
     let mut layout_parts: HashMap<LayoutId, String> = HashMap::new();
-    let mut n_layout = 0u32;
     let mut big_id: u64 = 2_147_483_648;
     for (mi, m) in p.masters.iter().enumerate() {
-        let mname = format!("ppt/slideMasters/slideMaster{}.xml", mi + 1);
-        let tname = format!("ppt/theme/theme{}.xml", mi + 1);
+        let mname = master_names.get(mi).cloned().unwrap_or_else(|| format!("ppt/slideMasters/slideMaster{}.xml", mi + 1));
+        let tname = theme_names.get(mi).cloned().unwrap_or_else(|| format!("ppt/theme/theme{}.xml", mi + 1));
         let mut mo = Out::new(&mname);
         let mut lrids = vec![];
         for l in &m.layouts {
-            n_layout += 1;
-            let lname = format!("ppt/slideLayouts/slideLayout{n_layout}.xml");
+            let lname = layout_names.get(&l.id).cloned().unwrap_or_else(|| x.namer.name(None, "ppt/slideLayouts/slideLayout"));
             layout_parts.insert(l.id, lname.clone());
             let rid = mo.rels.add("slideLayout", &opc::relative(&mname, &lname), false);
             lrids.push(rid);
@@ -632,10 +686,12 @@ fn build_package(p: &Presentation, main_ct: &str, on: &mut dyn FnMut(&'static st
 
     // Notes master when a slide has notes, or the file already has one (its header and footer
     // live on the master, not on the notes slides).
-    let notes_master = "ppt/notesMasters/notesMaster1.xml";
+    let nm_src = src_names.and_then(|n| n.notes_master.clone());
+    let notes_master_name = nm_src.as_ref().map(|(m, _)| m.clone()).unwrap_or_else(|| "ppt/notesMasters/notesMaster1.xml".into());
+    let notes_master = notes_master_name.as_str();
     let mut notes_master_rid = None;
     if let Some(nm) = notes_master_write(p) {
-        let tname = format!("ppt/theme/theme{}.xml", p.masters.len() + 1);
+        let tname = x.namer.name(nm_src.as_ref().and_then(|(_, t)| t.as_ref()), "ppt/theme/theme");
         let mut no = Out::new(notes_master);
         no.rels.add("theme", &opc::relative(notes_master, &tname), false);
         let theme = nm.theme.or_else(|| p.masters.first().map(|m| m.theme.clone())).unwrap_or_default();
@@ -656,11 +712,12 @@ fn build_package(p: &Presentation, main_ct: &str, on: &mut dyn FnMut(&'static st
 
     // Handout master. Its header, footer, date and slide-number text live on this part; a deck
     // that has never had one does not gain an empty master on save.
-    let handout_path = "ppt/handoutMasters/handoutMaster1.xml";
+    let hm_src = src_names.and_then(|n| n.handout_master.clone());
+    let handout_name = hm_src.as_ref().map(|(m, _)| m.clone()).unwrap_or_else(|| "ppt/handoutMasters/handoutMaster1.xml".into());
+    let handout_path = handout_name.as_str();
     let mut handout_rid = None;
     if let Some(hm) = p.handout_master.as_ref() {
-        let tindex = p.masters.len() + 1 + usize::from(notes_master_rid.is_some());
-        let tname = format!("ppt/theme/theme{tindex}.xml");
+        let tname = x.namer.name(hm_src.as_ref().and_then(|(_, t)| t.as_ref()), "ppt/theme/theme");
         let mut ho = Out::new(handout_path);
         ho.rels.add("theme", &opc::relative(handout_path, &tname), false);
         let mut to = Out::new(&tname);
@@ -687,7 +744,7 @@ fn build_package(p: &Presentation, main_ct: &str, on: &mut dyn FnMut(&'static st
         if !on("writing slides", i, p.slides.len()) {
             return Err(PptxError::Write("cancelled".into()));
         }
-        let sname = format!("ppt/slides/slide{}.xml", i + 1);
+        let sname = x.slide_parts.get(&s.id).cloned().unwrap_or_else(|| format!("ppt/slides/slide{}.xml", i + 1));
         let mut so = Out::new(&sname);
         // WHIQ: parts the slide linked that DeckCraft doesn't model are linked first, under their own
         // ids, so the writer's ids never take theirs; should one be taken all the same, the slide's
@@ -709,7 +766,7 @@ fn build_package(p: &Presentation, main_ct: &str, on: &mut dyn FnMut(&'static st
             so.rels.add("slideLayout", &opc::relative(&sname, lp), false);
         }
         if !s.notes.is_empty() {
-            let nname = format!("ppt/notesSlides/notesSlide{}.xml", i + 1);
+            let nname = notes_names.get(&s.id).cloned().unwrap_or_else(|| format!("ppt/notesSlides/notesSlide{}.xml", i + 1));
             so.rels.add("notesSlide", &opc::relative(&sname, &nname), false);
             let mut no = Out::new(&nname);
             no.rels.add("notesMaster", &opc::relative(&nname, notes_master), false);
@@ -759,8 +816,8 @@ fn build_package(p: &Presentation, main_ct: &str, on: &mut dyn FnMut(&'static st
     }
 
     // Presentation-level parts.
-    let theme1 = "theme/theme1.xml";
-    pres.rels.add("theme", theme1, false);
+    let theme1 = theme_names.first().map(|t| opc::relative("ppt/presentation.xml", t)).unwrap_or_else(|| "theme/theme1.xml".into());
+    pres.rels.add("theme", &theme1, false);
     pres.rels.add("presProps", "presProps.xml", false);
     pres.rels.add("viewProps", "viewProps.xml", false);
     pres.rels.add("tableStyles", "tableStyles.xml", false);
@@ -793,12 +850,34 @@ fn build_package(p: &Presentation, main_ct: &str, on: &mut dyn FnMut(&'static st
     }
 
     // Document properties and package relationships.
-    x.pkg.xml_part("docProps/core.xml", CT_CORE, core_xml(p));
-    x.pkg.xml_part("docProps/app.xml", CT_APP, app_xml(p));
+    // WHIQ: a file's own document properties are kept, with what changed set; its thumbnail too.
+    let then_props = p.source.get().and_then(|s| s.pristine.as_ref()).map(|q| &q.props);
+    let (core_name, core_bytes) = match src_names.and_then(|n| n.core.as_ref()) {
+        Some((name, b)) => match keep::core_xml(b, &p.props, then_props) {
+            Some(x) => (name.clone(), x),
+            None => ("docProps/core.xml".to_string(), core_xml(p)),
+        },
+        None => ("docProps/core.xml".to_string(), core_xml(p)),
+    };
+    let (app_name, app_bytes) = match src_names.and_then(|n| n.app.as_ref()) {
+        Some((name, b)) => match keep::app_xml(b, p, then_props) {
+            Some(x) => (name.clone(), x),
+            None => ("docProps/app.xml".to_string(), app_xml(p)),
+        },
+        None => ("docProps/app.xml".to_string(), app_xml(p)),
+    };
+    x.pkg.xml_part(&core_name, CT_CORE, core_bytes);
+    x.pkg.xml_part(&app_name, CT_APP, app_bytes);
     let mut root = RelsOut::default();
     root.add("officeDocument", "ppt/presentation.xml", false);
-    root.add(opc::RT_CORE, "docProps/core.xml", false);
-    root.add("extended-properties", "docProps/app.xml", false);
+    root.add(opc::RT_CORE, &core_name, false);
+    root.add("extended-properties", &app_name, false);
+    if let Some((name, ct, bytes)) = src_names.and_then(|n| n.thumbnail.as_ref())
+        && !x.pkg.has(name)
+    {
+        x.pkg.typed(name, ct, bytes.clone(), false);
+        root.add("http://schemas.openxmlformats.org/package/2006/relationships/metadata/thumbnail", name, false);
+    }
     for k in kept.iter().filter(|k| !k.rel_type.is_empty() && k.from_root) {
         root.add_new(&k.rel_type, &k.name, false);
     }

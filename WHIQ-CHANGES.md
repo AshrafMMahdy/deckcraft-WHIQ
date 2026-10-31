@@ -501,6 +501,48 @@ Not done here: the platform side (calling `render_preview` on create / open, and
 radial one between its first and middle colours; a tiled picture mirrored on alternate tiles repeats
 unmirrored; masks (`mask-type: alpha`) need a current browser.
 
+## A customer's file keeps what the edit did not touch (2026-10-31, whiq-v0.7.5)
+
+The owner's rule: editing a customer's file must not lose anything it holds. The platform's edit-in-place
+check (a python-pptx deck: `selfchecks/shared/craftEditInPlace.selfcheck.ts`) found a save of an edited
+deck dropping the thumbnail, the document properties (title, creator, subject, keywords, company,
+manager), one placeholder per notes page and some layout paragraph properties. On that deck
+`roundtrip_check` also listed masters' and layouts' extension lists (`p14:creationId`), the theme's
+system colours, presentation and master default paragraph properties, presentation-property extensions
+and the notes view properties. The writer rebuilds every part from the model, so whatever the model does
+not hold was lost even from parts the edit never touched.
+
+| Change | Where | Tested by |
+|---|---|---|
+| **The reader records the package it read** (`Presentation::source`, never saved in `.deckcraft` files, never part of comparing presentations): the part each master, theme, layout, slide, chart and notes page came from, the original bytes of those parts and of their relationships, of the presentation part and of the presentation, view and table-style properties (at most 256 MB a package), `docProps/core.xml`, `docProps/app.xml`, the thumbnail, every entry's CRC-32 and size (from the zip directory), and a copy of the model as read (after the engine's repair pass, which is not an edit). | `crates/model/src/source.rs` (new), `lib.rs`, `chart.rs` (`ChartKept::part`); `crates/pptx/src/read/source.rs` (new), `read/mod.rs`, `read/chart.rs`, `opc.rs` (entry CRCs); `crates/engine/src/cmd/file.rs` | below |
+| **Parts keep their names** on save: masters, themes, layouts, slides, notes pages, the notes and handout masters, an unchanged chart and its workbook and style parts; new objects get names no original part has. (Notes pages were renumbered by slide, the chart's workbook became `keptN.xlsx`.) | `crates/pptx/src/write/keep.rs` (`Namer`, new), `write/mod.rs`, `write/chart.rs` | `keep::tests::fresh_names_never_take_a_kept_one` |
+| **A part the edit did not change is written as it was, byte for byte, with its relationships**: when the writer's output for the part now equals its output for the model as read, and every part its original relationships point at is in the save as the same object (a part that keeps its name) or with the same bytes (CRC-32 and size). Everything else is written from the model as before. Editing one text box now changes only that slide (and its relationships), the document properties and the package's content-type and root relationship lists. | `write/keep.rs` (`pass_through`), `write/mod.rs` (`build_package` writes the package twice when the presentation came from a file: now and as read) | `mcp_deck` `editing_a_customer_deck_keeps_every_part_the_edit_did_not_touch` |
+| **A notes page whose text is edited keeps its other shapes** (slide image, slide number, header…): only the body placeholder's text is replaced in the original XML, with the page's original relationships. | `write/keep.rs` (`splice_notes`) | the same test; `keep::tests::a_notes_page_keeps_its_other_shapes_when_its_text_changes` |
+| **Document properties are kept**: `docProps/core.xml` and `docProps/app.xml` as they were, with the fields the model changed set (title, subject, creator, keywords, description, category, company), `modified` set to now, `lastModifiedBy` to the caller, the slide, notes and hidden-slide counts made true; elements DeckCraft does not model (`contentStatus`, `revision`, `Manager`, `TitlesOfParts`, `AppVersion`…) stay. **The thumbnail is kept** with its relationship. A deck built on a template (`build_deck {template}`) keeps the template's masters and layouts as they were but not its properties or thumbnail. | `write/keep.rs` (`core_xml`, `app_xml`), `write/mod.rs`, `crates/engine/src/cmd/build.rs` | the same test; `keep::tests::core_properties_keep_what_they_had_and_take_the_changes` |
+
+On the platform's fixture (`board-update.pptx`): `roundtrip_check` was `lossless: false` with 3 missing parts,
+8 missing relationships and about 70 lost element counts; now `lossless: true` with no problems. Editing the
+text box on slide 4 and the notes of slide 3 then saving changes only `ppt/slides/slide4.xml` and its
+relationships, `ppt/notesSlides/notesSlide2.xml` (its text, its three placeholders kept), `docProps/core.xml` /
+`app.xml` (`modified`, `lastModifiedBy`, and the creator, which the contract sets when it is empty) and the
+content-type and root relationship lists. Every other part is byte for byte the same.
+
+Test status (Linux x86_64, craft-fonts 4391305, 2026-10-31): `cargo test -p deckcraft-model -p deckcraft-pptx
+-p deckcraft-format -p deckcraft-engine -p deckcraft-mcp -p deckcraft-cli`: 699 pass, 0 fail (model 83,
+pptx 56 + its integration tests, format 19, engine 335, mcp 24 + 6, CLI 12 + 8 + 2, `mcp_contract`
+25/25, `mcp_deck` 13/13). Two `chart_embed` assertions changed with the behaviour: an unchanged chart's
+workbook keeps its own name. `cargo clippy --no-deps -D warnings --all-targets` on the pptx, engine, mcp
+and CLI crates and `cargo fmt --check` pass (model: only the upstream `trendline.rs:468` lint noted above),
+as does `cargo check --target wasm32-unknown-unknown -p deckcraft-engine` (the browser build has no clock:
+`modified` keeps the model's date there).
+
+Not done: a slide the edit changed is still written from the model, so XML DeckCraft does not model on
+*that* slide could still be lost (none was on the fixture's slides). The same goes for an edited layout or
+master, a chart whose data changed, and a notes page whose new text has links. The content-type list is
+rewritten (each part gets an override, so no type is lost). The test deck is DeckCraft's own deck with its
+parts rewritten, not the python-pptx fixture: AGENTS.md §1.1 forbids committing files produced by
+PowerPoint, and python-pptx's default template is one.
+
 ## Not done / known limits
 
 - By design, not a gap: busy is per process — one worker serves calls in order (one process per

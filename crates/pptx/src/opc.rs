@@ -82,6 +82,8 @@ struct Entry {
     index: usize,
     size: u64,
     compressed: u64,
+    /// WHIQ: the entry's CRC-32 from the zip directory (a save compares parts with it).
+    crc: u32,
     data: OnceCell<Option<Vec<u8>>>,
     used: Cell<bool>,
 }
@@ -141,6 +143,7 @@ impl Package {
                 index: i,
                 size: f.size(),
                 compressed: f.compressed_size(),
+                crc: f.crc32(),
                 data: OnceCell::new(),
                 used: Cell::new(false),
             };
@@ -327,6 +330,11 @@ impl Package {
     }
     pub fn original_name(&self, name: &str) -> Option<&str> {
         self.entries.get(&norm(name)).map(|e| e.name.as_str())
+    }
+    /// WHIQ: every entry's CRC-32 and unpacked size, by lower-case name (read from the zip
+    /// directory: nothing is inflated).
+    pub fn digests(&self) -> HashMap<String, (u32, u64)> {
+        self.entries.iter().map(|(k, e)| (k.clone(), (e.crc, e.size))).collect()
     }
 }
 
@@ -596,6 +604,12 @@ impl From<Vec<u8>> for PartData {
     }
 }
 
+impl From<Arc<Vec<u8>>> for PartData {
+    fn from(v: Arc<Vec<u8>>) -> Self {
+        PartData::Shared(v)
+    }
+}
+
 /// A package being written.
 pub struct PackageOut {
     files: Vec<(String, PartData, bool)>,
@@ -631,6 +645,31 @@ impl PackageOut {
             return;
         }
         self.files.push((rels_path(part), rels.to_xml().into(), true));
+    }
+    /// WHIQ: the bytes of a part made for this save (`None` for one streamed from disk).
+    pub fn bytes_of(&self, name: &str) -> Option<&[u8]> {
+        self.files.iter().find(|(n, ..)| n.eq_ignore_ascii_case(name)).and_then(|(_, d, _)| match d {
+            PartData::Owned(v) => Some(v.as_slice()),
+            PartData::Shared(v) => Some(v.as_slice()),
+            PartData::Disk(_) => None,
+        })
+    }
+    /// WHIQ: the names of the parts written so far.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.files.iter().map(|(n, ..)| n.as_str())
+    }
+    /// WHIQ: put `data` in place of the part `name` (added when there is none).
+    pub fn replace(&mut self, name: &str, data: impl Into<PartData>) {
+        let data = data.into();
+        match self.files.iter_mut().find(|(n, ..)| n.eq_ignore_ascii_case(name)) {
+            Some(f) => f.1 = data,
+            None => self.files.push((name.to_string(), data, true)),
+        }
+    }
+    /// WHIQ: a part with its own content type override (a part kept from the source file).
+    pub fn typed(&mut self, name: &str, content_type: &str, data: impl Into<PartData>, compress: bool) {
+        self.overrides.push((format!("/{name}"), content_type.to_string()));
+        self.files.push((name.to_string(), data.into(), compress));
     }
     /// Add a part with no content type of its own (a relationships part).
     pub fn raw(&mut self, name: &str, data: Vec<u8>) {

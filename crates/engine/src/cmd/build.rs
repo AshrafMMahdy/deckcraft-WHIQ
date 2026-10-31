@@ -1636,6 +1636,9 @@ fn base_presentation(template: Option<&str>) -> Result<(Presentation, bool)> {
     p.slides.clear();
     p.sections.clear();
     p.custom_shows.clear();
+    // WHIQ: the template's masters and layouts are saved as they were; its document properties
+    // and thumbnail are not the new deck's.
+    p.source = p.source.for_new_document();
     Ok((p, true))
 }
 

@@ -4,6 +4,7 @@ pub(crate) mod chart;
 mod chartex;
 pub(crate) mod dml;
 mod shapes;
+pub(crate) mod source;
 mod theme;
 mod timing;
 
@@ -549,6 +550,8 @@ fn import_package(pkg: &Package, on_slide: &mut dyn FnMut(usize, usize) -> bool)
         return Err(PptxError::NotPptx(format!("{pres_path} is not a presentation part")));
     }
     let pres_part = Part::new(pkg, &pres_path, &pres_doc);
+    // WHIQ: what a save needs to keep what an edit does not touch.
+    let mut src = source::SourceBuilder::new(pkg, &pres_path);
 
     // Masters, layouts and slides to read.
     let master_paths: Vec<String> = pres_el
@@ -650,6 +653,7 @@ fn import_package(pkg: &Package, on_slide: &mut dyn FnMut(usize, usize) -> bool)
             continue;
         };
         let master = read_master(&mut imp, mp, doc, &docs, &mut layout_by_part);
+        src.master(pkg, master.id, mp);
         p.masters.push(Arc::new(master));
     }
     if p.masters.is_empty() {
@@ -657,6 +661,13 @@ fn import_package(pkg: &Package, on_slide: &mut dyn FnMut(usize, usize) -> bool)
         let (m, _) = defaults::build_master(p.slide_size, Default::default(), imp.next);
         imp.next = imp.next.saturating_add(200);
         p.masters.push(Arc::new(m));
+    }
+    for m in &master_paths {
+        for r in pkg.rels(m).all_of("slideLayout") {
+            if let Some(id) = layout_by_part.get(&opc::norm(&r.target)) {
+                src.layout(pkg, *id, &r.target);
+            }
+        }
     }
     let fallback_layout = p.masters.first().and_then(|m| m.layouts.first()).map(|l| l.id).unwrap_or_default();
 
@@ -671,6 +682,7 @@ fn import_package(pkg: &Package, on_slide: &mut dyn FnMut(usize, usize) -> bool)
         let part = Part::new(pkg, path, doc);
         let layout = part.rels.first_of("slideLayout").and_then(|r| layout_by_part.get(&opc::norm(&r.target)).copied()).unwrap_or(fallback_layout);
         let mut slide = read_slide(&mut imp, &part, doc, *id, layout);
+        src.slide(pkg, *id, path, part.rels.first_of("notesSlide").map(|n| n.target.as_str()));
         // Notes.
         if let Some(n) = part.rels.first_of("notesSlide")
             && let Some(nd) = load(pkg, &n.target)
@@ -786,6 +798,7 @@ fn import_package(pkg: &Package, on_slide: &mut dyn FnMut(usize, usize) -> bool)
             m.body_style = dml::list_style(&mut imp, &part, ns);
         }
         p.notes_master = Some(Arc::new(m));
+        src.names.notes_master = Some(src.other_master(pkg, &r.target));
     }
     // Handout master (header, footer, date and slide number for printed handouts).
     if let Some(r) = pres_part.rels.first_of("handoutMaster")
@@ -815,6 +828,7 @@ fn import_package(pkg: &Package, on_slide: &mut dyn FnMut(usize, usize) -> bool)
             m.color_map = color_map(cm);
         }
         p.handout_master = Some(Arc::new(m));
+        src.names.handout_master = Some(src.other_master(pkg, &r.target));
     }
     // Document properties.
     if let Some(r) = root_rels.first_of("core-properties")
@@ -843,6 +857,7 @@ fn import_package(pkg: &Package, on_slide: &mut dyn FnMut(usize, usize) -> bool)
     p.media = std::mem::take(&mut imp.media);
     p.next_id = imp.next;
     p.fix_next_id();
+    src.finish(pkg, &pres_path, &mut p);
     Ok((p, std::mem::take(&mut imp.not_kept)))
 }
 

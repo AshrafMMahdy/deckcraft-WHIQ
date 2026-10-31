@@ -717,7 +717,7 @@ fn kept_name(original: &str, n: u32) -> String {
 /// written under a fresh name ([`kept_name`]) and the relationships between kept parts are
 /// rewritten to those names; a relationship to anything that was not kept is dropped.
 /// `n_kept` numbers kept parts across the package.
-pub fn write_kept(pkg: &mut crate::opc::PackageOut, chart_name: &str, c: &Chart, n_kept: &mut u32) {
+pub fn write_kept(pkg: &mut crate::opc::PackageOut, chart_name: &str, c: &Chart, n_kept: &mut u32, mut namer: Option<&mut super::keep::Namer>) {
     use std::collections::HashMap;
 
     use crate::opc::{RelsOut, norm, relative, rels_path};
@@ -732,8 +732,17 @@ pub fn write_kept(pkg: &mut crate::opc::PackageOut, chart_name: &str, c: &Chart,
         if names.contains_key(&key) {
             continue;
         }
-        *n_kept += 1;
-        let new = kept_name(&p.name, *n_kept);
+        // WHIQ: a workbook or chart style part keeps its own name when nothing else has it.
+        let own = norm(&p.name);
+        let mine = (own.starts_with("ppt/embeddings/") || own.starts_with("ppt/charts/"))
+            && !pkg.has(&own)
+            && namer.as_deref_mut().is_some_and(|nm| nm.claim(&p.name));
+        let new = if mine {
+            p.name.clone()
+        } else {
+            *n_kept += 1;
+            kept_name(&p.name, *n_kept)
+        };
         let ct = if !p.content_type.is_empty() { p.content_type.clone() } else { crate::mime_for(&p.name).to_string() };
         // An override per part: a kept part never sets the package-wide default for its extension.
         pkg.xml_part(&new, &ct, p.bytes.clone());

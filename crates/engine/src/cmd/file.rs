@@ -142,6 +142,8 @@ fn open_other(name: &str, bytes: &[u8]) -> Result<Presentation> {
         let mut p = deckcraft_pptx::import_with(bytes, &mut |done, total| crate::task::step(done, total).is_ok())
             .map_err(|e| if crate::task::check().is_err() { crate::task::cancelled() } else { EngineError::Other(e.to_string()) })?;
         deckcraft_format::repair(&mut p);
+        // WHIQ: the repaired model is the one "as read": a repair alone is not an edit.
+        deckcraft_pptx::snapshot_source(&mut p);
         return Ok(p);
     }
     if deckcraft_pptx::is_encrypted(bytes) {
@@ -213,6 +215,7 @@ pub fn read_presentation_file(path: &str) -> Result<LoadedFile> {
         let (mut doc, report) = deckcraft_pptx::import_reader(reader, &mut |done, total| crate::task::step(done, total).is_ok())
             .map_err(|e| if crate::task::check().is_err() { crate::task::cancelled() } else { EngineError::Other(e.to_string()) })?;
         deckcraft_format::repair(&mut doc);
+        deckcraft_pptx::snapshot_source(&mut doc);
         crate::task::phase("adding it to the session", 0.9, 1.0);
         let unreferenced = report.unused.iter().filter(|(_, _, referenced)| !referenced).map(|(n, b, _)| (n.clone(), *b)).collect();
         let mut damaged = report.not_kept;

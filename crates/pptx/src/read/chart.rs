@@ -415,7 +415,7 @@ const MAX_KEPT_DEPTH: usize = 8;
 pub(crate) fn capture_kept(pkg: &crate::opc::Package, chart_part: &str) -> deckcraft_model::chart::ChartKept {
     use deckcraft_model::chart::{ChartKept, ChartRel};
 
-    let mut kept = ChartKept::default();
+    let mut kept = ChartKept { part: pkg.original_name(chart_part).unwrap_or(chart_part).to_string(), ..Default::default() };
     // The chart document itself is rewritten; don't store a second copy of it.
     let mut seen = std::collections::HashMap::from([(crate::opc::norm(chart_part), true)]);
     for r in pkg.rels(chart_part).items {

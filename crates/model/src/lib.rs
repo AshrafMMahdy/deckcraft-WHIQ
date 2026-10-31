@@ -14,6 +14,7 @@ pub mod defaults;
 pub mod edit;
 pub mod numfmt;
 pub mod resolve;
+pub mod source;
 pub mod spill;
 pub mod style;
 pub mod table;
@@ -1085,6 +1086,10 @@ pub struct Presentation {
     /// Unmodelled presentation-level XML kept for round-trip.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_ext: Option<String>,
+    /// WHIQ: the package this presentation was read from, so a save keeps what an edit did not
+    /// touch (`source.rs`). Not saved in `.deckcraft` files.
+    #[serde(skip)]
+    pub source: source::Source,
 }
 
 /// A drawing guide: a vertical line at `pos` points from the slide's left edge, or a horizontal

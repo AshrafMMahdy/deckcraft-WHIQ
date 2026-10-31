@@ -425,6 +425,9 @@ pub struct ChartPart {
 pub struct ChartKept {
     pub rels: Vec<ChartRel>,
     pub parts: Vec<ChartPart>,
+    /// WHIQ: the chart's own part in the file it was read from (an unchanged chart is saved
+    /// under that name again).
+    pub part: String,
 }
 
 impl Default for Chart {
