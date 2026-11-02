@@ -585,6 +585,17 @@ Not done: a SmartArt graphic whose drawing part is missing still becomes a kept 
 one whose outline is empty is still written as a plain group. A slide edited elsewhere writes its
 SmartArt and objects whole but itself from the model, as in v0.7.5.
 
+## A resized letterboxed picture keeps its own aspect (2026-11-02, whiq-v0.7.7)
+
+`build_deck` places a picture `contain`: the whole picture centred in its box, padded through
+negative crop. `set_bounds` / Size & Position then kept that padding while the box changed shape,
+so a figure placed in a 3:1 slot and resized to its own 1.35:1 showed at 44% of its width — six
+squeezed figures in a pilot customer's deck. Now a picture that is only padded (no real crop) gets
+its padding worked out again for the new box from its own aspect (recovered from the old box and
+padding); a box resized to the picture's own shape has no padding at all. A cropped picture is left
+as it was. `crates/engine/src/cmd/shape.rs` (`letterboxed_aspect`, `refit_letterbox`); tests
+`whiq_letterbox_tests` (the pilot's numbers, and a cropped or unpadded picture left alone).
+
 ## Not done / known limits
 
 - By design, not a gap: busy is per process — one worker serves calls in order (one process per

@@ -214,14 +214,58 @@ fn resize(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn set_bounds(s: &mut Session, p: &Value) -> Result<Value> {
     edit_geometry(s, p, "shape.setBounds", |sh| {
+        let aspect = letterboxed_aspect(sh);
         if let Some(x) = sh.xfrm.as_mut() {
             x.x = f64_param(p, "x").unwrap_or(x.x);
             x.y = f64_param(p, "y").unwrap_or(x.y);
             x.w = f64_param(p, "w").unwrap_or(x.w).max(0.0);
             x.h = f64_param(p, "h").unwrap_or(x.h).max(0.0);
         }
+        refit_letterbox(sh, aspect);
         Ok(())
     })
+}
+
+/// WHIQ: the picture's own aspect (width / height) when the shape is a picture letterboxed in its
+/// box — padded through negative crop on one axis (`contain`, as `build_deck` places pictures) and
+/// cut nowhere. `None` for any other shape, a cropped picture, or an unpadded one.
+fn letterboxed_aspect(sh: &deckcraft_model::Shape) -> Option<f64> {
+    let deckcraft_model::ShapeKind::Picture { fill } = &sh.kind else { return None };
+    let [l, t, r, b] = fill.crop;
+    if !fill.crop.iter().all(|c| c.is_finite() && *c <= 1e-9) || fill.crop.iter().all(|c| *c > -1e-9) {
+        return None;
+    }
+    let x = sh.xfrm.as_ref()?;
+    if x.w <= 0.0 || x.h <= 0.0 {
+        return None;
+    }
+    // The visible picture is the box divided by (1 - l - r) across and (1 - t - b) down.
+    let (vw, vh) = (x.w / (1.0 - l - r), x.h / (1.0 - t - b));
+    (vw > 0.0 && vh > 0.0).then(|| vw / vh)
+}
+
+/// WHIQ: a letterboxed picture whose box was resized keeps its own aspect — the padding is worked
+/// out again for the new box (the whole picture inside it, centred). Resizing the box to the
+/// picture's own shape removes the padding. Before this, the old padding stayed and squeezed the
+/// picture (a 3:1 box resized to 1.35:1 showed the figure at 44% of its width).
+fn refit_letterbox(sh: &mut deckcraft_model::Shape, aspect: Option<f64>) {
+    let (Some(ia), Some(x)) = (aspect, sh.xfrm.as_ref()) else { return };
+    if x.w <= 0.0 || x.h <= 0.0 {
+        return;
+    }
+    let ba = x.w / x.h;
+    let crop = if (ia / ba - 1.0).abs() < 1e-6 {
+        [0.0; 4]
+    } else if ia > ba {
+        let pad = (ia / ba - 1.0) / 2.0;
+        [0.0, -pad, 0.0, -pad]
+    } else {
+        let pad = (ba / ia - 1.0) / 2.0;
+        [-pad, 0.0, -pad, 0.0]
+    };
+    if let deckcraft_model::ShapeKind::Picture { fill } = &mut sh.kind {
+        fill.crop = crop;
+    }
 }
 
 const SIZE_POS: &str = "shape.sizePosition";
@@ -370,9 +414,11 @@ fn size_position(s: &mut Session, p: &Value) -> Result<Value> {
         return Ok(Value::Null);
     }
     edit_geometry(s, p, SIZE_POS, |sh| {
+        let aspect = letterboxed_aspect(sh);
         if let Some(x) = sh.xfrm.as_mut() {
             apply_size(x, spec);
         }
+        refit_letterbox(sh, aspect);
         Ok(())
     })
 }
@@ -1280,6 +1326,57 @@ fn freeform(s: &mut Session, p: &Value) -> Result<Value> {
         Ok(())
     })?;
     Ok(json!({"id": id.0}))
+}
+
+#[cfg(test)]
+mod whiq_letterbox_tests {
+    use deckcraft_model::style::PictureFill;
+    use deckcraft_model::{Shape, ShapeKind, Xfrm};
+
+    use super::{letterboxed_aspect, refit_letterbox};
+
+    fn pic(w: f64, h: f64, crop: [f64; 4]) -> Shape {
+        Shape {
+            xfrm: Some(Xfrm::new(43.2, 118.0, w, h)),
+            kind: ShapeKind::Picture { fill: PictureFill { crop, ..Default::default() } },
+            ..Default::default()
+        }
+    }
+    fn crop(sh: &Shape) -> [f64; 4] {
+        match &sh.kind {
+            ShapeKind::Picture { fill } => fill.crop,
+            _ => unreachable!(),
+        }
+    }
+
+    /// The pilot's deck: a 1.35:1 figure placed `contain` in an 873.6 x 288 slot (3.03:1, padded left
+    /// and right), then the box resized to 457.5 x 340. The old padding squeezed it to 44% of its width.
+    #[test]
+    fn a_letterboxed_picture_resized_keeps_its_own_aspect() {
+        let ia = 798.0 / 593.0;
+        let pad = (873.6 / 288.0 / ia - 1.0) / 2.0;
+        let mut sh = pic(873.6, 288.0, [-pad, 0.0, -pad, 0.0]);
+        let a = letterboxed_aspect(&sh).unwrap();
+        assert!((a - ia).abs() < 1e-9, "{a} vs {ia}");
+        sh.xfrm.as_mut().unwrap().w = 457.5;
+        sh.xfrm.as_mut().unwrap().h = 340.0;
+        refit_letterbox(&mut sh, Some(a));
+        // shown = box / (1 - l - r) across, / (1 - t - b) down: the picture's own aspect again
+        let [l, t, r, b] = crop(&sh);
+        let shown = (457.5 / (1.0 - l - r)) / (340.0 / (1.0 - t - b));
+        assert!((shown - ia).abs() < 1e-9, "shown {shown} vs {ia}");
+        // the box resized to the picture's own shape: no padding at all
+        sh.xfrm.as_mut().unwrap().w = 340.0 * ia;
+        refit_letterbox(&mut sh, Some(ia));
+        assert_eq!(crop(&sh), [0.0; 4]);
+    }
+
+    #[test]
+    fn a_cropped_or_unpadded_picture_is_left_alone() {
+        assert!(letterboxed_aspect(&pic(100.0, 50.0, [0.1, 0.0, 0.0, 0.0])).is_none());
+        assert!(letterboxed_aspect(&pic(100.0, 50.0, [0.0; 4])).is_none());
+        assert!(letterboxed_aspect(&pic(100.0, 50.0, [-0.2, 0.1, -0.2, 0.0])).is_none());
+    }
 }
 
 #[cfg(test)]
