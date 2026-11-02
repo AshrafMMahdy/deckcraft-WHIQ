@@ -111,6 +111,17 @@ Tests: `build.rs` `whiq_overlays_measure_the_visible_picture_of_a_letterboxed_bo
 1.415:1 aspect, all four levels), `add_overlays_relative_to_the_image_keeps_each_mark_on_the_drawing`;
 `overlay_regression_deck_renders_every_mark` now probes the visible picture.
 
+- **D4 (owner, 2026-11-02) — a picture keeps its aspect ratio, as in PowerPoint.** `insert_picture` and `set_bounds` on a
+  picture lock the ratio by default (the engine's `lockAspect`, never set by the tools before): one side given, the other
+  follows; both given, the width wins and the answer's `note` says the height asked for was not used and that
+  `unlock_aspect: true` sets both freely (warning that a large change of shape squeezes or stretches the photo). With
+  `unlock_aspect: true` both sides apply as given and the answer notes the change of shape. `insert_picture` with only a
+  width (or only x/y) used to ignore the size and position and drop the picture at the default place; it now inserts at
+  the picture's own size and applies them. Other shapes resize freely as before. Answers carry the picture's `box`.
+
+Tests: `crates/mcp/tests/whiq_picture_aspect.rs` (width-only insert, both sides locked, width-only resize, unlocked, a
+non-picture shape).
+
 ## 4. Theme adoption from a company template, `.potx`
 
 - `build_deck {template: company.pptx|.potx}` builds on the template itself: its theme (colours,

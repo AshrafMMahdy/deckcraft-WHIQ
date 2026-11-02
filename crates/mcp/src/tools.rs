@@ -355,9 +355,9 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "set_bounds",
             "Move and size",
-            "Move, resize or rotate a shape: any of x, y, w, h (pt) and rot (degrees).",
+            "Move, resize or rotate a shape: any of x, y, w, h (pt) and rot (degrees). A picture keeps its aspect ratio, as in PowerPoint: give one side and the other follows; given both, the width is used and the height follows (the answer says so). To set both sides freely, pass unlock_aspect: true.",
             obj(
-                json!({"id": int("Shape id"), "x": num("Left (pt)"), "y": num("Top (pt)"), "w": num("Width (pt)"), "h": num("Height (pt)"), "rot": num("Rotation (degrees)"), "slide": int("Slide index (default: current)")}),
+                json!({"id": int("Shape id"), "x": num("Left (pt)"), "y": num("Top (pt)"), "w": num("Width (pt)"), "h": num("Height (pt)"), "rot": num("Rotation (degrees)"), "unlock_aspect": boolean("A picture: set w and h freely (may squeeze or stretch the photo). Default: the aspect ratio is locked"), "slide": int("Slide index (default: current)")}),
                 &["id"],
             ),
             false,
@@ -447,9 +447,9 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "insert_picture",
             "Insert picture",
-            "Insert a picture from a file path or base64 data, optionally at a box.",
+            "Insert a picture from a file path or base64 data, optionally at a position and size (pt). It keeps its aspect ratio, as in PowerPoint: give one side and the other follows; given both, the width is used and the height follows (the answer says so). To set both sides freely, pass unlock_aspect: true.",
             obj(
-                json!({"path": string("Image file path"), "data": string("Base64 image data (instead of path)"), "name": string("File name for data"), "x": num("Left"), "y": num("Top"), "w": num("Width"), "h": num("Height")}),
+                json!({"path": string("Image file path"), "data": string("Base64 image data (instead of path)"), "name": string("File name for data"), "x": num("Left"), "y": num("Top"), "w": num("Width"), "h": num("Height"), "unlock_aspect": boolean("Set w and h freely (may squeeze or stretch the photo). Default: the aspect ratio is locked")}),
                 &[],
             ),
             false,
@@ -739,9 +739,21 @@ fn edit_tool(b: &mut dyn Backend, name: &str, a: &Value) -> Result<Value, String
             if p.as_object().is_some_and(serde_json::Map::is_empty) {
                 return Err("invalid arguments: give at least one of x, y, w, h, rot".into());
             }
+            let sid = id.as_u64().unwrap_or(0);
+            let before = current_shape(b, sid);
+            let picture = before.as_ref().and_then(|v| v.get("kind")).and_then(Value::as_str) == Some("picture");
+            let unlock = a.get("unlock_aspect").and_then(Value::as_bool).unwrap_or(false);
+            if picture && !unlock {
+                p["lockAspect"] = json!(true);
+            }
             p["ids"] = json!([id]);
             exec(b, "shape.sizePosition", p)?;
-            Ok(json!({"id": id}))
+            let mut out = json!({"id": id});
+            if picture {
+                let after = current_shape(b, sid);
+                aspect_note(&mut out, a, before.as_ref(), after.as_ref(), unlock);
+            }
+            Ok(out)
         }
         "format_shape" => {
             let ids = json!([id]);
@@ -809,6 +821,47 @@ fn edit_tool(b: &mut dyn Backend, name: &str, a: &Value) -> Result<Value, String
 }
 
 /// A shape by id in `slide.inspect`'s shape list (groups' children too).
+/// A shape on the current slide, as slide.inspect lists it (kind, box [x, y, w, h]).
+fn current_shape(b: &mut dyn Backend, id: u64) -> Option<Value> {
+    let sv = exec(b, "slide.inspect", json!({})).ok()?;
+    find_shape_json(sv.get("shapes"), id)
+}
+
+fn box_of(sh: Option<&Value>) -> Option<[f64; 4]> {
+    let v = sh?.get("box")?.as_array()?;
+    Some([v.first()?.as_f64()?, v.get(1)?.as_f64()?, v.get(2)?.as_f64()?, v.get(3)?.as_f64()?])
+}
+
+/// WHIQ (owner, 2026-11-02): say what a picture resize did — the side that followed the locked ratio, the height that was not
+/// used, or that an unlocked resize changed the picture's shape.
+fn aspect_note(out: &mut Value, a: &Value, before: Option<&Value>, after: Option<&Value>, unlock: bool) {
+    let (Some(b0), Some(b1)) = (box_of(before), box_of(after)) else { return };
+    out["box"] = json!(b1.iter().map(|n| (n * 100.0).round() / 100.0).collect::<Vec<_>>());
+    let pt = |n: f64| format!("{} pt", (n * 100.0).round() / 100.0);
+    let (gw, gh) = (f(a, "w"), f(a, "h"));
+    if !unlock {
+        let note = match (gw, gh) {
+            (Some(_), Some(h)) => format!(
+                "Aspect ratio locked (a picture's default): the width was applied and the height followed to {}; the height you asked ({}) was not used. To set both sides freely pass unlock_aspect: true — a large change of shape squeezes or stretches the photo.",
+                pt(b1[3]),
+                pt(h)
+            ),
+            (Some(_), None) => format!("Aspect ratio locked: the height followed to {}.", pt(b1[3])),
+            (None, Some(_)) => format!("Aspect ratio locked: the width followed to {}.", pt(b1[2])),
+            (None, None) => return,
+        };
+        out["note"] = json!(note);
+    } else if b0[3] > 0.0 && b1[3] > 0.0 {
+        let (r0, r1) = (b0[2] / b0[3], b1[2] / b1[3]);
+        if (r1 / r0 - 1.0).abs() > 1e-6 {
+            out["note"] = json!(format!(
+                "Aspect ratio unlocked: the picture's shape changed from {:.3}:1 to {:.3}:1, so the photo is squeezed or stretched — render the slide to check it reads right.",
+                r0, r1
+            ));
+        }
+    }
+}
+
 fn find_shape_json(shapes: Option<&Value>, id: u64) -> Option<Value> {
     for sh in shapes.and_then(Value::as_array)? {
         if sh.get("id").and_then(Value::as_u64) == Some(id) {
@@ -979,11 +1032,49 @@ pub fn call_tool(b: &mut dyn Backend, name: &str, a: &Value) -> ToolResult {
         }
         "set_text" => wrap(exec(b, "text.set", a)),
         "insert_picture" => {
+            // WHIQ (owner, 2026-11-02): a picture keeps its aspect ratio unless unlock_aspect is passed, as in PowerPoint. The
+            // picture goes in at its own size; the position and size asked for are then applied with the ratio locked (a width
+            // or a height alone used to be ignored, with x and y, and the picture landed at the default place).
+            let unlock = a.get("unlock_aspect").and_then(Value::as_bool).unwrap_or(false);
             let mut p = a.clone();
-            if let (Some(x), Some(y), Some(w), Some(h)) = (f(&a, "x"), f(&a, "y"), f(&a, "w"), f(&a, "h")) {
-                p["rect"] = json!([x, y, w, h]);
+            if let Some(o) = p.as_object_mut() {
+                o.remove("unlock_aspect");
             }
-            wrap(exec(b, "insert.picture", p))
+            let all = (f(&a, "x"), f(&a, "y"), f(&a, "w"), f(&a, "h"));
+            if unlock && let (Some(x), Some(y), Some(w), Some(h)) = all {
+                p["rect"] = json!([x, y, w, h]);
+                return wrap(exec(b, "insert.picture", p));
+            }
+            for k in ["x", "y", "w", "h"] {
+                if let Some(o) = p.as_object_mut() {
+                    o.remove(k);
+                }
+            }
+            let r = exec(b, "insert.picture", p);
+            let Ok(v) = r else { return wrap(r) };
+            let Some(sid) = v.get("id").and_then(Value::as_u64) else { return ToolResult::json(&v) };
+            let mut size = serde_json::Map::new();
+            for k in ["x", "y", "w", "h"] {
+                if let Some(n) = f(&a, k) {
+                    size.insert(k.into(), json!(n));
+                }
+            }
+            if size.is_empty() {
+                return ToolResult::json(&v);
+            }
+            let before = current_shape(b, sid);
+            let mut q = Value::Object(size);
+            q["ids"] = json!([sid]);
+            if !unlock {
+                q["lockAspect"] = json!(true);
+            }
+            if let Err(e) = exec(b, "shape.sizePosition", q) {
+                return ToolResult::error(format!("the picture was inserted (id {sid}) at its own size, but its position and size were not applied: {e}"));
+            }
+            let mut out = v.clone();
+            let after = current_shape(b, sid);
+            aspect_note(&mut out, &a, before.as_ref(), after.as_ref(), unlock);
+            ToolResult::json(&out)
         }
         "insert_table" => {
             let mut p = a.clone();
