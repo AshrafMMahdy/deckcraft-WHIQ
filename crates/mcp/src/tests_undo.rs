@@ -112,6 +112,7 @@ fn a_call_that_panics_after_its_work_is_undone_before_the_work_is_saved() {
     // `_panic` (test hooks): the call runs, then fails inside the server.
     let (text, e) = err(&mut s, "add_slide", json!({"title": "Not me", "_panic": true}));
     assert_eq!(e["code"], "internal", "{e}");
+    assert_eq!(e["rolled_back"], true, "{e}");
     assert!(text.contains("nothing of this call was applied") && !text.contains("retry the call"), "{text}");
     assert_eq!(slides(&mut s), 2, "the slide the call added is gone");
     let saved = e["recovered_path"].as_str().unwrap();
@@ -124,3 +125,4 @@ fn a_call_that_panics_after_its_work_is_undone_before_the_work_is_saved() {
     assert_eq!(slides(&mut s), 2);
     let _ = std::fs::remove_dir_all(&dir);
 }
+

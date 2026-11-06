@@ -577,19 +577,20 @@ impl Server {
                 let roots = self.backend.automation_roots();
                 // Nothing of the call stays: the presentations go back as it found them, then the
                 // active one is auto-saved.
-                let saved = match (before, self.backend.session()) {
+                // Undone only when there was a snapshot to put back (a connected app has no in-process session).
+                let (undone, saved) = match (before, self.backend.session()) {
                     (Some(before), Some(s)) => {
                         before.restore(s);
-                        crate::autosave::save_session(s, &self.shared, roots.as_ref(), "panic", true, true)
+                        (true, crate::autosave::save_session(s, &self.shared, roots.as_ref(), "panic", true, true))
                     }
-                    _ => vec![],
+                    _ => (false, vec![]),
                 };
-                let undone = self.backend.session().is_some();
                 let at = saved.first().map(|r| r.path.clone());
                 let state = if undone {
                     "nothing of this call was applied (the presentation is as it was before it)"
                 } else {
-                    "the presentation is still open"
+                    // A connected app (no in-process session): nothing could be put back.
+                    "the presentation may hold part of it: inspect it before going on"
                 };
                 let e = ToolError::new(
                     code::INTERNAL,
@@ -599,7 +600,8 @@ impl Server {
                         None => "send the call again; server_status shows the server's state".into(),
                     },
                 )
-                .with("recovered_path", json!(at));
+                .with("recovered_path", json!(at))
+                .with("rolled_back", json!(undone));
                 (Err(e), vec![])
             }
         };
