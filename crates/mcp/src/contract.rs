@@ -141,7 +141,13 @@ pub fn classify(msg: &str, cx: &ErrorContext<'_>) -> ToolError {
         .with("retry_after_ms", json!(5000));
     }
     if l.contains("no space left") || l.contains("os error 28") || l.contains("os error 112") || l.contains("disk full") {
-        return ToolError::new(code::DISK_FULL, msg, "free space on the disk and save again; the presentation is still open");
+        // WHIQ: a build_deck whose save failed kept nothing open (the deck it built was closed).
+        let next = if tool == "build_deck" {
+            "free space on the disk and call build_deck again"
+        } else {
+            "free space on the disk and save again; the presentation is still open"
+        };
+        return ToolError::new(code::DISK_FULL, msg, next);
     }
     if l.contains("password") && (l.contains("wrong") || l.contains("incorrect")) {
         return ToolError::new(code::WRONG_PASSWORD, msg, "call open_presentation again with the right `password`");

@@ -607,6 +607,23 @@ padding); a box resized to the picture's own shape has no padding at all. A crop
 as it was. `crates/engine/src/cmd/shape.rs` (`letterboxed_aspect`, `refit_letterbox`); tests
 `whiq_letterbox_tests` (the pilot's numbers, and a cropped or unpadded picture left alone).
 
+## Undo the call: one failed call applies nothing (owner, 2026-11-05)
+
+When one call fails half way, the presentation goes back to exactly how it was before the call and
+the error says "nothing of this call was applied — send it again (fixed)". The `batch` rule is kept:
+an error keeps the steps before it (each step itself whole or nothing), a cancel undoes the batch.
+
+| What broke before | Now | Where | Test |
+|---|---|---|---|
+| A tool made of several commands kept what ran before the one that failed, and did not say so (`format_shape`: the fill stayed when the line or text failed; `edit_chart`: the type stayed when the data failed; `add_shape`, `insert_picture`, `set_bounds`, `replace_text`, `delete_shapes`, `delete_slides` likewise) | The open presentations are taken (cheaply: content is shared) before such a tool runs and put back whole on its error — content, selection, undo history, saved state; the edit counter only goes forward. In a batch the failed step says "nothing of this step was applied" | `crates/mcp/src/rollback.rs` (`Before`), `tools.rs` (`WHOLE_OR_NOTHING`, `call_whole`) | `tests_undo` `format_shape_that_fails_half_way_keeps_nothing_and_says_so`; `rollback` unit tests |
+| `add_text_box` dropped a size, colour or alignment it could not apply and answered success | Such a value fails the call, and the box it inserted goes too | `tools.rs` | `add_text_box_whose_formatting_fails_adds_nothing` |
+| A panic inside a call auto-saved the half-done presentation and said "retry the call" | The presentations go back as the call found them (one it opened is closed, one it closed comes back), then the active one is auto-saved; the error says nothing of the call was applied. The `_panic` test hook now fires after the call's work | `server.rs` (`call`) | `a_call_that_panics_after_its_work_is_undone_before_the_work_is_saved` |
+| `build_deck` with `path`: a failed save left the built deck open, so a retry built a second one | The deck is closed, the presentation active before is active again, and the error says so | `crates/engine/src/cmd/build.rs` | `whiq_a_build_whose_save_fails_keeps_nothing_open` |
+| The `batch` description read as if an error undid the batch; a cancel that landed inside a step (not between steps) kept the steps before it | The description says what happens: an error keeps the steps before it (send the failed step onwards), a cancel undoes the whole batch — now also when it lands inside a step; the error's `next_step` says which | `tools.rs` (`batch`), `server.rs` (`outcome`) | `a_batch_error_keeps_the_steps_before_it_and_nothing_of_the_failed_step` |
+
+Not covered: with `--connect` (a running desktop app, no in-process session) nothing can be put back;
+those errors stay the tool's own (`insert_picture` and `add_text_box` still say what was inserted).
+
 ## Not done / known limits
 
 - By design, not a gap: busy is per process — one worker serves calls in order (one process per

@@ -538,10 +538,6 @@ impl Server {
 
         let crash = self.shared.config.test_hooks && raw_args.get("_panic").and_then(Value::as_bool) == Some(true);
         let run = |me: &mut Self| -> Result<Outcome, ToolError> {
-            if crash {
-                // Contract tests only (DECKCRAFT_MCP_TEST_HOOKS=1): an internal failure mid-call.
-                std::panic::resume_unwind(Box::new(String::from("test hook: _panic")));
-            }
             // Contract tests only: slow work with a safe point every 20 ms.
             let steps = delay_ms / 20;
             for k in 0..steps {
@@ -551,8 +547,16 @@ impl Server {
                     return Err(contract::classify(&e.to_string(), &cx));
                 }
             }
-            me.dispatch(name, &args, author.as_deref(), overwrite)
+            let r = me.dispatch(name, &args, author.as_deref(), overwrite);
+            if crash {
+                // Contract tests only (DECKCRAFT_MCP_TEST_HOOKS=1): an internal failure after the
+                // call did its work.
+                std::panic::resume_unwind(Box::new(String::from("test hook: _panic")));
+            }
+            r
         };
+        // WHIQ (owner, 2026-11-05): the presentations as the call found them, put back if it panics.
+        let before = self.backend.session().map(|s| crate::rollback::Before::take(s));
         // The call's task: `cancel` (answered by the reader) stops it at its next safe point.
         let task = deckcraft_engine::task::Task::new();
         self.shared.set_current_task(Some(task.clone()));
@@ -571,18 +575,28 @@ impl Server {
             Err(payload) => {
                 let msg = deckcraft_engine::guard::panic_message(payload.as_ref());
                 let roots = self.backend.automation_roots();
-                let saved = self
-                    .backend
-                    .session()
-                    .map(|s| crate::autosave::save_session(s, &self.shared, roots.as_ref(), "panic", true, true))
-                    .unwrap_or_default();
+                // Nothing of the call stays: the presentations go back as it found them, then the
+                // active one is auto-saved.
+                let saved = match (before, self.backend.session()) {
+                    (Some(before), Some(s)) => {
+                        before.restore(s);
+                        crate::autosave::save_session(s, &self.shared, roots.as_ref(), "panic", true, true)
+                    }
+                    _ => vec![],
+                };
+                let undone = self.backend.session().is_some();
                 let at = saved.first().map(|r| r.path.clone());
+                let state = if undone {
+                    "nothing of this call was applied (the presentation is as it was before it)"
+                } else {
+                    "the presentation is still open"
+                };
                 let e = ToolError::new(
                     code::INTERNAL,
-                    format!("internal error while running `{name}` ({msg}); the presentation is still open"),
+                    format!("internal error while running `{name}`: {state}. Cause: {msg}"),
                     match &at {
-                        Some(p) => format!("your work is auto-saved at {p}; retry the call, or open that file if the server restarts"),
-                        None => "retry the call; server_status shows the server's state".into(),
+                        Some(p) => format!("your work is auto-saved at {p}; send the call again, or open that file if the server restarts"),
+                        None => "send the call again; server_status shows the server's state".into(),
                     },
                 )
                 .with("recovered_path", json!(at));
@@ -871,7 +885,14 @@ impl Server {
                 let cx = self.error_context(name);
                 structured_steps(&mut steps, &cx);
                 let mut e = contract::classify(&format!("{cmd}: {msg}"), &cx);
-                e.next_step = format!("{} (the steps before it ran; pass keepGoing: true to run the rest anyway)", e.next_step);
+                e.next_step = if msg.contains(crate::tools::BATCH_UNDONE) {
+                    format!("{} (the whole batch was undone: send it again)", e.next_step)
+                } else {
+                    format!(
+                        "{} (the steps before it were kept and nothing of this step was applied: send this step and the ones after it again, fixed — or pass keepGoing: true to run the rest anyway)",
+                        e.next_step
+                    )
+                };
                 return Err(e.with("results", Value::Array(steps)).with("failed_command", json!(cmd)));
             }
             let cx = self.error_context(name);

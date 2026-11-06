@@ -5,6 +5,7 @@ use serde_json::{Value, json};
 
 use crate::backend::Backend;
 use crate::headless::NEEDS_APP;
+use crate::rollback::{Before, NOTHING_APPLIED};
 
 /// The result of `tools/call`: MCP content blocks plus the `isError` flag.
 #[derive(Clone, Debug, PartialEq)]
@@ -182,7 +183,7 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "batch",
             "Run several commands",
-            "Run many edits in one call, in order: each item is a command ({command, params}) or one of the editing tools ({tool: add_slide|go_to_slide|add_shape|add_text_box|set_text|insert_picture|insert_table|insert_chart|add_overlays|select|run_command, args}); `slide` on an item makes that slide current first. Stops at the first error unless keepGoing (a stop or a cancel leaves the presentation as before the call). Returns each result. Thousands of items fit one call.",
+            "Run many edits in one call, in order: each item is a command ({command, params}) or one of the editing tools ({tool: add_slide|go_to_slide|add_shape|add_text_box|set_text|insert_picture|insert_table|insert_chart|add_overlays|select|run_command, args}); `slide` on an item makes that slide current first. Stops at the first error unless keepGoing: the steps before the error are kept and nothing of the failed step is applied, so send only the failed step and the ones after it again (fixed); with keepGoing the rest run and each result says ok or its error. A cancel (stop) undoes the whole batch: the presentation is as it was before the call. Returns each result. Thousands of items fit one call.",
             obj(
                 json!({"commands": {"type": "array", "items": obj(json!({
                     "command": string("Command id (or use tool)"),
@@ -646,7 +647,7 @@ fn batch_tool(b: &mut dyn Backend, name: &str, args: Value) -> Result<Value, Str
     let Ok(name) = crate::contract::resolve_tool(name, BATCH_TOOLS) else {
         return Err(format!("unknown tool `{name}` in a batch (a batch item's tool is one of: {})", BATCH_TOOLS.join(", ")));
     };
-    let r = call_tool(b, name, &args);
+    let r = call_whole(b, name, &args, "nothing of this step was applied");
     let text = r.content.iter().find_map(|c| c.get("text").and_then(Value::as_str)).unwrap_or_default().to_string();
     if r.is_error {
         return Err(text);
@@ -896,7 +897,54 @@ fn wrap(r: Result<Value, String>) -> ToolResult {
     }
 }
 
+/// WHIQ (owner, 2026-11-05, "Undo the call"): the tools that run several engine commands. One that
+/// fails half way is undone as a whole — the presentation is as it was before the call, and the
+/// error says nothing of it was applied (a single command is already undone by the engine).
+const WHOLE_OR_NOTHING: &[&str] =
+    &["replace_text", "delete_shapes", "delete_slides", "set_bounds", "format_shape", "edit_chart", "add_shape", "add_text_box", "insert_picture"];
+
+/// The text a batch's failed step carries when the cancelled batch was undone as a whole.
+pub(crate) const BATCH_UNDONE: &str = "; the batch was undone (the presentation is as it was before it)";
+
 pub fn call_tool(b: &mut dyn Backend, name: &str, a: &Value) -> ToolResult {
+    call_whole(b, name, a, NOTHING_APPLIED)
+}
+
+/// [`run_tool`], with a [`WHOLE_OR_NOTHING`] tool that fails put back as it was before the call and
+/// `note` added to its error. Without an in-process session (a connected app) nothing can be put
+/// back, and the error is the tool's own.
+fn call_whole(b: &mut dyn Backend, name: &str, a: &Value, note: &str) -> ToolResult {
+    if !WHOLE_OR_NOTHING.contains(&name) {
+        return run_tool(b, name, a);
+    }
+    let before = b.session().map(|s| Before::take(s));
+    let mut r = run_tool(b, name, a);
+    if r.is_error
+        && let (Some(before), Some(s)) = (before, b.session())
+    {
+        before.restore(s);
+        for c in r.content.iter_mut() {
+            if let Some(t) = c.get("text").and_then(Value::as_str) {
+                // First, so a long reason never cuts it off.
+                c["text"] = json!(format!("{note}. {t}"));
+            }
+        }
+    }
+    r
+}
+
+/// Put back what a cancelled batch did; the note its failed step carries.
+fn undo_batch(b: &mut dyn Backend, before: Option<Before>) -> &'static str {
+    match (before, b.session()) {
+        (Some(before), Some(s)) => {
+            before.restore(s);
+            BATCH_UNDONE
+        }
+        _ => "",
+    }
+}
+
+fn run_tool(b: &mut dyn Backend, name: &str, a: &Value) -> ToolResult {
     let a = if a.is_object() { a.clone() } else { json!({}) };
     match name {
         "list_commands" => wrap(b.call("engine.commands", json!({})).map(|v| {
@@ -925,23 +973,14 @@ pub fn call_tool(b: &mut dyn Backend, name: &str, a: &Value) -> ToolResult {
             let n = commands.len();
             deckcraft_engine::task::phase("running commands", 0.0, 1.0);
             // WHIQ parity pass: a cancelled batch is undone as a whole (the presentation as it was
-            // before the call), as in every craft app.
-            let before = b.session().and_then(|s| s.active_index().zip(s.active().cloned()));
+            // before the call), as in every craft app. An error keeps the steps before it.
+            let mut before = b.session().map(|s| Before::take(s));
             for (k, c) in commands.into_iter().enumerate() {
                 let tool_name = c.get("tool").and_then(Value::as_str).filter(|t| !t.is_empty());
                 let id = tool_name.or_else(|| c.get("command").and_then(Value::as_str)).unwrap_or("");
                 // WHIQ: a safe point between commands, with the progress of the batch.
                 if let Err(e) = deckcraft_engine::task::step(k, n) {
-                    let mut rolled = false;
-                    if let (Some((i, st)), Some(s)) = (before, b.session())
-                        && s.active_index() == Some(i)
-                        && let Some(a) = s.active_mut()
-                        && a.uid == st.uid
-                    {
-                        *a = st;
-                        rolled = true;
-                    }
-                    let note = if rolled { "; the batch was undone (the presentation is as it was before it)" } else { "" };
+                    let note = undo_batch(b, before.take());
                     out.push(json!({"command": id, "ok": false, "error": format!("{e}{note}")}));
                     return ToolResult { content: vec![json!({"type": "text", "text": Value::Array(out).to_string()})], is_error: true };
                 }
@@ -958,6 +997,12 @@ pub fn call_tool(b: &mut dyn Backend, name: &str, a: &Value) -> ToolResult {
                 }
                 match r {
                     Ok(v) => out.push(json!({"command": id, "ok": true, "result": v})),
+                    // A cancel that reached a safe point inside the step undoes the whole batch too.
+                    Err(e) if deckcraft_engine::task::check().is_err() => {
+                        let note = undo_batch(b, before.take());
+                        out.push(json!({"command": id, "ok": false, "error": format!("{e}{note}")}));
+                        return ToolResult { content: vec![json!({"type": "text", "text": Value::Array(out).to_string()})], is_error: true };
+                    }
                     Err(e) => {
                         out.push(json!({"command": id, "ok": false, "error": e}));
                         if !keep {
@@ -1018,17 +1063,26 @@ pub fn call_tool(b: &mut dyn Backend, name: &str, a: &Value) -> ToolResult {
             let Ok(v) = r else { return wrap(r) };
             let id = v.get("id").cloned().unwrap_or_default();
             let _ = exec(b, "text.exit", json!({}));
-            let _ = exec(b, "edit.select", json!({"ids": [id]}));
-            if let Some(s) = f(&a, "size") {
-                let _ = exec(b, "format.size", json!({"size": s}));
+            // A size, colour or alignment that cannot be applied fails the call (and the box goes too).
+            let formatted = (|| -> Result<(), String> {
+                exec(b, "edit.select", json!({"ids": [id]}))?;
+                if let Some(s) = f(&a, "size") {
+                    exec(b, "format.size", json!({"size": s}))?;
+                }
+                if let Some(c) = a.get("color").filter(|c| c.is_string()) {
+                    exec(b, "format.color", json!({"color": c}))?;
+                }
+                if let Some(al) = a.get("align").and_then(Value::as_str) {
+                    exec(b, "format.align", json!({"align": al}))?;
+                }
+                Ok(())
+            })();
+            match (formatted, b.session()) {
+                (Ok(()), _) => ToolResult::json(&v),
+                (Err(e), Some(_)) => ToolResult::error(e),
+                // A connected app keeps the box (nothing in process to put back).
+                (Err(e), None) => ToolResult::error(format!("the text box was inserted (id {id}), but its formatting was not applied: {e}")),
             }
-            if let Some(c) = a.get("color").filter(|c| c.is_string()) {
-                let _ = exec(b, "format.color", json!({"color": c}));
-            }
-            if let Some(al) = a.get("align").and_then(Value::as_str) {
-                let _ = exec(b, "format.align", json!({"align": al}));
-            }
-            ToolResult::json(&v)
         }
         "set_text" => wrap(exec(b, "text.set", a)),
         "insert_picture" => {
@@ -1069,7 +1123,11 @@ pub fn call_tool(b: &mut dyn Backend, name: &str, a: &Value) -> ToolResult {
                 q["lockAspect"] = json!(true);
             }
             if let Err(e) = exec(b, "shape.sizePosition", q) {
-                return ToolResult::error(format!("the picture was inserted (id {sid}) at its own size, but its position and size were not applied: {e}"));
+                // In process the whole call is undone (call_whole); a connected app keeps the picture.
+                return ToolResult::error(match b.session() {
+                    Some(_) => format!("the picture's position and size could not be applied: {e}"),
+                    None => format!("the picture was inserted (id {sid}) at its own size, but its position and size were not applied: {e}"),
+                });
             }
             let mut out = v.clone();
             let after = current_shape(b, sid);

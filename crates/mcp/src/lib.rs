@@ -21,6 +21,7 @@ mod checkpoint;
 pub mod contract;
 mod headless;
 mod jobs;
+mod rollback;
 mod roundtrip;
 mod runtime;
 mod server;
@@ -44,3 +45,5 @@ pub fn control_addr(s: &str) -> String {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_undo;

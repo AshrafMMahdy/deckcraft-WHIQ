@@ -1772,10 +1772,24 @@ fn build(s: &mut Session, p: &Value) -> Result<Value> {
     doc.media.retain(|m| used.contains(&m.id));
     doc.fix_next_id();
     let name = title.clone().unwrap_or_else(|| s.next_untitled());
+    let was_active = s.active_index();
     let i = s.add_document(DocState::new(doc, None, name));
     let mut out = json!({"document": i, "slides": n, "warnings": warnings, "template": from_template});
     if let Some(path) = str_param(&p, "path").filter(|x| !x.trim().is_empty()) {
-        let saved = s.execute("file.save", &json!({"path": path}))?;
+        // WHIQ (owner, 2026-11-05, "Undo the call"): a deck that cannot be saved is not kept open
+        // either — a retry would otherwise build a second one beside it.
+        let saved = match s.execute("file.save", &json!({"path": path})) {
+            Ok(v) => v,
+            Err(e) => {
+                s.close_document(i);
+                if let Some(a) = was_active {
+                    s.set_active(a);
+                }
+                return Err(EngineError::Other(format!(
+                    "nothing of this call was applied (the deck it built was closed, not kept open) — send it again (fixed). {e}"
+                )));
+            }
+        };
         out["path"] = saved.get("path").cloned().unwrap_or(Value::Null);
         out["bytes"] = saved.get("bytes").cloned().unwrap_or(Value::Null);
     }
@@ -1948,6 +1962,26 @@ mod tests {
         assert!(r.get(1).unwrap().1 && r.get(3).unwrap().2 && r.get(5).unwrap().3);
         assert_eq!(md_plain("**x** y"), "x y");
         assert_eq!(md_plain("a * b"), "a * b");
+    }
+
+    /// WHIQ (owner, 2026-11-05, "Undo the call"): a deck whose save fails is closed, not left open
+    /// beside the one a retry builds; the presentation that was active before stays active.
+    #[test]
+    fn whiq_a_build_whose_save_fails_keeps_nothing_open() {
+        let mut s = Session::with_new();
+        let before = s.active().unwrap().uid;
+        // A file where the folder should be: the save cannot succeed.
+        let blocker = std::env::temp_dir().join(format!("dc-build-save-fails-{}", std::process::id()));
+        std::fs::write(&blocker, b"not a folder").unwrap();
+        let path = blocker.join("deck.pptx");
+        let e = s.execute("deck.build", &json!({"title": "Half", "path": path.to_string_lossy()})).unwrap_err().to_string();
+        assert!(e.contains("nothing of this call was applied") && e.contains("closed"), "{e}");
+        assert_eq!(s.documents().len(), 1, "the deck it built is not open");
+        assert_eq!(s.active().unwrap().uid, before);
+        // Without a path, or with one that saves, the deck stays open as before.
+        s.execute("deck.build", &json!({"title": "Whole"})).unwrap();
+        assert_eq!(s.documents().len(), 2);
+        let _ = std::fs::remove_file(&blocker);
     }
 
     #[test]
