@@ -184,7 +184,14 @@ fn long_work_runs_as_a_job() {
     let e = m.err("inspect_document", json!({}));
     assert_eq!(e["code"], "busy", "{e}");
     assert_eq!(e["job_id"], json!(id));
-    let running = m.ok("job_status", json!({"job_id": id}));
+    // The job's worker names its first stage once it starts (a slow runner may answer before that: the tool's own name).
+    let running = loop {
+        let r = m.ok("job_status", json!({"job_id": id}));
+        if r["stage"] != "open_presentation" || r["status"] != "running" {
+            break r;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
     assert_eq!(running["stage"], "reading the file", "{running}");
     let j = wait_job(&mut m, &id);
     assert_eq!(j["status"], "done", "{j}");
