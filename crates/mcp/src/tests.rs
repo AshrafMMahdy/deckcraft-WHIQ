@@ -171,50 +171,43 @@ impl crate::backend::Backend for FakeApp {
     }
 }
 
-/// WHIQ (2026-11-27): the tools that need the desktop app are not listed headless — hidden, not removed: a call still answers
-/// that it needs the app — and are listed, with their annotations, when the app is attached.
+/// WHIQ (2026-11-27): the tools that need the desktop app are not listed headless — hidden, not removed: a call still
+/// answers — and are listed, with their annotations, when the app is attached. The names are written out here, not read
+/// from `tools::DESKTOP_ONLY`, so a tool left out of it fails this test.
 #[test]
 fn desktop_only_tools_are_listed_only_with_the_app() {
+    let hidden = ["screenshot", "call_app"];
+    let names = |s: &mut Server| -> Vec<String> {
+        let r = call(s, 1, "tools/list", json!({}));
+        r["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect()
+    };
+    let all: Vec<String> = crate::tools::tool_definitions().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
     let mut headless = Server::new(Box::new(Headless::new()));
-    let tools = call(&mut headless, 1, "tools/list", json!({}))["result"]["tools"].as_array().unwrap().clone();
-    for n in crate::tools::DESKTOP_ONLY {
-        assert!(!tools.iter().any(|t| t["name"] == n), "{n} is listed headless");
-    }
-    assert!(tools.iter().any(|t| t["name"] == "render_slide"), "the picture of a slide is still listed");
+    let want: Vec<String> = all.iter().filter(|n| !hidden.contains(&n.as_str())).cloned().collect();
+    assert_eq!(names(&mut headless), want, "headless: every tool but the desktop-only ones");
     let r = call(&mut headless, 2, "tools/call", json!({"name": "screenshot", "arguments": {}}));
-    assert_eq!(r["result"]["isError"], true, "a hidden tool still answers: {r}");
+    let text = r["result"]["content"][0]["text"].as_str().unwrap_or_default();
+    assert!(r["result"]["isError"] == true && text.contains("needs the desktop app"), "screenshot still answers that it needs the app: {r}");
+    // call_app reaches what the headless session answers (each of those has a tool of its own): it still does
+    let r = call(&mut headless, 3, "tools/call", json!({"name": "call_app", "arguments": {"method": "engine.commands"}}));
+    assert_eq!(r["result"]["isError"], false, "call_app still answers headless: {r}");
     let mut app = Server::new(Box::new(FakeApp));
-    let tools = call(&mut app, 3, "tools/list", json!({}))["result"]["tools"].as_array().unwrap().clone();
-    for n in crate::tools::DESKTOP_ONLY {
-        let t = tools.iter().find(|t| t["name"] == n).unwrap_or_else(|| panic!("{n} is not listed with the app"));
+    assert_eq!(names(&mut app), all, "with the app every tool, as before");
+    // the contract's per-tool checks (tests/mcp-contract) see only what is listed headless: the hidden ones are checked here
+    let tools = call(&mut app, 4, "tools/list", json!({}))["result"]["tools"].as_array().unwrap().clone();
+    for n in hidden {
+        let t = tools.iter().find(|t| t["name"] == n).unwrap();
+        for k in ["readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint"] {
+            assert!(t["annotations"][k].is_boolean(), "{n}: {k}");
+        }
         let reads = n == "screenshot";
         assert_eq!(t["annotations"]["readOnlyHint"], reads, "{n}");
         assert_eq!(t["annotations"]["destructiveHint"], !reads, "{n}");
-    }
-    // the same through the stdio loop, whose `tools/list` is answered without waiting on the server (runtime::fast_answer)
-    let served = |s: Server| -> Vec<String> {
-        #[derive(Clone)]
-        struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-        impl std::io::Write for Buf {
-            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(b);
-                Ok(b.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
+        if reads {
+            assert_eq!(t["annotations"]["idempotentHint"], true, "{n}");
         }
-        let out = Buf(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
-        let input = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}\n";
-        s.serve(std::io::Cursor::new(input.as_bytes().to_vec()), out.clone()).unwrap();
-        let text = String::from_utf8(out.0.lock().unwrap().clone()).unwrap();
-        let r: Value = serde_json::from_str(text.lines().find(|l| l.contains("\"tools\"")).expect("a tools/list answer")).unwrap();
-        r["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect()
-    };
-    let listed = served(Server::new(Box::new(Headless::new())));
-    assert!(listed.iter().any(|t| t == "render_slide") && !crate::tools::DESKTOP_ONLY.iter().any(|n| listed.iter().any(|t| t == n)), "{listed:?}");
-    let listed = served(Server::new(Box::new(FakeApp)));
-    assert!(crate::tools::DESKTOP_ONLY.iter().all(|n| listed.iter().any(|t| t == n)), "{listed:?}");
+        assert!(t["inputSchema"]["properties"]["caller"].is_object(), "{n} takes caller");
+    }
 }
 
 fn current_slide_title(s: &mut Server) -> Value {

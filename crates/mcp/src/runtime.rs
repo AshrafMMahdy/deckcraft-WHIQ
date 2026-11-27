@@ -554,3 +554,29 @@ pub fn serve(server: Server, input: impl BufRead + Send + 'static, output: impl 
         None => Ok(()),
     }
 }
+
+#[cfg(test)]
+mod whiq_tests {
+    use super::*;
+
+    /// WHIQ (2026-11-27): the stdio loop's quick `tools/list` (never waiting on the server) hides the desktop-only tools
+    /// headless and lists them with an app; `serve` reads `has_ui` from the backend once, before the loop. Called directly,
+    /// not through `serve`, which would leave its process-wide signal handler behind in the test binary.
+    #[test]
+    fn the_quick_tools_list_hides_desktop_only_tools_headless() {
+        let server = Server::new(Box::new(crate::Headless::new()));
+        let shared = server.shared();
+        let server = Arc::new(Mutex::new(server));
+        let queue = Queue { items: Mutex::new(VecDeque::new()), cv: Condvar::new(), closed: AtomicBool::new(false) };
+        let out: Out = Arc::new(Mutex::new(Box::new(std::io::sink())));
+        let msg = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}});
+        let listed = |has_ui: bool| -> Vec<String> {
+            let r = fast_answer(&msg, &shared, &server, has_ui, &queue, &out).expect("answered at once");
+            r["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect()
+        };
+        let headless = listed(false);
+        assert!(!headless.iter().any(|n| n == "screenshot" || n == "call_app") && headless.iter().any(|n| n == "render_slide"), "{headless:?}");
+        let app = listed(true);
+        assert!(["screenshot", "call_app"].iter().all(|n| app.iter().any(|t| t == n)), "{app:?}");
+    }
+}

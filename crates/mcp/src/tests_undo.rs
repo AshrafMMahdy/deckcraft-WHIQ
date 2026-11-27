@@ -125,4 +125,3 @@ fn a_call_that_panics_after_its_work_is_undone_before_the_work_is_saved() {
     assert_eq!(slides(&mut s), 2);
     let _ = std::fs::remove_dir_all(&dir);
 }
-
