@@ -158,6 +158,15 @@ fn hints(name: &str, read_only: bool) -> (bool, bool) {
 
 const APP_ONLY: &str = " Desktop app only (`deckcraft-cli mcp --connect PORT`).";
 
+/// WHIQ: the tools that need the desktop app (`--connect`). Without it they are not listed (hidden, not removed: a call still
+/// answers that it needs the app), so a headless agent is not offered a tool that can only refuse.
+pub const DESKTOP_ONLY: [&str; 2] = ["screenshot", "call_app"];
+
+/// WHIQ: what `tools/list` shows: every tool with the desktop app, all but [`DESKTOP_ONLY`] without it.
+pub fn listed_tools(has_ui: bool) -> Vec<Value> {
+    tool_definitions().into_iter().filter(|t| has_ui || !DESKTOP_ONLY.iter().any(|n| t["name"].as_str() == Some(*n))).collect()
+}
+
 pub fn tool_definitions() -> Vec<Value> {
     vec![
         tool(

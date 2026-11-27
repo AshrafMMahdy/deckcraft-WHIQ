@@ -156,6 +156,67 @@ fn errors_are_reported_not_panics() {
     assert_eq!(r["result"]["isError"], true);
 }
 
+/// WHIQ: a backend that says the desktop app is attached (`--connect`); it answers every call with `{}`.
+struct FakeApp;
+
+impl crate::backend::Backend for FakeApp {
+    fn call(&mut self, _method: &str, _params: Value) -> Result<Value, String> {
+        Ok(json!({}))
+    }
+    fn has_ui(&self) -> bool {
+        true
+    }
+    fn describe(&self) -> String {
+        "fake app".into()
+    }
+}
+
+/// WHIQ (2026-11-27): the tools that need the desktop app are not listed headless — hidden, not removed: a call still answers
+/// that it needs the app — and are listed, with their annotations, when the app is attached.
+#[test]
+fn desktop_only_tools_are_listed_only_with_the_app() {
+    let mut headless = Server::new(Box::new(Headless::new()));
+    let tools = call(&mut headless, 1, "tools/list", json!({}))["result"]["tools"].as_array().unwrap().clone();
+    for n in crate::tools::DESKTOP_ONLY {
+        assert!(!tools.iter().any(|t| t["name"] == n), "{n} is listed headless");
+    }
+    assert!(tools.iter().any(|t| t["name"] == "render_slide"), "the picture of a slide is still listed");
+    let r = call(&mut headless, 2, "tools/call", json!({"name": "screenshot", "arguments": {}}));
+    assert_eq!(r["result"]["isError"], true, "a hidden tool still answers: {r}");
+    let mut app = Server::new(Box::new(FakeApp));
+    let tools = call(&mut app, 3, "tools/list", json!({}))["result"]["tools"].as_array().unwrap().clone();
+    for n in crate::tools::DESKTOP_ONLY {
+        let t = tools.iter().find(|t| t["name"] == n).unwrap_or_else(|| panic!("{n} is not listed with the app"));
+        let reads = n == "screenshot";
+        assert_eq!(t["annotations"]["readOnlyHint"], reads, "{n}");
+        assert_eq!(t["annotations"]["destructiveHint"], !reads, "{n}");
+    }
+    // the same through the stdio loop, whose `tools/list` is answered without waiting on the server (runtime::fast_answer)
+    let served = |s: Server| -> Vec<String> {
+        #[derive(Clone)]
+        struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let out = Buf(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+        let input = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}\n";
+        s.serve(std::io::Cursor::new(input.as_bytes().to_vec()), out.clone()).unwrap();
+        let text = String::from_utf8(out.0.lock().unwrap().clone()).unwrap();
+        let r: Value = serde_json::from_str(text.lines().find(|l| l.contains("\"tools\"")).expect("a tools/list answer")).unwrap();
+        r["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect()
+    };
+    let listed = served(Server::new(Box::new(Headless::new())));
+    assert!(listed.iter().any(|t| t == "render_slide") && !crate::tools::DESKTOP_ONLY.iter().any(|n| listed.iter().any(|t| t == n)), "{listed:?}");
+    let listed = served(Server::new(Box::new(FakeApp)));
+    assert!(crate::tools::DESKTOP_ONLY.iter().all(|n| listed.iter().any(|t| t == n)), "{listed:?}");
+}
+
 fn current_slide_title(s: &mut Server) -> Value {
     tool(s, "inspect_slide", json!({}))["title"].clone()
 }

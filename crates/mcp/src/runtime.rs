@@ -111,7 +111,7 @@ fn install_signal_handler() {
 }
 
 /// Answer the requests that never wait. `None`: queue it.
-fn fast_answer(msg: &Value, shared: &Arc<Shared>, server: &Arc<Mutex<Server>>, queue: &Queue, out: &Out) -> Option<Value> {
+fn fast_answer(msg: &Value, shared: &Arc<Shared>, server: &Arc<Mutex<Server>>, has_ui: bool, queue: &Queue, out: &Out) -> Option<Value> {
     let id = msg.get("id")?.clone();
     if !(id.is_string() || id.is_number()) {
         return None;
@@ -119,7 +119,7 @@ fn fast_answer(msg: &Value, shared: &Arc<Shared>, server: &Arc<Mutex<Server>>, q
     let method = msg.get("method").and_then(Value::as_str)?;
     let result = match method {
         "ping" => json!({}),
-        "tools/list" => json!({"tools": crate::tools::tool_definitions()}),
+        "tools/list" => json!({"tools": crate::tools::listed_tools(has_ui)}),
         "tools/call" => {
             let params = msg.get("params")?;
             let raw = params.get("name").and_then(Value::as_str)?;
@@ -333,9 +333,11 @@ pub fn serve(server: Server, input: impl BufRead + Send + 'static, output: impl 
     let roots = {
         let mut s = server;
         let r = s.backend().automation_roots();
-        (Arc::new(Mutex::new(s)), r)
+        // WHIQ: whether the desktop app is attached, read once here: the quick `tools/list` never waits on the server's lock.
+        let has_ui = s.backend().has_ui();
+        (Arc::new(Mutex::new(s)), (r, has_ui))
     };
-    let (server, roots) = roots;
+    let (server, (roots, has_ui)) = roots;
     let out: Out = Arc::new(Mutex::new(Box::new(output)));
     *lock(&RUNNING) = Some(Running { server: Arc::downgrade(&server), shared: Arc::clone(&shared), roots: roots.clone(), out: Arc::clone(&out) });
     install_signal_handler();
@@ -513,7 +515,7 @@ pub fn serve(server: Server, input: impl BufRead + Send + 'static, output: impl 
                 continue;
             }
         };
-        if let Some(r) = fast_answer(&msg, &shared, &server, &queue, &out) {
+        if let Some(r) = fast_answer(&msg, &shared, &server, has_ui, &queue, &out) {
             write_line(&out, &r);
             continue;
         }

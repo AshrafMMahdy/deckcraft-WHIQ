@@ -624,6 +624,14 @@ an error keeps the steps before it (each step itself whole or nothing), a cancel
 Not covered: with `--connect` (a running desktop app, no in-process session) nothing can be put back;
 those errors stay the tool's own (`insert_picture` and `add_text_box` still say what was inserted).
 
+## Desktop-only tools are not listed headless (2026-11-27)
+
+The platform runs the server headless, where `screenshot` and `call_app` can only answer that they need the desktop app; an agent offered
+them wastes a call on a refusal. `tools/list` now lists them only when the app is attached (`--connect`): hidden, not removed —
+a call still answers that it needs the app, and the pictures an agent can have headless stay listed. With the app every tool is
+listed as before, annotations unchanged. `crates/mcp/src/tools.rs` (`DESKTOP_ONLY`, `listed_tools`); `server.rs`; the runtime's quick `tools/list` (`runtime.rs` `fast_answer`, with `has_ui` read from the backend once when `serve` starts, so it never waits on the server). Headless, every method `call_app` reaches (`engine.execute`, `ui.pointer`, `ui.key`, `ui.text`, `ui.tool.select`, `ui.render`, `app.open` / `save` / `export`) has its own tool.
+Test: `crates/mcp/src/tests.rs` `desktop_only_tools_are_listed_only_with_the_app` (through `handle_line` and through the stdio loop; with an attached app both are listed with their annotations).
+
 ## Not done / known limits
 
 - By design, not a gap: busy is per process — one worker serves calls in order (one process per

@@ -352,7 +352,7 @@ impl Server {
                 }))
             }
             "ping" => Ok(json!({})),
-            "tools/list" => Ok(json!({"tools": tool_definitions()})),
+            "tools/list" => Ok(json!({"tools": crate::tools::listed_tools(self.backend.has_ui())})),
             "tools/call" => {
                 let name = params.get("name").and_then(Value::as_str).ok_or((INVALID_PARAMS, "missing tool `name`".to_string()))?;
                 let args = params.get("arguments").cloned().unwrap_or(Value::Null);
